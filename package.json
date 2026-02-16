@@ -1,0 +1,55 @@
+{
+  "name": "agentwallet-mcp",
+  "version": "1.2.0",
+  "description": "MCP server for AgentWallet — lets AI agents create wallets, sign transactions, and broadcast on any EVM chain",
+  "type": "module",
+  "main": "build/index.js",
+  "bin": {
+    "agentwallet-mcp": "build/index.js"
+  },
+  "files": [
+    "build",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node build/index.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "wallet",
+    "ai-agent",
+    "blockchain",
+    "evm",
+    "ethereum",
+    "base",
+    "arbitrum",
+    "optimism",
+    "polygon",
+    "avalanche",
+    "bsc",
+    "zora",
+    "pulsechain",
+    "erc20",
+    "token-transfer",
+    "transaction-signing",
+    "agentwallet"
+  ],
+  "author": "HiFriendbot (https://hifriendbot.com)",
+  "license": "MIT",
+  "homepage": "https://hifriendbot.com/agentwallet",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.11.4",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0"
+  }
+}
