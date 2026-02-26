@@ -130,7 +130,7 @@ function resolveChainId(network: string): number | null {
 
 const server = new McpServer({
   name: 'agentwallet',
-  version: '1.3.0',
+  version: '1.4.0',
 });
 
 // ─── Tool: create_wallet ─────────────────────────────────────────
@@ -852,6 +852,162 @@ server.tool(
   },
   async ({ wallet_id }) => {
     const data = await api(`/wallets/${wallet_id}`, 'DELETE');
+    return jsonResponse(data);
+  },
+);
+
+// ─── Tool: create_paywall ────────────────────────────────────────
+
+server.tool(
+  'create_paywall',
+  'Create an x402 paywall that charges agents/clients for accessing a resource. ' +
+    'Returns a public access URL that returns HTTP 402 until paid. ' +
+    'Agents pay on-chain, then retry with proof to get the content.',
+  {
+    wallet_id: z.number().int().describe('Wallet ID to receive payments'),
+    name: z.string().describe('Human-readable paywall name (e.g. "Premium API Access")'),
+    description: z.string().default('').describe('Description shown in the 402 response'),
+    amount: z.string().describe('Price in human-readable format (e.g. "0.01" for 0.01 USDC)'),
+    token_type: z.enum(['erc20', 'native']).default('erc20').describe('"erc20" for stablecoin payments, "native" for ETH/POL/etc.'),
+    token_address: z.string().default('').describe('ERC-20 token contract address (required if token_type is "erc20"). Use get_chains to find stablecoin addresses.'),
+    token_decimals: z.number().int().default(6).describe('Token decimals (6 for USDC, 18 for ETH/most tokens)'),
+    token_name: z.string().default('USDC').describe('Token display name (e.g. "USDC", "ETH")'),
+    chain_id: z.number().int().default(8453).describe('Chain ID for payments (8453=Base, 1=Ethereum, etc.)'),
+    resource_url: z.string().url().describe('URL of the protected resource to serve after payment verification'),
+    resource_mime: z.string().default('application/json').describe('MIME type of the resource (e.g. "application/json", "text/plain")'),
+  },
+  async ({ wallet_id, name, description, amount, token_type, token_address, token_decimals, token_name, chain_id, resource_url, resource_mime }) => {
+    // Convert human-readable amount to raw token units
+    const rawAmount = parseUnits(amount, token_decimals);
+
+    const data = await api('/x402/paywalls', 'POST', {
+      wallet_id,
+      name,
+      description,
+      amount: rawAmount,
+      token_type,
+      token_address,
+      token_decimals,
+      token_name,
+      chain_id,
+      resource_url,
+      resource_mime,
+    });
+
+    return jsonResponse({
+      ...(data as Record<string, unknown>),
+      price: `${amount} ${token_name}`,
+      chain_id,
+    });
+  },
+);
+
+// ─── Tool: list_paywalls ────────────────────────────────────────
+
+server.tool(
+  'list_paywalls',
+  'List all your x402 paywalls. Returns paywall IDs, names, pricing, ' +
+    'access URLs, payment counts, and revenue totals.',
+  {
+    page: z.number().int().default(1).describe('Page number'),
+    per_page: z.number().int().default(50).describe('Results per page (max 100)'),
+  },
+  async ({ page, per_page }) => {
+    const data = await api(`/x402/paywalls?page=${page}&per_page=${per_page}`);
+    return jsonResponse(data);
+  },
+);
+
+// ─── Tool: get_paywall ──────────────────────────────────────────
+
+server.tool(
+  'get_paywall',
+  'Get details for a specific x402 paywall by ID. ' +
+    'Returns pricing, access URL, payment stats, and configuration.',
+  {
+    paywall_id: z.number().int().describe('Paywall ID'),
+  },
+  async ({ paywall_id }) => {
+    const data = await api(`/x402/paywalls/${paywall_id}`);
+    return jsonResponse(data);
+  },
+);
+
+// ─── Tool: update_paywall ───────────────────────────────────────
+
+server.tool(
+  'update_paywall',
+  'Update an x402 paywall configuration. ' +
+    'Can change price, resource URL, active status, or any other field.',
+  {
+    paywall_id: z.number().int().describe('Paywall ID to update'),
+    name: z.string().optional().describe('New paywall name'),
+    description: z.string().optional().describe('New description'),
+    amount: z.string().optional().describe('New price in human-readable format (e.g. "0.05")'),
+    token_decimals: z.number().int().optional().describe('Token decimals (needed if changing amount)'),
+    resource_url: z.string().url().optional().describe('New resource URL'),
+    resource_mime: z.string().optional().describe('New MIME type'),
+    is_active: z.boolean().optional().describe('Enable (true) or disable (false) the paywall'),
+  },
+  async ({ paywall_id, name, description, amount, token_decimals, resource_url, resource_mime, is_active }) => {
+    const body: Record<string, unknown> = {};
+    if (name !== undefined) body.name = name;
+    if (description !== undefined) body.description = description;
+    if (resource_url !== undefined) body.resource_url = resource_url;
+    if (resource_mime !== undefined) body.resource_mime = resource_mime;
+    if (is_active !== undefined) body.is_active = is_active;
+
+    // Convert human-readable amount to raw if provided
+    if (amount !== undefined) {
+      const decimals = token_decimals ?? 6; // Default to USDC decimals
+      body.amount = parseUnits(amount, decimals);
+    }
+
+    const data = await api(`/x402/paywalls/${paywall_id}`, 'PUT', body);
+    return jsonResponse(data);
+  },
+);
+
+// ─── Tool: delete_paywall ───────────────────────────────────────
+
+server.tool(
+  'delete_paywall',
+  'Delete an x402 paywall. The access URL will return 404 after deletion.',
+  {
+    paywall_id: z.number().int().describe('Paywall ID to delete'),
+  },
+  async ({ paywall_id }) => {
+    const data = await api(`/x402/paywalls/${paywall_id}`, 'DELETE');
+    return jsonResponse(data);
+  },
+);
+
+// ─── Tool: get_paywall_payments ─────────────────────────────────
+
+server.tool(
+  'get_paywall_payments',
+  'Get payment history for a specific x402 paywall. ' +
+    'Returns verified payments with TX hashes, payer addresses, amounts, and timestamps.',
+  {
+    paywall_id: z.number().int().describe('Paywall ID'),
+    page: z.number().int().default(1).describe('Page number'),
+    per_page: z.number().int().default(20).describe('Results per page (max 100)'),
+  },
+  async ({ paywall_id, page, per_page }) => {
+    const data = await api(`/x402/paywalls/${paywall_id}/payments?page=${page}&per_page=${per_page}`);
+    return jsonResponse(data);
+  },
+);
+
+// ─── Tool: get_x402_revenue ─────────────────────────────────────
+
+server.tool(
+  'get_x402_revenue',
+  'Get aggregate x402 revenue statistics across all your paywalls. ' +
+    'Returns total payments and revenue broken down by chain and token.',
+  {},
+  async () => {
+    const data = await api('/x402/revenue');
     return jsonResponse(data);
   },
 );

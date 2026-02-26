@@ -10,9 +10,9 @@ Permissionless EVM wallet infrastructure for AI agents. Create wallets, sign tra
 
 ## Features
 
-- **21 MCP tools** — create wallets, send transactions, approve tokens, wrap ETH, pay x402 invoices, and more
+- **28 MCP tools** — create wallets, send transactions, approve tokens, wrap ETH, pay and accept x402 payments, and more
 - **Any EVM chain** — Ethereum, Base, Polygon, BSC, Arbitrum, Optimism, Avalanche, Zora, PulseChain, and any other EVM-compatible chain
-- **x402 payments** — automatically pay for x402-enabled APIs and resources on any supported chain
+- **x402 payments** — pay for x402-enabled APIs automatically, or accept x402 payments on your own endpoints
 - **Secure** — Private keys encrypted at rest, decrypted only during signing, zeroed from memory immediately after
 - **Permissionless** — No identity verification, no compliance gatekeeping. Create a wallet and transact immediately.
 
@@ -95,6 +95,13 @@ Add to your settings:
 | `wrap_eth` | Wrap native tokens to WETH/WAVAX/etc. |
 | `unwrap_eth` | Unwrap WETH back to native tokens |
 | `pay_x402` | Pay x402 invoices automatically (fetch, pay, retry) |
+| `create_paywall` | Create an x402 paywall to charge for a resource |
+| `list_paywalls` | List all your x402 paywalls |
+| `get_paywall` | Get paywall details by ID |
+| `update_paywall` | Update paywall pricing, resource, or status |
+| `delete_paywall` | Delete a paywall |
+| `get_paywall_payments` | View payment history for a paywall |
+| `get_x402_revenue` | Aggregate revenue stats across all paywalls |
 | `get_usage` | Check your monthly usage and billing |
 | `get_chains` | List all supported chains |
 | `pause_wallet` | Emergency pause a wallet |
@@ -148,6 +155,30 @@ pay_x402(
 ```
 
 Supports ERC-20 tokens (USDC, USDT) and native tokens on any chain. Compatible with x402 V1 and V2 (CAIP-2 chain identifiers).
+
+## x402 Acceptance
+
+AgentWallet also lets you **accept** x402 payments. Create a paywall, point it at any resource, and get a public URL that charges agents automatically:
+
+```
+create_paywall(
+  wallet_id=1,
+  name="Premium API",
+  amount="0.01",
+  token_name="USDC",
+  token_address="0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  chain_id=8453,
+  resource_url="https://your-api.com/data"
+)
+```
+
+When an agent hits the paywall URL:
+1. Gets back HTTP 402 with payment requirements
+2. Pays on-chain using `pay_x402` (or any x402-compatible client)
+3. Retries with proof of payment
+4. Receives the protected content
+
+On-chain verification ensures every payment is real. Replay protection prevents double-spending. Revenue tracking shows you who paid, how much, and when.
 
 ## Security
 
