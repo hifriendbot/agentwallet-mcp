@@ -154,7 +154,6 @@ Supports ERC-20 tokens (USDC, USDT) and native tokens on any chain. Compatible w
 - Private keys are generated server-side and encrypted at rest
 - Keys are decrypted only during transaction signing and zeroed from memory immediately after
 - EIP-1559 transactions only with gas safety caps
-- Emergency pause: freeze any wallet or all wallets instantly
 - Bug bounty program: $50–$500 for responsible disclosure ([details](https://hifriendbot.com/wallet))
 
 ## Links
