@@ -98,9 +98,39 @@ function encodeUint256(value: string): string {
 
 // ─── Server ──────────────────────────────────────────────────────
 
+// ─── x402 Network Mapping ──────────────────────────────────────
+
+const X402_NETWORKS: Record<string, number> = {
+  'ethereum': 1,
+  'base': 8453,
+  'base-sepolia': 84532,
+  'polygon': 137,
+  'arbitrum': 42161,
+  'optimism': 10,
+  'bsc': 56,
+  'avalanche': 43114,
+  'zora': 7777777,
+  'pulsechain': 369,
+};
+
+/**
+ * Resolve an x402 network identifier to a chain ID.
+ * Supports plain names ("base"), CAIP-2 format ("eip155:8453"), and raw chain IDs ("8453").
+ */
+function resolveChainId(network: string): number | null {
+  if (X402_NETWORKS[network]) return X402_NETWORKS[network];
+  const caipMatch = network.match(/^eip155:(\d+)$/);
+  if (caipMatch) return parseInt(caipMatch[1], 10);
+  const num = parseInt(network, 10);
+  if (!isNaN(num) && num > 0) return num;
+  return null;
+}
+
+// ─── Server ──────────────────────────────────────────────────────
+
 const server = new McpServer({
   name: 'agentwallet',
-  version: '1.2.0',
+  version: '1.3.0',
 });
 
 // ─── Tool: create_wallet ─────────────────────────────────────────
@@ -556,6 +586,203 @@ server.tool(
       name: name || 'Unknown',
       symbol: symbol || 'Unknown',
       decimals,
+    });
+  },
+);
+
+// ─── Tool: pay_x402 ─────────────────────────────────────────────
+
+server.tool(
+  'pay_x402',
+  'Handle an x402 payment flow. Fetches a URL, and if the server returns HTTP 402 Payment Required, ' +
+    'parses the payment requirements, executes the on-chain payment, and retries the request with ' +
+    'proof of payment. Returns the final response. Supports the x402 open payment standard ' +
+    '(https://x402.org). Set max_payment to prevent overspending.',
+  {
+    url: z.string().url().describe('The URL to access (will handle 402 payment if required)'),
+    wallet_id: z.number().int().describe('Wallet ID to pay from'),
+    method: z.string().default('GET').describe('HTTP method (GET, POST, PUT, DELETE)'),
+    headers: z.string().optional().describe('Optional JSON string of additional request headers'),
+    body: z.string().optional().describe('Optional request body for POST/PUT requests'),
+    max_payment: z.string().optional().describe(
+      'Maximum payment in human-readable format (e.g. "1.00" for 1 USDC). ' +
+        'Rejects payments above this amount. Strongly recommended to prevent overspending.',
+    ),
+    prefer_chain: z.number().int().optional().describe(
+      'Preferred chain ID if the server accepts payment on multiple chains ' +
+        '(e.g. 8453 for Base, 1 for Ethereum)',
+    ),
+  },
+  async ({ url, wallet_id, method, headers: headersJson, body: reqBody, max_payment, prefer_chain }) => {
+    // Build request headers
+    const reqHeaders: Record<string, string> = { Accept: 'application/json' };
+    if (headersJson) {
+      try {
+        Object.assign(reqHeaders, JSON.parse(headersJson));
+      } catch {
+        throw new Error('Invalid headers JSON. Must be a JSON object (e.g. {"Authorization": "Bearer ..."}).');
+      }
+    }
+
+    // Validate URL — block private IPs and cloud metadata endpoints
+    const urlObj = new URL(url);
+    const hostname = urlObj.hostname.toLowerCase();
+    const blockedHosts = ['localhost', '127.0.0.1', '0.0.0.0', '[::1]', '169.254.169.254', 'metadata.google.internal'];
+    const blockedPrefixes = ['10.', '172.16.', '172.17.', '172.18.', '172.19.', '172.20.', '172.21.',
+      '172.22.', '172.23.', '172.24.', '172.25.', '172.26.', '172.27.', '172.28.', '172.29.',
+      '172.30.', '172.31.', '192.168.'];
+    if (blockedHosts.includes(hostname) || blockedPrefixes.some(p => hostname.startsWith(p))) {
+      throw new Error('URL points to a private/internal address. Only public URLs are allowed.');
+    }
+    if (!['http:', 'https:'].includes(urlObj.protocol)) {
+      throw new Error('Only http: and https: URLs are supported.');
+    }
+
+    // Step 1: Make initial request
+    const reqOptions: RequestInit = {
+      method,
+      headers: reqHeaders,
+      signal: AbortSignal.timeout(30_000), // 30s timeout
+    };
+    if (reqBody && method !== 'GET') {
+      reqOptions.body = reqBody;
+      if (!reqHeaders['Content-Type']) reqHeaders['Content-Type'] = 'application/json';
+    }
+
+    const initialRes = await fetch(url, reqOptions);
+
+    // If not 402, return the response as-is (no payment needed)
+    if (initialRes.status !== 402) {
+      const text = await initialRes.text();
+      let parsed: unknown;
+      try { parsed = JSON.parse(text); } catch { parsed = text; }
+      return jsonResponse({
+        status: initialRes.status,
+        payment_required: false,
+        response: parsed,
+      });
+    }
+
+    // Step 2: Parse x402 payment requirements from 402 response
+    let paymentInfo: { x402Version?: number; accepts?: Array<Record<string, unknown>> };
+    try {
+      paymentInfo = await initialRes.json() as typeof paymentInfo;
+    } catch {
+      throw new Error('402 response body is not valid JSON. This server may not support x402.');
+    }
+
+    if (!paymentInfo.accepts || paymentInfo.accepts.length === 0) {
+      throw new Error('402 response has no payment options in "accepts" array.');
+    }
+
+    // Step 3: Pick the best payment option
+    type PaymentOption = {
+      scheme: string; network: string; maxAmountRequired: string;
+      payTo: string; requiredDecimals: number; description?: string;
+      extra?: { name?: string; token?: string };
+    };
+    const options = paymentInfo.accepts as PaymentOption[];
+
+    let option: PaymentOption;
+    if (prefer_chain) {
+      option = options.find(a => resolveChainId(a.network) === prefer_chain) || options[0];
+    } else {
+      option = options[0];
+    }
+
+    // Resolve the chain
+    const chainId = resolveChainId(option.network);
+    if (!chainId) {
+      throw new Error(
+        `Unsupported x402 network: "${option.network}". ` +
+          `Supported: ${Object.keys(X402_NETWORKS).join(', ')}, or any CAIP-2 / numeric chain ID.`,
+      );
+    }
+
+    // Calculate human-readable amount
+    const amount = formatUnits(option.maxAmountRequired, option.requiredDecimals);
+
+    // Step 4: Check spending limit
+    if (max_payment) {
+      const maxRaw = parseUnits(max_payment, option.requiredDecimals);
+      if (BigInt(option.maxAmountRequired) > BigInt(maxRaw)) {
+        return jsonResponse({
+          status: 402,
+          payment_required: true,
+          payment_made: false,
+          error: `Payment of ${amount} ${option.extra?.name || 'tokens'} exceeds your max_payment limit of ${max_payment}`,
+          required_amount: amount,
+          max_allowed: max_payment,
+          token: option.extra?.name || 'native',
+          network: option.network,
+          chain_id: chainId,
+          pay_to: option.payTo,
+          description: option.description,
+        });
+      }
+    }
+
+    // Step 5: Execute payment
+    let txResult: Record<string, unknown>;
+
+    if (option.extra?.token) {
+      // ERC-20 token payment (e.g. USDC)
+      const calldata = '0xa9059cbb' + padAddress(option.payTo) + encodeUint256(option.maxAmountRequired);
+      txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', {
+        to: option.extra.token,
+        value: '0',
+        data: calldata,
+        chain_id: chainId,
+      })) as Record<string, unknown>;
+    } else {
+      // Native token payment (ETH, etc.)
+      txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', {
+        to: option.payTo,
+        value: option.maxAmountRequired,
+        data: '',
+        chain_id: chainId,
+      })) as Record<string, unknown>;
+    }
+
+    const txHash = txResult.tx_hash as string;
+
+    // Step 6: Build x402 payment proof and retry
+    const paymentProof = {
+      x402Version: paymentInfo.x402Version || 1,
+      scheme: option.scheme,
+      network: option.network,
+      payload: { txHash },
+    };
+    const paymentHeader = Buffer.from(JSON.stringify(paymentProof)).toString('base64');
+
+    const retryHeaders = { ...reqHeaders, 'X-PAYMENT': paymentHeader };
+    const retryOptions: RequestInit = {
+      method,
+      headers: retryHeaders,
+      signal: AbortSignal.timeout(30_000),
+    };
+    if (reqBody && method !== 'GET') {
+      retryOptions.body = reqBody;
+    }
+
+    const retryRes = await fetch(url, retryOptions);
+    const retryText = await retryRes.text();
+    let retryParsed: unknown;
+    try { retryParsed = JSON.parse(retryText); } catch { retryParsed = retryText; }
+
+    return jsonResponse({
+      status: retryRes.status,
+      payment_required: true,
+      payment_made: true,
+      amount,
+      token: option.extra?.name || 'native',
+      token_address: option.extra?.token || null,
+      network: option.network,
+      chain_id: chainId,
+      pay_to: option.payTo,
+      tx_hash: txHash,
+      description: option.description,
+      response: retryParsed,
     });
   },
 );

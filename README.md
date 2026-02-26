@@ -6,9 +6,10 @@ Permissionless EVM wallet infrastructure for AI agents. Create wallets, sign tra
 
 ## Features
 
-- **20 MCP tools** — create wallets, send transactions, approve tokens, wrap ETH, check balances, and more
-- **9 EVM chains** — Ethereum, Base, Polygon, BSC, Arbitrum, Optimism, Avalanche, Zora, PulseChain
-- **Secure** — Private keys encrypted at rest (Sodium XSalsa20-Poly1305), decrypted only during signing, zeroed from memory immediately after
+- **21 MCP tools** — create wallets, send transactions, approve tokens, wrap ETH, pay x402 invoices, and more
+- **Any EVM chain** — Ethereum, Base, Polygon, BSC, Arbitrum, Optimism, Avalanche, Zora, PulseChain, and any other EVM-compatible chain
+- **x402 payments** — automatically pay for x402-enabled APIs and resources on any supported chain
+- **Secure** — Private keys encrypted at rest, decrypted only during signing, zeroed from memory immediately after
 - **Permissionless** — No identity verification, no compliance gatekeeping. Create a wallet and transact immediately.
 
 ## Pricing
@@ -78,13 +79,18 @@ Add to your settings:
 | `list_wallets` | List all your wallets |
 | `get_wallet` | Get wallet details by ID |
 | `get_balance` | Check native token balance on any chain |
-| `send_transaction` | Sign and broadcast a transaction |
-| `sign_transaction` | Sign a transaction (returns raw hex) |
-| `approve_token` | Approve ERC-20 token spending |
+| `get_token_balance` | Check ERC-20 token balance |
+| `get_token_info` | Get ERC-20 token name, symbol, and decimals |
+| `transfer` | Send native tokens (ETH, POL, BNB, etc.) |
+| `transfer_token` | Send ERC-20 tokens (USDC, USDT, etc.) |
+| `send_transaction` | Sign and broadcast a raw transaction |
+| `sign_transaction` | Sign a transaction without broadcasting |
+| `call_contract` | Read-only contract call (eth_call) |
+| `approve_token` | Approve ERC-20 token spending for DeFi |
 | `get_allowance` | Check ERC-20 token allowance |
-| `wrap_eth` | Wrap native ETH to WETH |
-| `unwrap_eth` | Unwrap WETH to native ETH |
-| `get_token_info` | Get ERC-20 token name, symbol, decimals, balance |
+| `wrap_eth` | Wrap native tokens to WETH/WAVAX/etc. |
+| `unwrap_eth` | Unwrap WETH back to native tokens |
+| `pay_x402` | Pay x402 invoices automatically (fetch, pay, retry) |
 | `get_usage` | Check your monthly usage and billing |
 | `get_chains` | List all supported chains |
 | `pause_wallet` | Emergency pause a wallet |
@@ -117,9 +123,31 @@ Pair with [guessmarket-mcp](https://www.npmjs.com/package/guessmarket-mcp) to le
 
 All on-chain. All through MCP. No frontend needed.
 
+## x402 Payments
+
+AgentWallet natively supports the [x402 open payment standard](https://x402.org). When your Ai agent encounters an API that returns HTTP 402 Payment Required, the `pay_x402` tool handles the entire flow automatically:
+
+1. Fetches the URL and detects the 402 response
+2. Parses the payment requirements (amount, token, chain)
+3. Executes the on-chain payment from your wallet
+4. Retries the request with proof of payment
+5. Returns the final response
+
+**Always set `max_payment` to control spending:**
+
+```
+pay_x402(
+  url="https://api.example.com/premium-data",
+  wallet_id=1,
+  max_payment="1.00"
+)
+```
+
+Supports ERC-20 tokens (USDC, USDT) and native tokens on any chain. Compatible with x402 V1 and V2 (CAIP-2 chain identifiers).
+
 ## Security
 
-- Private keys are generated server-side and encrypted at rest with Sodium (XSalsa20-Poly1305)
+- Private keys are generated server-side and encrypted at rest
 - Keys are decrypted only during transaction signing and zeroed from memory immediately after
 - EIP-1559 transactions only with gas safety caps
 - Emergency pause: freeze any wallet or all wallets instantly

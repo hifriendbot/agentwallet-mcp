@@ -1,7 +1,7 @@
 {
   "name": "agentwallet-mcp",
-  "version": "1.2.0",
-  "description": "MCP server for AgentWallet — lets AI agents create wallets, sign transactions, and broadcast on any EVM chain",
+  "version": "1.3.0",
+  "description": "MCP server for AgentWallet — lets AI agents create wallets, sign transactions, broadcast on any EVM chain, and pay x402 invoices",
   "type": "module",
   "main": "build/index.js",
   "bin": {
@@ -36,6 +36,9 @@
     "erc20",
     "token-transfer",
     "transaction-signing",
+    "x402",
+    "http-402",
+    "agent-payments",
     "agentwallet"
   ],
   "author": "HiFriendbot (https://hifriendbot.com)",
