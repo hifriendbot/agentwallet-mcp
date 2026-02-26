@@ -1,0 +1,108 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 520">
+  <!-- Terminal background -->
+  <rect width="820" height="520" rx="10" ry="10" fill="#0d1117"/>
+
+  <!-- Title bar -->
+  <rect width="820" height="36" rx="10" ry="10" fill="#161b22"/>
+  <rect x="0" y="26" width="820" height="10" fill="#161b22"/>
+
+  <!-- Separator -->
+  <line x1="0" y1="36" x2="820" y2="36" stroke="#30363d" stroke-width="0.5"/>
+
+  <!-- Traffic lights -->
+  <circle cx="22" cy="18" r="6" fill="#ff5f57"/>
+  <circle cx="42" cy="18" r="6" fill="#febc2e"/>
+  <circle cx="62" cy="18" r="6" fill="#28c840"/>
+
+  <!-- Title bar text -->
+  <text x="410" y="23" text-anchor="middle" fill="#484f58" font-family="SFMono-Regular,Consolas,Liberation Mono,Menlo,monospace" font-size="12">AgentWallet</text>
+
+  <!-- Content -->
+  <g font-family="SFMono-Regular,Consolas,Liberation Mono,Menlo,monospace" font-size="14">
+
+    <!-- Line 1: User prompt -->
+    <g opacity="0">
+      <animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.010;0.033;0.800;0.867;1" dur="18s" repeatCount="indefinite"/>
+      <text x="24" y="68"><tspan fill="#58a6ff">&gt; </tspan><tspan fill="#c9d1d9">Fetch premium market data from api.datavendor.com</tspan></text>
+    </g>
+
+    <!-- Line 2: Fetching... -->
+    <g opacity="0">
+      <animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.072;0.094;0.800;0.867;1" dur="18s" repeatCount="indefinite"/>
+      <text x="24" y="106" fill="#484f58">Fetching https://api.datavendor.com/v1/markets...</text>
+    </g>
+
+    <!-- Line 3: 402 Payment Required -->
+    <g opacity="0">
+      <animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.128;0.150;0.800;0.867;1" dur="18s" repeatCount="indefinite"/>
+      <text x="24" y="144"><tspan fill="#f0883e">402 Payment Required</tspan></text>
+    </g>
+
+    <!-- Line 4: Payment details -->
+    <g opacity="0">
+      <animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.167;0.189;0.800;0.867;1" dur="18s" repeatCount="indefinite"/>
+      <text x="44" y="172"><tspan fill="#484f58">Amount: </tspan><tspan fill="#c9d1d9">0.01 USDC</tspan></text>
+    </g>
+
+    <!-- Line 5: Chain -->
+    <g opacity="0">
+      <animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.194;0.217;0.800;0.867;1" dur="18s" repeatCount="indefinite"/>
+      <text x="44" y="194"><tspan fill="#484f58">Chain:  </tspan><tspan fill="#58a6ff">Base</tspan><tspan fill="#484f58"> (8453)</tspan></text>
+    </g>
+
+    <!-- Line 6: Pay to -->
+    <g opacity="0">
+      <animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.222;0.244;0.800;0.867;1" dur="18s" repeatCount="indefinite"/>
+      <text x="44" y="216"><tspan fill="#484f58">Pay to: </tspan><tspan fill="#c9d1d9">0x4b3F...8f2D</tspan></text>
+    </g>
+
+    <!-- Line 7: Paying... -->
+    <g opacity="0">
+      <animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.283;0.306;0.800;0.867;1" dur="18s" repeatCount="indefinite"/>
+      <text x="24" y="254" fill="#484f58">Sending 0.01 USDC from wallet #3...</text>
+    </g>
+
+    <!-- Line 8: TX confirmed -->
+    <g opacity="0">
+      <animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.350;0.372;0.800;0.867;1" dur="18s" repeatCount="indefinite"/>
+      <text x="24" y="284"><tspan fill="#3fb950">&#x2713; Payment confirmed</tspan></text>
+    </g>
+
+    <!-- Line 9: TX hash -->
+    <g opacity="0">
+      <animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.378;0.400;0.800;0.867;1" dur="18s" repeatCount="indefinite"/>
+      <text x="44" y="306"><tspan fill="#484f58">TX: </tspan><tspan fill="#58a6ff">0xa8f3...2c1b</tspan></text>
+    </g>
+
+    <!-- Line 10: Retrying with proof -->
+    <g opacity="0">
+      <animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.433;0.456;0.800;0.867;1" dur="18s" repeatCount="indefinite"/>
+      <text x="24" y="344" fill="#484f58">Retrying with payment proof...</text>
+    </g>
+
+    <!-- Line 11: 200 OK -->
+    <g opacity="0">
+      <animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.494;0.517;0.800;0.867;1" dur="18s" repeatCount="indefinite"/>
+      <text x="24" y="374"><tspan fill="#3fb950">200 OK</tspan><tspan fill="#484f58"> &#x2014; data received</tspan></text>
+    </g>
+
+    <!-- Line 12: Response data line 1 -->
+    <g opacity="0">
+      <animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.533;0.556;0.800;0.867;1" dur="18s" repeatCount="indefinite"/>
+      <text x="24" y="406"><tspan fill="#484f58">{ </tspan><tspan fill="#7ee787">"btc"</tspan><tspan fill="#484f58">: </tspan><tspan fill="#c9d1d9">"$97,432"</tspan><tspan fill="#484f58">, </tspan><tspan fill="#7ee787">"eth"</tspan><tspan fill="#484f58">: </tspan><tspan fill="#c9d1d9">"$3,891"</tspan><tspan fill="#484f58">, </tspan><tspan fill="#7ee787">"sol"</tspan><tspan fill="#484f58">: </tspan><tspan fill="#c9d1d9">"$189"</tspan><tspan fill="#484f58"> }</tspan></text>
+    </g>
+
+    <!-- Line 13: Summary -->
+    <g opacity="0">
+      <animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.600;0.622;0.800;0.867;1" dur="18s" repeatCount="indefinite"/>
+      <text x="24" y="450"><tspan fill="#c9d1d9">Paid </tspan><tspan fill="#3fb950">0.01 USDC</tspan><tspan fill="#c9d1d9"> on </tspan><tspan fill="#58a6ff">Base</tspan><tspan fill="#c9d1d9"> for premium market data.</tspan></text>
+    </g>
+
+    <!-- Line 14: One tool call -->
+    <g opacity="0">
+      <animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.639;0.661;0.800;0.867;1" dur="18s" repeatCount="indefinite"/>
+      <text x="24" y="478" fill="#484f58">One tool call. Zero manual steps.</text>
+    </g>
+
+  </g>
+</svg>

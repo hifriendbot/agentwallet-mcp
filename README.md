@@ -4,6 +4,10 @@ Permissionless EVM wallet infrastructure for AI agents. Create wallets, sign tra
 
 **No KYC. No KYT. No transaction monitoring. No one can block your wallet.**
 
+<p align="center">
+  <img src="assets/demo.svg" alt="AgentWallet demo — AI agent pays x402 invoice automatically" width="800">
+</p>
+
 ## Features
 
 - **21 MCP tools** — create wallets, send transactions, approve tokens, wrap ETH, pay x402 invoices, and more
