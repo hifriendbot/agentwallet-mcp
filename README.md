@@ -1,6 +1,6 @@
 # AgentWallet MCP Server
 
-Permissionless EVM wallet infrastructure for AI agents. Create wallets, sign transactions, and broadcast on-chain — on any EVM chain.
+Permissionless EVM wallet infrastructure for AI agents. Create wallets, sign transactions, and broadcast on-chain — on any EVM chain. Up to 50% less expensive than Coinbase.
 
 **No KYC. No KYT. No transaction monitoring. No one can block your wallet.**
 
@@ -18,8 +18,10 @@ Permissionless EVM wallet infrastructure for AI agents. Create wallets, sign tra
 
 ## Pricing
 
-- **$0.0069 per transaction** (31% less expensive than Coinbase CDP)
-- **6,000 free transactions/month**
+- **$0.00345 per operation** (31% less expensive than Coinbase CDP)
+- **12,000 free operations/month**
+- **$0.0005 per x402 verification** (50% less expensive than Coinbase)
+- **1,000 free x402 verifications/month**
 - No monthly fee, no tiers — just pay as you go
 
 ## Quick Start
@@ -178,7 +180,7 @@ When an agent hits the paywall URL:
 3. Retries with proof of payment
 4. Receives the protected content
 
-On-chain verification ensures every payment is real. Replay protection prevents double-spending. Revenue tracking shows you who paid, how much, and when.
+On-chain verification ensures every payment is real. Replay protection prevents double-spending. Revenue tracking shows you who paid, how much, and when. 1,000 free verifications/month, then $0.0005 each — 50% less expensive than Coinbase.
 
 ## Security
 
