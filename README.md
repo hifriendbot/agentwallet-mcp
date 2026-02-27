@@ -19,7 +19,7 @@ Permissionless EVM wallet infrastructure for AI agents. Create wallets, sign tra
 ## Pricing
 
 - **$0.00345 per operation** (31% less expensive than Coinbase CDP)
-- **12,000 free operations/month**
+- **6,000 free operations/month**
 - **$0.0005 per x402 verification** (50% less expensive than Coinbase)
 - **1,000 free x402 verifications/month**
 - No monthly fee, no tiers — just pay as you go
