@@ -1,8 +1,8 @@
 # AgentWallet MCP Server
 
-Permissionless EVM wallet infrastructure for AI agents. Create wallets, sign transactions, and broadcast on-chain — on any EVM chain. Up to 50% less expensive than Coinbase.
+Permissionless wallet infrastructure for AI agents. Create wallets, sign transactions, and broadcast on-chain — on any EVM chain and Solana. Up to 50% less expensive than Coinbase. Built-in guards. No KYC.
 
-**No KYC. No KYT. No transaction monitoring. No one can block your wallet.**
+**No KYC. No KYT. No approval process. No transaction monitoring. No one can block your wallet.**
 
 <p align="center">
   <img src="assets/demo.svg" alt="AgentWallet demo — AI agent pays x402 invoice automatically" width="800">
@@ -10,11 +10,14 @@ Permissionless EVM wallet infrastructure for AI agents. Create wallets, sign tra
 
 ## Features
 
-- **28 MCP tools** — create wallets, send transactions, approve tokens, wrap ETH, pay and accept x402 payments, and more
-- **Any EVM chain** — Ethereum, Base, Polygon, BSC, Arbitrum, Optimism, Avalanche, Zora, PulseChain, and any other EVM-compatible chain
-- **x402 payments** — pay for x402-enabled APIs automatically, or accept x402 payments on your own endpoints
+- **28 MCP tools** — create wallets, send transactions, approve tokens, wrap ETH, transfer SPL tokens, pay and accept x402 payments, and more
+- **EVM + Solana** — Ethereum, Base, Polygon, BSC, Arbitrum, Optimism, Avalanche, Zora, PulseChain, Solana, and any other EVM-compatible chain
+- **SOL + SPL tokens** — native SOL transfers and SPL token transfers (USDC, USDT, etc.) with automatic account creation
+- **Built-in guards** — daily spending limits, gas price protection, emergency pause, rate limiting, replay protection, and on-chain verification — all active by default
+- **x402 payments** — pay for x402-enabled APIs automatically, or accept x402 payments on your own endpoints (EVM and Solana)
 - **Secure** — Private keys encrypted at rest, decrypted only during signing, zeroed from memory immediately after
-- **Permissionless** — No identity verification, no compliance gatekeeping. Create a wallet and transact immediately.
+- **Permissionless** — No KYC. No KYT. No identity verification. No approval process. No compliance gatekeeping. Sign up, get an API key, and start transacting immediately.
+- **30-second setup** — three lines of config. No SDK to install. No dependencies to manage.
 
 ## Pricing
 
@@ -26,7 +29,7 @@ Permissionless EVM wallet infrastructure for AI agents. Create wallets, sign tra
 
 ## Quick Start
 
-Get your free API key at [hifriendbot.com/wallet](https://hifriendbot.com/wallet) (no credit card required).
+Get your free API key at [hifriendbot.com/wallet](https://hifriendbot.com/wallet) — no credit card required, no KYC, no approval wait.
 
 ### Claude Desktop / OpenClaw
 
@@ -81,14 +84,14 @@ Add to your settings:
 
 | Tool | Description |
 |------|-------------|
-| `create_wallet` | Create a new wallet on any EVM chain |
+| `create_wallet` | Create a new EVM or Solana wallet |
 | `list_wallets` | List all your wallets |
 | `get_wallet` | Get wallet details by ID |
 | `get_balance` | Check native token balance on any chain |
-| `get_token_balance` | Check ERC-20 token balance |
+| `get_token_balance` | Check ERC-20 or SPL token balance |
 | `get_token_info` | Get ERC-20 token name, symbol, and decimals |
-| `transfer` | Send native tokens (ETH, POL, BNB, etc.) |
-| `transfer_token` | Send ERC-20 tokens (USDC, USDT, etc.) |
+| `transfer` | Send native tokens (ETH, SOL, POL, BNB, etc.) |
+| `transfer_token` | Send ERC-20 or SPL tokens (USDC, USDT, etc.) |
 | `send_transaction` | Sign and broadcast a raw transaction |
 | `sign_transaction` | Sign a transaction without broadcasting |
 | `call_contract` | Read-only contract call (eth_call) |
@@ -123,6 +126,8 @@ Add to your settings:
 | Avalanche | 43114 | AVAX | USDC |
 | Zora | 7777777 | ETH | USDC |
 | PulseChain | 369 | PLS | USDC |
+| Solana | 900 | SOL | USDC |
+| Solana Devnet | 901 | SOL | USDC |
 
 ## Use Case: GuessMarket
 
@@ -156,7 +161,7 @@ pay_x402(
 )
 ```
 
-Supports ERC-20 tokens (USDC, USDT) and native tokens on any chain. Compatible with x402 V1 and V2 (CAIP-2 chain identifiers).
+Supports ERC-20 tokens, SPL tokens, and native tokens on EVM and Solana. Compatible with x402 V1 and V2 (CAIP-2 chain identifiers).
 
 ## x402 Acceptance
 
@@ -182,11 +187,35 @@ When an agent hits the paywall URL:
 
 On-chain verification ensures every payment is real. Replay protection prevents double-spending. Revenue tracking shows you who paid, how much, and when. 1,000 free verifications/month, then $0.0005 each — 50% less expensive than Coinbase.
 
-## Security
+## How We Compare
 
-- Private keys are generated server-side and encrypted at rest
-- Keys are decrypted only during transaction signing and zeroed from memory immediately after
-- EIP-1559 transactions only with gas safety caps
+| Feature | Coinbase CDP | AgentWallet |
+|---------|-------------|-------------|
+| Setup Time | Install SDK + configure | **3 lines of config** |
+| Approval Process | Identity verification required | **None — instant access** |
+| KYC Required | Yes | **No** |
+| KYT / Transaction Monitoring | Yes | **No** |
+| Can Block Your Wallet | Yes | **No** |
+| Built-in Guards | Yes (requires setup) | **Yes (active by default)** |
+| Free Operations / Month | 5,000 | **6,000** |
+| Cost Per Operation | $0.005 | **$0.00345** |
+| x402 Verification Cost | $0.001 | **$0.0005** |
+| x402 Acceptance (Paywalls) | No | **Yes** |
+| Supported Chains | 8 EVM + Solana | **Any EVM + Solana** |
+| Token Tools | Yes | **ERC-20 + SPL (28 tools)** |
+
+## Built-in Guards
+
+All guards are active by default — no configuration required.
+
+- **Encrypted at rest** — private keys encrypted before storage and never leave the server
+- **Memory zeroing** — keys wiped from memory immediately after every signing operation
+- **Daily spending limits** — set a per-wallet daily cap in USD, enforced automatically on every transaction
+- **Gas price protection** — transactions blocked when gas prices spike above safe thresholds
+- **Emergency pause** — instantly freeze any wallet or all wallets with one click
+- **Rate limiting** — API requests capped per minute to prevent abuse and brute force attacks
+- **Replay protection** — every x402 payment verified on-chain with unique transaction tracking
+- **On-chain verification** — x402 payments verified directly on the blockchain with finalized commitment
 - Bug bounty program: $50–$500 for responsible disclosure ([details](https://hifriendbot.com/wallet))
 
 ## Links

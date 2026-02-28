@@ -53,6 +53,25 @@ function jsonResponse(data: unknown) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
 }
 
+// ─── Solana Helpers ───────────────────────────────────────────────
+
+const SOLANA_CHAIN_IDS = new Set([900, 901, 902]);
+
+function isSolanaChain(chainId: number): boolean {
+  return SOLANA_CHAIN_IDS.has(chainId);
+}
+
+/**
+ * Validate an address — accepts both EVM (0x...) and Solana (Base58).
+ */
+function isValidAddress(address: string): boolean {
+  // EVM: 0x + 40 hex chars
+  if (/^0x[a-fA-F0-9]{40}$/.test(address)) return true;
+  // Solana: 32-44 chars, Base58 alphabet (no 0, O, I, l)
+  if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address)) return true;
+  return false;
+}
+
 // ─── EVM Helpers ──────────────────────────────────────────────────
 
 /**
@@ -111,6 +130,14 @@ const X402_NETWORKS: Record<string, number> = {
   'avalanche': 43114,
   'zora': 7777777,
   'pulsechain': 369,
+  'solana': 900,
+  'solana-devnet': 901,
+};
+
+// Solana genesis hash prefixes for CAIP-2
+const SOLANA_GENESIS: Record<number, string> = {
+  900: '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp',  // mainnet-beta
+  901: 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1',  // devnet
 };
 
 /**
@@ -118,9 +145,17 @@ const X402_NETWORKS: Record<string, number> = {
  * Supports plain names ("base"), CAIP-2 format ("eip155:8453"), and raw chain IDs ("8453").
  */
 function resolveChainId(network: string): number | null {
-  if (X402_NETWORKS[network]) return X402_NETWORKS[network];
+  const lower = network.toLowerCase();
+  if (X402_NETWORKS[lower]) return X402_NETWORKS[lower];
   const caipMatch = network.match(/^eip155:(\d+)$/);
   if (caipMatch) return parseInt(caipMatch[1], 10);
+  // Solana CAIP-2: solana:<genesis_prefix>
+  const solanaMatch = network.match(/^solana:(.+)$/);
+  if (solanaMatch) {
+    for (const [chainId, genesis] of Object.entries(SOLANA_GENESIS)) {
+      if (solanaMatch[1] === genesis) return parseInt(chainId, 10);
+    }
+  }
   const num = parseInt(network, 10);
   if (!isNaN(num) && num > 0) return num;
   return null;
@@ -130,18 +165,18 @@ function resolveChainId(network: string): number | null {
 
 const server = new McpServer({
   name: 'agentwallet',
-  version: '1.4.0',
+  version: '1.7.0',
 });
 
 // ─── Tool: create_wallet ─────────────────────────────────────────
 
 server.tool(
   'create_wallet',
-  'Create a new EVM wallet. Returns the wallet ID and address. ' +
+  'Create a new EVM or Solana wallet. Returns the wallet ID and address. ' +
     'Private key is encrypted server-side and never exposed.',
   {
     label: z.string().default('').describe('Friendly name for the wallet'),
-    chain_id: z.number().int().default(8453).describe('Default chain ID (1=Ethereum, 8453=Base, 42161=Arbitrum, 10=Optimism, 137=Polygon, 43114=Avalanche, 56=BSC, 7777777=Zora, 369=PulseChain)'),
+    chain_id: z.number().int().default(8453).describe('Default chain ID (1=Ethereum, 8453=Base, 42161=Arbitrum, 10=Optimism, 137=Polygon, 43114=Avalanche, 56=BSC, 7777777=Zora, 369=PulseChain, 900=Solana, 901=Solana Devnet)'),
   },
   async ({ label, chain_id }) => {
     const data = await api('/wallets', 'POST', { label, chain_id });
@@ -182,7 +217,7 @@ server.tool(
 server.tool(
   'get_balance',
   'Get the native token balance for a wallet on a specific chain. ' +
-    'Returns balance in both wei and human-readable format.',
+    'Returns balance in both wei (or lamports for Solana) and human-readable format.',
   {
     wallet_id: z.number().int().describe('Wallet ID'),
     chain_id: z.number().int().optional().describe('Chain ID to check (defaults to wallet\'s default chain)'),
@@ -198,25 +233,41 @@ server.tool(
 
 server.tool(
   'sign_transaction',
-  'Sign an EVM transaction with a wallet\'s private key. ' +
-    'Returns the signed raw transaction hex (ready for manual broadcast). ' +
+  'Sign a transaction with a wallet\'s private key. ' +
+    'For EVM: returns signed raw transaction hex. For Solana: returns base64 signed transaction. ' +
     'Does NOT broadcast — use send_transaction for sign + broadcast.',
   {
     wallet_id: z.number().int().describe('Wallet ID'),
-    to: z.string().regex(/^0x[a-fA-F0-9]{40}$/).describe('Destination address'),
+    to: z.string().describe('Destination address (0x-prefixed for EVM, Base58 for Solana)'),
     chain_id: z.number().int().optional().describe('Chain ID (defaults to wallet\'s default)'),
-    value: z.string().default('0').describe('Value in wei (decimal string)'),
-    data: z.string().default('').describe('Hex-encoded calldata (0x-prefixed) for contract calls'),
-    gas_limit: z.string().optional().describe('Gas limit (auto-estimated if omitted)'),
-    max_fee: z.string().optional().describe('Max fee per gas in wei (auto if omitted)'),
-    priority_fee: z.string().optional().describe('Max priority fee per gas in wei (auto if omitted)'),
+    value: z.string().default('0').describe('Value in wei/lamports (decimal string)'),
+    data: z.string().default('').describe('Hex-encoded calldata (0x-prefixed) for EVM contract calls'),
+    gas_limit: z.string().optional().describe('Gas limit — EVM only (auto-estimated if omitted)'),
+    max_fee: z.string().optional().describe('Max fee per gas in wei — EVM only (auto if omitted)'),
+    priority_fee: z.string().optional().describe('Max priority fee per gas in wei — EVM only (auto if omitted)'),
+    token_mint: z.string().optional().describe('SPL token mint address — Solana only (for SPL token transfers)'),
+    token_decimals: z.number().int().optional().describe('SPL token decimals — Solana only (6 for USDC)'),
   },
-  async ({ wallet_id, to, chain_id, value, data, gas_limit, max_fee, priority_fee }) => {
-    const body: Record<string, unknown> = { to, value, data };
+  async ({ wallet_id, to, chain_id, value, data, gas_limit, max_fee, priority_fee, token_mint, token_decimals }) => {
+    // Validate address format
+    if (!isValidAddress(to)) {
+      throw new Error(`Invalid address "${to}". Use 0x-prefixed hex for EVM or Base58 for Solana.`);
+    }
+
+    const body: Record<string, unknown> = { to, value };
     if (chain_id) body.chain_id = chain_id;
-    if (gas_limit) body.gas_limit = gas_limit;
-    if (max_fee) body.max_fee = max_fee;
-    if (priority_fee) body.priority_fee = priority_fee;
+
+    if (isSolanaChain(chain_id ?? 0)) {
+      // Solana-specific params
+      if (token_mint) body.token_mint = token_mint;
+      if (token_decimals !== undefined) body.token_decimals = token_decimals;
+    } else {
+      // EVM-specific params
+      body.data = data;
+      if (gas_limit) body.gas_limit = gas_limit;
+      if (max_fee) body.max_fee = max_fee;
+      if (priority_fee) body.priority_fee = priority_fee;
+    }
 
     const result = await api(`/wallets/${wallet_id}/sign`, 'POST', body);
     return jsonResponse(result);
@@ -227,25 +278,41 @@ server.tool(
 
 server.tool(
   'send_transaction',
-  'Sign and broadcast an EVM transaction. ' +
-    'Returns the transaction hash on success. ' +
+  'Sign and broadcast a transaction. ' +
+    'Returns the transaction hash (EVM) or signature (Solana) on success. ' +
     'The transaction is signed server-side and broadcast via RPC.',
   {
     wallet_id: z.number().int().describe('Wallet ID'),
-    to: z.string().regex(/^0x[a-fA-F0-9]{40}$/).describe('Destination address'),
+    to: z.string().describe('Destination address (0x-prefixed for EVM, Base58 for Solana)'),
     chain_id: z.number().int().optional().describe('Chain ID (defaults to wallet\'s default)'),
-    value: z.string().default('0').describe('Value in wei (decimal string)'),
-    data: z.string().default('').describe('Hex-encoded calldata (0x-prefixed) for contract calls'),
-    gas_limit: z.string().optional().describe('Gas limit (auto-estimated if omitted)'),
-    max_fee: z.string().optional().describe('Max fee per gas in wei (auto if omitted)'),
-    priority_fee: z.string().optional().describe('Max priority fee per gas in wei (auto if omitted)'),
+    value: z.string().default('0').describe('Value in wei/lamports (decimal string)'),
+    data: z.string().default('').describe('Hex-encoded calldata (0x-prefixed) for EVM contract calls'),
+    gas_limit: z.string().optional().describe('Gas limit — EVM only (auto-estimated if omitted)'),
+    max_fee: z.string().optional().describe('Max fee per gas in wei — EVM only (auto if omitted)'),
+    priority_fee: z.string().optional().describe('Max priority fee per gas in wei — EVM only (auto if omitted)'),
+    token_mint: z.string().optional().describe('SPL token mint address — Solana only (for SPL token transfers)'),
+    token_decimals: z.number().int().optional().describe('SPL token decimals — Solana only (6 for USDC)'),
   },
-  async ({ wallet_id, to, chain_id, value, data, gas_limit, max_fee, priority_fee }) => {
-    const body: Record<string, unknown> = { to, value, data };
+  async ({ wallet_id, to, chain_id, value, data, gas_limit, max_fee, priority_fee, token_mint, token_decimals }) => {
+    // Validate address format
+    if (!isValidAddress(to)) {
+      throw new Error(`Invalid address "${to}". Use 0x-prefixed hex for EVM or Base58 for Solana.`);
+    }
+
+    const body: Record<string, unknown> = { to, value };
     if (chain_id) body.chain_id = chain_id;
-    if (gas_limit) body.gas_limit = gas_limit;
-    if (max_fee) body.max_fee = max_fee;
-    if (priority_fee) body.priority_fee = priority_fee;
+
+    if (isSolanaChain(chain_id ?? 0)) {
+      // Solana-specific params
+      if (token_mint) body.token_mint = token_mint;
+      if (token_decimals !== undefined) body.token_decimals = token_decimals;
+    } else {
+      // EVM-specific params
+      body.data = data;
+      if (gas_limit) body.gas_limit = gas_limit;
+      if (max_fee) body.max_fee = max_fee;
+      if (priority_fee) body.priority_fee = priority_fee;
+    }
 
     const result = await api(`/wallets/${wallet_id}/send`, 'POST', body);
     return jsonResponse(result);
@@ -256,25 +323,35 @@ server.tool(
 
 server.tool(
   'transfer',
-  'Send native tokens (ETH, AVAX, BNB, POL, PLS) to an address. ' +
+  'Send native tokens (ETH, AVAX, BNB, POL, PLS, SOL) to an address. ' +
     'Specify the amount in human-readable format (e.g. "0.1" for 0.1 ETH). ' +
-    'The amount is converted to wei automatically. Signs and broadcasts the transaction.',
+    'The amount is converted to wei/lamports automatically. Signs and broadcasts the transaction.',
   {
     wallet_id: z.number().int().describe('Wallet ID to send from'),
-    to: z.string().regex(/^0x[a-fA-F0-9]{40}$/).describe('Destination address'),
+    to: z.string().describe('Destination address (0x-prefixed for EVM, Base58 for Solana)'),
     amount: z.string().describe('Amount to send in human-readable format (e.g. "0.1" for 0.1 ETH)'),
-    chain_id: z.number().int().describe('Chain ID (1=Ethereum, 8453=Base, 42161=Arbitrum, 10=Optimism, 137=Polygon, 43114=Avalanche, 56=BSC, 7777777=Zora, 369=PulseChain)'),
+    chain_id: z.number().int().describe('Chain ID (1=Ethereum, 8453=Base, 42161=Arbitrum, 10=Optimism, 137=Polygon, 43114=Avalanche, 56=BSC, 7777777=Zora, 369=PulseChain, 900=Solana, 901=Solana Devnet)'),
   },
   async ({ wallet_id, to, amount, chain_id }) => {
-    // Convert human-readable to wei (18 decimals for all native tokens)
-    const valueWei = parseUnits(amount, 18);
+    // Validate address format
+    if (!isValidAddress(to)) {
+      throw new Error(`Invalid address "${to}". Use 0x-prefixed hex for EVM or Base58 for Solana.`);
+    }
 
-    const result = await api(`/wallets/${wallet_id}/send`, 'POST', {
+    // SOL uses 9 decimals (lamports), EVM native tokens use 18 decimals (wei)
+    const decimals = isSolanaChain(chain_id) ? 9 : 18;
+    const valueRaw = parseUnits(amount, decimals);
+
+    const body: Record<string, unknown> = {
       to,
-      value: valueWei,
+      value: valueRaw,
       chain_id,
-      data: '',
-    });
+    };
+    if (!isSolanaChain(chain_id)) {
+      body.data = '';
+    }
+
+    const result = await api(`/wallets/${wallet_id}/send`, 'POST', body);
 
     return jsonResponse({
       ...(result as Record<string, unknown>),
@@ -288,20 +365,35 @@ server.tool(
 
 server.tool(
   'get_token_balance',
-  'Get the ERC-20 token balance for a wallet on a specific chain. ' +
+  'Get the ERC-20 or SPL token balance for a wallet on a specific chain. ' +
     'Returns the raw balance and human-readable balance. ' +
     'Use get_chains to find stablecoin addresses for each chain.',
   {
     wallet_id: z.number().int().describe('Wallet ID to check'),
-    token: z.string().regex(/^0x[a-fA-F0-9]{40}$/).describe('ERC-20 token contract address'),
+    token: z.string().describe('Token address (0x-prefixed ERC-20 contract for EVM, Base58 mint for Solana)'),
     chain_id: z.number().int().describe('Chain ID to check on'),
     decimals: z.number().int().default(18).describe('Token decimals (6 for USDC, 18 for most tokens)'),
   },
   async ({ wallet_id, token, chain_id, decimals }) => {
-    const params = `?chain_id=${chain_id}&token=${token}`;
-    const data = await api(`/wallets/${wallet_id}/token-balance${params}`) as { balance_raw: string };
+    // Validate token address format
+    if (!isValidAddress(token)) {
+      throw new Error(`Invalid token address "${token}". Use 0x-prefixed hex for EVM or Base58 for Solana.`);
+    }
 
-    const balanceFormatted = formatUnits(data.balance_raw, decimals);
+    const params = `?chain_id=${chain_id}&token=${token}`;
+    const data = await api(`/wallets/${wallet_id}/token-balance${params}`) as { balance_raw?: string; balance_formatted?: string; decimals?: number };
+
+    // Solana API returns balance_formatted + decimals directly
+    if (isSolanaChain(chain_id) && data.balance_formatted !== undefined) {
+      return jsonResponse({
+        ...data,
+        balance: data.balance_formatted,
+        decimals: data.decimals ?? decimals,
+      });
+    }
+
+    // EVM: format from raw
+    const balanceFormatted = formatUnits(data.balance_raw || '0', decimals);
 
     return jsonResponse({
       ...data,
@@ -315,28 +407,48 @@ server.tool(
 
 server.tool(
   'transfer_token',
-  'Send ERC-20 tokens (USDC, USDT, etc.) to an address. ' +
+  'Send ERC-20 tokens (EVM) or SPL tokens (Solana) to an address. ' +
     'Specify the amount in human-readable format (e.g. "100" for 100 USDC). ' +
     'Signs and broadcasts the transaction. Use get_chains to find stablecoin addresses.',
   {
     wallet_id: z.number().int().describe('Wallet ID to send from'),
-    token: z.string().regex(/^0x[a-fA-F0-9]{40}$/).describe('ERC-20 token contract address'),
-    to: z.string().regex(/^0x[a-fA-F0-9]{40}$/).describe('Recipient address'),
+    token: z.string().describe('Token address (0x-prefixed ERC-20 contract for EVM, Base58 mint for Solana)'),
+    to: z.string().describe('Recipient address (0x-prefixed for EVM, Base58 for Solana)'),
     amount: z.string().describe('Amount in human-readable format (e.g. "100" for 100 USDC)'),
     chain_id: z.number().int().describe('Chain ID'),
     decimals: z.number().int().default(18).describe('Token decimals (6 for USDC, 18 for most tokens)'),
   },
   async ({ wallet_id, token, to, amount, chain_id, decimals }) => {
-    // Encode ERC-20 transfer(address, uint256) calldata
-    const rawAmount = parseUnits(amount, decimals);
-    const calldata = '0xa9059cbb' + padAddress(to) + encodeUint256(rawAmount);
+    // Validate addresses
+    if (!isValidAddress(token)) {
+      throw new Error(`Invalid token address "${token}". Use 0x-prefixed hex for EVM or Base58 for Solana.`);
+    }
+    if (!isValidAddress(to)) {
+      throw new Error(`Invalid recipient address "${to}". Use 0x-prefixed hex for EVM or Base58 for Solana.`);
+    }
 
-    const result = await api(`/wallets/${wallet_id}/send`, 'POST', {
-      to: token,       // Send TX to the token contract
-      value: '0',      // No native value for token transfers
-      data: calldata,
-      chain_id,
-    });
+    const rawAmount = parseUnits(amount, decimals);
+    let result: unknown;
+
+    if (isSolanaChain(chain_id)) {
+      // Solana SPL transfer — the server handles ATA derivation + instruction building
+      result = await api(`/wallets/${wallet_id}/send`, 'POST', {
+        to,
+        value: rawAmount,
+        token_mint: token,
+        token_decimals: decimals,
+        chain_id,
+      });
+    } else {
+      // EVM ERC-20 transfer(address, uint256) calldata
+      const calldata = '0xa9059cbb' + padAddress(to) + encodeUint256(rawAmount);
+      result = await api(`/wallets/${wallet_id}/send`, 'POST', {
+        to: token,       // Send TX to the token contract
+        value: '0',      // No native value for token transfers
+        data: calldata,
+        chain_id,
+      });
+    }
 
     return jsonResponse({
       ...(result as Record<string, unknown>),
@@ -361,6 +473,9 @@ server.tool(
     data: z.string().describe('ABI-encoded calldata (0x-prefixed hex)'),
   },
   async ({ chain_id, to, data }) => {
+    if (isSolanaChain(chain_id)) {
+      throw new Error('call_contract is not supported on Solana. Use Solana-specific RPC methods instead.');
+    }
     const result = await api('/eth-call', 'POST', { chain_id, to, data });
     return jsonResponse(result);
   },
@@ -382,6 +497,9 @@ server.tool(
     decimals: z.number().int().default(18).describe('Token decimals (6 for USDC, 18 for most tokens)'),
   },
   async ({ wallet_id, token, spender, amount, chain_id, decimals }) => {
+    if (isSolanaChain(chain_id)) {
+      throw new Error('approve_token is not supported on Solana. Solana SPL tokens do not use ERC-20 style approvals.');
+    }
     // approve(address spender, uint256 amount) — selector: 0x095ea7b3
     let rawAmount: string;
     if (amount.toLowerCase() === 'max') {
@@ -422,6 +540,9 @@ server.tool(
     decimals: z.number().int().default(18).describe('Token decimals (6 for USDC, 18 for most tokens)'),
   },
   async ({ wallet_id, token, spender, chain_id, decimals }) => {
+    if (isSolanaChain(chain_id)) {
+      throw new Error('get_allowance is not supported on Solana. Solana SPL tokens do not use ERC-20 style allowances.');
+    }
     // First get the wallet address
     const wallet = await api(`/wallets/${wallet_id}`) as { address: string };
 
@@ -473,6 +594,9 @@ server.tool(
     chain_id: z.number().int().describe('Chain ID'),
   },
   async ({ wallet_id, amount, chain_id }) => {
+    if (isSolanaChain(chain_id)) {
+      throw new Error('wrap_eth is not supported on Solana. Solana does not use wrapped native tokens like WETH.');
+    }
     const wrapped = WRAPPED_NATIVE[chain_id];
     if (!wrapped) {
       throw new Error(`No wrapped native token configured for chain ${chain_id}`);
@@ -509,6 +633,9 @@ server.tool(
     chain_id: z.number().int().describe('Chain ID'),
   },
   async ({ wallet_id, amount, chain_id }) => {
+    if (isSolanaChain(chain_id)) {
+      throw new Error('unwrap_eth is not supported on Solana. Solana does not use wrapped native tokens like WETH.');
+    }
     const wrapped = WRAPPED_NATIVE[chain_id];
     if (!wrapped) {
       throw new Error(`No wrapped native token configured for chain ${chain_id}`);
@@ -568,6 +695,9 @@ server.tool(
     chain_id: z.number().int().describe('Chain ID'),
   },
   async ({ token, chain_id }) => {
+    if (isSolanaChain(chain_id)) {
+      throw new Error('get_token_info is not supported on Solana. Use Solana token metadata programs to query SPL token details.');
+    }
     // Make 3 parallel eth_call requests: name(), symbol(), decimals()
     const [nameResult, symbolResult, decimalsResult] = await Promise.all([
       api('/eth-call', 'POST', { chain_id, to: token, data: '0x06fdde03' }).catch(() => ({ result: '0x' })),
@@ -725,8 +855,27 @@ server.tool(
     // Step 5: Execute payment
     let txResult: Record<string, unknown>;
 
-    if (option.extra?.token) {
-      // ERC-20 token payment (e.g. USDC)
+    if (isSolanaChain(chainId)) {
+      // Solana payment
+      if (option.extra?.token) {
+        // SPL token payment (e.g. USDC on Solana)
+        txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', {
+          to: option.payTo,
+          value: option.maxAmountRequired,
+          token_mint: option.extra.token,
+          token_decimals: option.requiredDecimals,
+          chain_id: chainId,
+        })) as Record<string, unknown>;
+      } else {
+        // Native SOL payment
+        txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', {
+          to: option.payTo,
+          value: option.maxAmountRequired,
+          chain_id: chainId,
+        })) as Record<string, unknown>;
+      }
+    } else if (option.extra?.token) {
+      // EVM ERC-20 token payment (e.g. USDC)
       const calldata = '0xa9059cbb' + padAddress(option.payTo) + encodeUint256(option.maxAmountRequired);
       txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', {
         to: option.extra.token,
@@ -735,7 +884,7 @@ server.tool(
         chain_id: chainId,
       })) as Record<string, unknown>;
     } else {
-      // Native token payment (ETH, etc.)
+      // EVM native token payment (ETH, etc.)
       txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', {
         to: option.payTo,
         value: option.maxAmountRequired,
@@ -744,7 +893,8 @@ server.tool(
       })) as Record<string, unknown>;
     }
 
-    const txHash = txResult.tx_hash as string;
+    // Solana returns 'signature', EVM returns 'tx_hash'
+    const txHash = (txResult.tx_hash || txResult.signature) as string;
 
     // Step 6: Build x402 payment proof and retry
     const paymentProof = {
@@ -832,7 +982,7 @@ server.tool(
 
 server.tool(
   'get_chains',
-  'List all supported EVM chains with their chain IDs, native tokens, ' +
+  'List all supported chains (EVM + Solana) with their chain IDs, native tokens, ' +
     'stablecoins, and RPC configuration status.',
   {},
   async () => {
@@ -868,8 +1018,8 @@ server.tool(
     name: z.string().describe('Human-readable paywall name (e.g. "Premium API Access")'),
     description: z.string().default('').describe('Description shown in the 402 response'),
     amount: z.string().describe('Price in human-readable format (e.g. "0.01" for 0.01 USDC)'),
-    token_type: z.enum(['erc20', 'native']).default('erc20').describe('"erc20" for stablecoin payments, "native" for ETH/POL/etc.'),
-    token_address: z.string().default('').describe('ERC-20 token contract address (required if token_type is "erc20"). Use get_chains to find stablecoin addresses.'),
+    token_type: z.enum(['erc20', 'spl', 'native']).default('erc20').describe('"erc20" for EVM stablecoins, "spl" for Solana SPL tokens, "native" for ETH/SOL/POL/etc.'),
+    token_address: z.string().default('').describe('Token contract address (ERC-20 for EVM, SPL mint Base58 for Solana). Required if token_type is "erc20" or "spl". Use get_chains to find stablecoin addresses.'),
     token_decimals: z.number().int().default(6).describe('Token decimals (6 for USDC, 18 for ETH/most tokens)'),
     token_name: z.string().default('USDC').describe('Token display name (e.g. "USDC", "ETH")'),
     chain_id: z.number().int().default(8453).describe('Chain ID for payments (8453=Base, 1=Ethereum, etc.)'),
