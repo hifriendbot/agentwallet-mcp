@@ -1,6 +1,6 @@
 {
   "name": "agentwallet-mcp",
-  "version": "1.7.1",
+  "version": "1.7.2",
   "description": "MCP server for AgentWallet — lets AI agents create wallets, sign transactions, broadcast on EVM + Solana, pay x402 invoices, and accept x402 payments",
   "type": "module",
   "main": "build/index.js",

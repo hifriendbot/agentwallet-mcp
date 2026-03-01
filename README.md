@@ -1,8 +1,8 @@
 # AgentWallet MCP Server
 
-Permissionless wallet infrastructure for AI agents. Create wallets, sign transactions, and broadcast on-chain — on any EVM chain and Solana. Up to 50% less expensive than Coinbase. Built-in guards. No KYC.
+Permissionless wallet infrastructure for AI agents. Create wallets, sign transactions, and broadcast on-chain — on any EVM chain and Solana. Up to 50% less expensive than Coinbase. Built-in guards. No KYC. The only AI agent wallet that accepts crypto for its own API fees.
 
-**No KYC. No KYT. No approval process. No transaction monitoring. No one can block your wallet.**
+**No KYC. No KYT. No approval process. No transaction monitoring. No one can block your wallet. Pay with USDC on-chain — no credit card required.**
 
 <p align="center">
   <img src="assets/demo.svg" alt="AgentWallet demo — AI agent pays x402 invoice automatically" width="800">
@@ -10,7 +10,7 @@ Permissionless wallet infrastructure for AI agents. Create wallets, sign transac
 
 ## Features
 
-- **28 MCP tools** — create wallets, send transactions, approve tokens, wrap ETH, transfer SPL tokens, pay and accept x402 payments, and more
+- **29 MCP tools** — create wallets, send transactions, approve tokens, wrap ETH, transfer SPL tokens, pay and accept x402 payments, and more
 - **EVM + Solana** — Ethereum, Base, Polygon, BSC, Arbitrum, Optimism, Avalanche, Zora, PulseChain, Solana, and any other EVM-compatible chain
 - **SOL + SPL tokens** — native SOL transfers and SPL token transfers (USDC, USDT, etc.) with automatic account creation
 - **Built-in guards** — daily spending limits, gas price protection, emergency pause, rate limiting, replay protection, and on-chain verification — all active by default
@@ -25,6 +25,7 @@ Permissionless wallet infrastructure for AI agents. Create wallets, sign transac
 - **6,000 free operations/month**
 - **$0.0005 per x402 verification** (50% less expensive than Coinbase)
 - **1,000 free x402 verifications/month**
+- **Pay with USDC on-chain** via x402 — no credit card required
 - No monthly fee, no tiers — just pay as you go
 
 ## Quick Start
@@ -43,12 +44,15 @@ Add to your config:
       "args": ["-y", "agentwallet-mcp"],
       "env": {
         "AGENTWALLET_USER": "your_username",
-        "AGENTWALLET_PASS": "your_api_key"
+        "AGENTWALLET_PASS": "your_api_key",
+        "AGENTWALLET_WALLET_ID": "1"
       }
     }
   }
 }
 ```
+
+> `AGENTWALLET_WALLET_ID` is optional. Set it to enable x402 auto-pay — when you exceed the free tier without a credit card, the MCP server will automatically pay for operations with USDC from this wallet.
 
 ### Claude Code
 
@@ -56,6 +60,7 @@ Add to your config:
 claude mcp add agentwallet \
   -e AGENTWALLET_USER=your_username \
   -e AGENTWALLET_PASS=your_api_key \
+  -e AGENTWALLET_WALLET_ID=1 \
   -- npx -y agentwallet-mcp
 ```
 
@@ -72,7 +77,8 @@ Add to your settings:
         "args": ["-y", "agentwallet-mcp"],
         "env": {
           "AGENTWALLET_USER": "your_username",
-          "AGENTWALLET_PASS": "your_api_key"
+          "AGENTWALLET_PASS": "your_api_key",
+          "AGENTWALLET_WALLET_ID": "1"
         }
       }
     }
@@ -107,6 +113,7 @@ Add to your settings:
 | `delete_paywall` | Delete a paywall |
 | `get_paywall_payments` | View payment history for a paywall |
 | `get_x402_revenue` | Aggregate revenue stats across all paywalls |
+| `buy_verification_credits` | Buy x402 verification credits with USDC on-chain |
 | `get_usage` | Check your monthly usage and billing |
 | `get_chains` | List all supported chains |
 | `pause_wallet` | Emergency pause a wallet |
@@ -200,9 +207,20 @@ On-chain verification ensures every payment is real. Replay protection prevents 
 | Free Operations / Month | 5,000 | **6,000** |
 | Cost Per Operation | $0.005 | **$0.00345** |
 | x402 Verification Cost | $0.001 | **$0.0005** |
+| Free x402 Verifications / Month | 1,000 | **1,000** |
 | x402 Acceptance (Paywalls) | No | **Yes** |
+| Pay for API Fees with Crypto | No (credit card only) | **Yes (USDC via x402)** |
 | Supported Chains | 8 EVM + Solana | **Any EVM + Solana** |
-| Token Tools | Yes | **ERC-20 + SPL (28 tools)** |
+| Token Tools | Yes | **ERC-20 + SPL (29 tools)** |
+| MCP Server | Yes | **Yes** |
+
+## Pay with Crypto — No Credit Card Required
+
+AgentWallet is the only AI agent wallet infrastructure that accepts crypto for its own API fees. Every competitor — Coinbase CDP, Circle, MoonPay, Crossmint, Turnkey — requires a credit card or monthly invoice. With AgentWallet, your agent can pay for operations with USDC on-chain via the x402 protocol. No credit card, no invoice, no billing portal. Just on-chain payments.
+
+When your agent exceeds the free tier (6,000 ops/month) without a credit card configured, the API returns HTTP 402 with USDC payment instructions. Your agent pays on-chain, retries with proof of payment, and the operation executes. Fully automated via the MCP server.
+
+You can also pre-purchase x402 verification credits with USDC using the `buy_verification_credits` tool — keeping your paywalls running beyond the free 1,000 verifications/month without needing a credit card.
 
 ## Built-in Guards
 

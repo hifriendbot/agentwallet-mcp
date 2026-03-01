@@ -19,16 +19,36 @@ import { z } from 'zod';
 const API_BASE = process.env.AGENTWALLET_API_URL || 'https://hifriendbot.com/wp-json/agentwallet/v1';
 const API_USER = process.env.AGENTWALLET_USER || '';
 const API_PASS = process.env.AGENTWALLET_PASS || '';  // WordPress application password
+const X402_WALLET_ID = process.env.AGENTWALLET_WALLET_ID || '';  // Wallet ID for x402 auto-pay
 
 // ─── API Helper ─────────────────────────────────────────────────
 
-async function api(path: string, method = 'GET', body?: Record<string, unknown>): Promise<unknown> {
+interface X402Accept {
+  scheme: string;
+  maxAmountRequired: string;
+  payTo: string;
+  network: string;
+  requiredDecimals: number;
+  extra?: { token?: string; name?: string };
+}
+
+interface X402Response {
+  x402Version: number;
+  accepts: X402Accept[];
+  error: string;
+}
+
+/**
+ * Make an API call. If the response is 402 and auto-pay is configured,
+ * automatically pay via x402 and retry the request.
+ */
+async function api(path: string, method = 'GET', body?: Record<string, unknown>, extraHeaders?: Record<string, string>): Promise<unknown> {
   const url = `${API_BASE}${path}`;
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
+    ...extraHeaders,
   };
 
-  // Add basic auth if credentials provided
   if (API_USER && API_PASS) {
     headers['Authorization'] = 'Basic ' + Buffer.from(`${API_USER}:${API_PASS}`).toString('base64');
   }
@@ -41,12 +61,104 @@ async function api(path: string, method = 'GET', body?: Record<string, unknown>)
   const res = await fetch(url, options);
   const data = await res.json();
 
+  // Handle 402 Payment Required — auto-pay if wallet configured
+  if (res.status === 402 && X402_WALLET_ID && !extraHeaders?.['X-PAYMENT']) {
+    return handleX402Payment(data as X402Response, path, method, body);
+  }
+
   if (!res.ok) {
     const error = (data as { error?: string }).error || `HTTP ${res.status}`;
     throw new Error(error);
   }
 
   return data;
+}
+
+/**
+ * Handle x402 auto-payment: pay on-chain, then retry the original request
+ */
+async function handleX402Payment(
+  x402Data: X402Response,
+  originalPath: string,
+  originalMethod: string,
+  originalBody?: Record<string, unknown>
+): Promise<unknown> {
+  const accepts = x402Data.accepts;
+  if (!accepts || accepts.length === 0) {
+    throw new Error('402 Payment Required but no payment options available.');
+  }
+
+  const accept = accepts[0]; // Use first option
+  const tokenAddress = accept.extra?.token || '';
+  const amount = accept.maxAmountRequired;
+  const payTo = accept.payTo;
+  const decimals = accept.requiredDecimals || 6;
+
+  // Determine chain_id from network string (CAIP-2, plain name, or raw ID)
+  const network = accept.network || '';
+  const chainId = resolveChainId(network) ?? 8453;
+
+  // Convert human-readable amount to raw (e.g. "0.01" with 6 decimals = "10000")
+  const rawAmount = parseUnits(amount, decimals);
+
+  // Send payment using our wallet (with X-AGW-SKIP-X402 to prevent recursion)
+  let txHash: string;
+  try {
+    if (tokenAddress) {
+      // ERC-20/SPL token transfer
+      const isSOL = isSolanaChain(chainId);
+      const sendResult = await api(
+        `/wallets/${X402_WALLET_ID}/send`,
+        'POST',
+        isSOL
+          ? { chain_id: chainId, to: payTo, value: rawAmount, token_mint: tokenAddress, token_decimals: decimals }
+          : { chain_id: chainId, to: tokenAddress, value: '0', data: buildErc20TransferData(payTo, rawAmount) },
+        { 'X-AGW-SKIP-X402': 'true' }
+      ) as { tx_hash?: string; signature?: string };
+      txHash = sendResult.tx_hash || sendResult.signature || '';
+    } else {
+      // Native transfer
+      const sendResult = await api(
+        `/wallets/${X402_WALLET_ID}/send`,
+        'POST',
+        { chain_id: chainId, to: payTo, value: rawAmount },
+        { 'X-AGW-SKIP-X402': 'true' }
+      ) as { tx_hash?: string; signature?: string };
+      txHash = sendResult.tx_hash || sendResult.signature || '';
+    }
+  } catch (e) {
+    throw new Error(`x402 auto-pay failed: ${(e as Error).message}. Original error: ${x402Data.error}`);
+  }
+
+  if (!txHash) {
+    throw new Error('x402 auto-pay: no transaction hash returned.');
+  }
+
+  // Build X-PAYMENT header (base64-encoded JSON proof)
+  const proof = {
+    x402Version: 1,
+    scheme: 'exact',
+    network: network,
+    payload: { txHash },
+  };
+  const paymentHeader = Buffer.from(JSON.stringify(proof)).toString('base64');
+
+  // Wait briefly for tx confirmation (EVM ~2s, Solana ~6s)
+  const waitMs = isSolanaChain(chainId) ? 8000 : 3000;
+  await new Promise(resolve => setTimeout(resolve, waitMs));
+
+  // Retry original request with payment proof
+  return api(originalPath, originalMethod, originalBody, { 'X-PAYMENT': paymentHeader });
+}
+
+/**
+ * Build ERC-20 transfer(address,uint256) calldata
+ */
+function buildErc20TransferData(to: string, amount: string): string {
+  // transfer(address,uint256) selector = 0xa9059cbb
+  const addressPadded = to.slice(2).toLowerCase().padStart(64, '0');
+  const amountHex = BigInt(amount).toString(16).padStart(64, '0');
+  return '0xa9059cbb' + addressPadded + amountHex;
 }
 
 function jsonResponse(data: unknown) {
@@ -764,8 +876,8 @@ server.tool(
     if (blockedHosts.includes(hostname) || blockedPrefixes.some(p => hostname.startsWith(p))) {
       throw new Error('URL points to a private/internal address. Only public URLs are allowed.');
     }
-    if (!['http:', 'https:'].includes(urlObj.protocol)) {
-      throw new Error('Only http: and https: URLs are supported.');
+    if (urlObj.protocol !== 'https:') {
+      throw new Error('Only HTTPS URLs are supported for x402 payments.');
     }
 
     // Step 1: Make initial request
@@ -946,6 +1058,24 @@ server.tool(
   {},
   async () => {
     const data = await api('/usage');
+    return jsonResponse(data);
+  },
+);
+
+// ─── Tool: buy_verification_credits ─────────────────────────────
+
+server.tool(
+  'buy_verification_credits',
+  'Buy x402 verification credits with USDC on-chain. ' +
+    'Paywall owners need credits to process verifications beyond the free tier (1,000/month) ' +
+    'when they don\'t have Stripe billing configured. ' +
+    'Returns 402 payment instructions — pay on-chain and retry with proof.',
+  {
+    count: z.number().int().min(100).default(1000)
+      .describe('Number of verification credits to purchase (min 100, default 1000)'),
+  },
+  async ({ count }) => {
+    const data = await api('/billing/verification-credits', 'POST', { count });
     return jsonResponse(data);
   },
 );
