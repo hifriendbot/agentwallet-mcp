@@ -275,10 +275,89 @@ function resolveChainId(network: string): number | null {
 
 // ─── Server ──────────────────────────────────────────────────────
 
-const server = new McpServer({
-  name: 'agentwallet',
-  version: '1.7.0',
-});
+const server = new McpServer(
+  {
+    name: 'agentwallet',
+    version: '1.7.2',
+  },
+  {
+    instructions: `AgentWallet gives AI agents their own blockchain wallets. Private keys are encrypted server-side and never exposed — agents sign and broadcast transactions without ever touching raw keys.
+
+## Getting Started
+1. Call list_wallets to see existing wallets, or create_wallet to make a new one.
+2. Fund the wallet by sending tokens to its address from an external source.
+3. Use transfer (native tokens) or transfer_token (ERC-20/SPL tokens) to send funds.
+
+## Supported Chains
+- **EVM chains:** Ethereum (1), Base (8453), Arbitrum (42161), Optimism (10), Polygon (137), Avalanche (43114), BSC (56), Zora (7777777), PulseChain (369)
+- **Solana:** Mainnet (900), Devnet (901)
+- Call get_chains for the full list with native tokens and stablecoin contract addresses.
+
+## EVM vs Solana
+- **Addresses:** EVM uses 0x-prefixed hex (42 chars). Solana uses Base58 (32-44 chars).
+- **Native tokens:** EVM = ETH/POL/BNB/etc (18 decimals, wei). Solana = SOL (9 decimals, lamports).
+- **Token standards:** EVM uses ERC-20. Solana uses SPL tokens.
+- **EVM-only tools:** approve_token, get_allowance, wrap_eth, unwrap_eth, call_contract, get_token_info. These do not work on Solana.
+- **Works on both:** create_wallet, transfer, transfer_token, send_transaction, sign_transaction, get_balance, get_token_balance.
+
+## Common Workflows
+
+### Send native tokens (ETH, SOL, etc.)
+Use the transfer tool with a human-readable amount (e.g. "0.1" ETH). It auto-converts to wei/lamports.
+
+### Send ERC-20 or SPL tokens
+Use transfer_token. You need: wallet_id, token contract address, recipient, amount, chain_id, and decimals (6 for USDC, 18 for most ERC-20s). Call get_chains to find stablecoin addresses.
+
+### Interact with DeFi (EVM only)
+1. Check allowance with get_allowance.
+2. If needed, call approve_token to let the DeFi contract spend your tokens.
+3. Use send_transaction with the contract's calldata to execute the interaction.
+
+### Wrap/unwrap native tokens (EVM only)
+Use wrap_eth to convert ETH → WETH (required by many DeFi protocols). Use unwrap_eth to convert back.
+
+### Read on-chain data (EVM only)
+Use call_contract for gas-free read-only calls (eth_call). Provide ABI-encoded calldata.
+
+## x402 Payments — Paying for Resources
+The pay_x402 tool handles the full x402 payment flow automatically:
+1. Fetches the URL.
+2. If the server returns HTTP 402, parses the payment requirements.
+3. Pays on-chain using your wallet.
+4. Retries the request with proof of payment.
+Always set max_payment to prevent overspending (e.g. "1.00" for max 1 USDC).
+
+## x402 Paywalls — Accepting Payments
+Create paywalls to charge other agents for accessing your resources:
+1. create_paywall — set price, token, chain, and the resource URL to protect.
+2. Share the access URL. Clients that pay on-chain get the resource; others get HTTP 402.
+3. list_paywalls and get_paywall_payments to track revenue.
+4. get_x402_revenue for aggregate stats across all paywalls.
+
+## Wallet Security
+- Use pause_wallet to immediately freeze a wallet if compromised. No transactions can be signed while paused.
+- Use unpause_wallet to resume operations.
+- Use delete_wallet to permanently disable a wallet.
+- Wallets have server-enforced spending limits.
+
+## Tool Selection Guide
+| Goal | Tool |
+|------|------|
+| Send ETH/SOL/native tokens | transfer |
+| Send USDC/ERC-20/SPL tokens | transfer_token |
+| Check native balance | get_balance |
+| Check token balance | get_token_balance |
+| Look up token details | get_token_info (EVM only) |
+| Approve DeFi spending | approve_token (EVM only) |
+| Check approval amount | get_allowance (EVM only) |
+| Read smart contract | call_contract (EVM only) |
+| Custom transaction | send_transaction |
+| Sign without broadcasting | sign_transaction |
+| Pay for x402 resource | pay_x402 |
+| Charge for your resource | create_paywall |
+| Check usage/billing | get_usage |`,
+  },
+);
 
 // ─── Tool: create_wallet ─────────────────────────────────────────
 
