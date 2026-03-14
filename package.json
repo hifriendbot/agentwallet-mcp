@@ -46,7 +46,7 @@
   ],
   "author": "HiFriendbot (https://hifriendbot.com)",
   "license": "MIT",
-  "homepage": "https://hifriendbot.com/agentwallet",
+  "homepage": "https://hifriendbot.com/wallet/",
   "engines": {
     "node": ">=18.0.0"
   },
