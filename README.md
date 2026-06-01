@@ -52,7 +52,9 @@ Add to your config:
 }
 ```
 
-> `AGENTWALLET_WALLET_ID` is optional. Set it to enable x402 auto-pay — when you exceed the free tier without a credit card, the MCP server will automatically pay for operations with USDC from this wallet.
+> `AGENTWALLET_WALLET_ID` is optional. Set it to enable x402 auto-pay: when you exceed the free tier without a credit card, the MCP server automatically pays for operations with USDC from this wallet.
+>
+> **Auto-pay safety cap.** `AGENTWALLET_MAX_AUTOPAY` (optional, default `1`) is the maximum amount, in human-readable units of the asset, that x402 auto-pay will authorize for a single payment. Any 402 requirement above this cap is rejected instead of paid, so a malformed or tampered payment requirement cannot drain the wallet. Raise it only if you genuinely need larger automatic payments (for example `"5"` to allow up to 5 USDC per call).
 
 ### Claude Code
 

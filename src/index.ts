@@ -13,6 +13,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { deriveX402Payment } from './x402-payment.js';
 
 // ─── Configuration ──────────────────────────────────────────────
 
@@ -29,6 +30,7 @@ interface X402Accept {
   payTo: string;
   network: string;
   requiredDecimals: number;
+  asset?: string;
   extra?: { token?: string; name?: string };
 }
 
@@ -89,17 +91,21 @@ async function handleX402Payment(
   }
 
   const accept = accepts[0]; // Use first option
-  const tokenAddress = accept.extra?.token || '';
-  const amount = accept.maxAmountRequired;
   const payTo = accept.payTo;
-  const decimals = accept.requiredDecimals || 6;
 
   // Determine chain_id from network string (CAIP-2, plain name, or raw ID)
   const network = accept.network || '';
   const chainId = resolveChainId(network) ?? 8453;
 
-  // Convert human-readable amount to raw (e.g. "0.01" with 6 decimals = "10000")
-  const rawAmount = parseUnits(amount, decimals);
+  // x402 maxAmountRequired is ALREADY in base/atomic units (e.g. "10000" =
+  // 0.01 USDC at 6 decimals) and must be used directly. The previous code ran
+  // it through parseUnits(), which re-scaled it by 10**decimals and overpaid by
+  // that factor (1,000,000x for USDC). deriveX402Payment uses it directly (like
+  // the pay_x402 tool) and enforces a hard ceiling so a malformed or malicious
+  // 402 response cannot drain the wallet. AGENTWALLET_MAX_AUTOPAY is in
+  // human-readable units of the asset; default 1.
+  const maxAutopay = process.env.AGENTWALLET_MAX_AUTOPAY || '1';
+  const { tokenAddress, rawAmount, decimals } = deriveX402Payment(accept, maxAutopay);
 
   // Send payment using our wallet (with X-AGW-SKIP-X402 to prevent recursion)
   let txHash: string;
