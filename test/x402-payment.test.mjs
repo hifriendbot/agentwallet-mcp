@@ -7,7 +7,7 @@
  * auto-pay path. Run with: npm test
  */
 import assert from 'node:assert';
-import { deriveX402Payment } from '../build/x402-payment.js';
+import { deriveX402Payment, isWithinCap } from '../build/x402-payment.js';
 
 let passed = 0;
 function ok(name, fn) { fn(); passed++; console.log(`  ok - ${name}`); }
@@ -46,4 +46,33 @@ ok('allows a normal micropayment under the cap', () => {
   assert.strictEqual(deriveX402Payment(accept, '1').rawAmount, '10000');
 });
 
-console.log(`\nx402-payment: ${passed}/5 passed`);
+// ── isWithinCap: the shared cap the public pay_x402 tool uses ──────────────
+// Guards the 2026-06-27 disclosure: pay_x402 with max_payment omitted must NOT
+// authorize an unbounded payment. The tool falls back to AGENTWALLET_MAX_AUTOPAY
+// (default "1"), so a malicious 402 returning 10,000 USDC is blocked.
+
+ok('isWithinCap blocks a 10,000 USDC requirement at the default cap "1"', () => {
+  // 10,000 USDC in base units at 6 decimals — the disclosure's malicious value.
+  assert.strictEqual(isWithinCap('10000000000', 6, '1'), false);
+});
+
+ok('isWithinCap allows a 0.01 USDC micropayment at cap "1"', () => {
+  assert.strictEqual(isWithinCap('10000', 6, '1'), true);
+});
+
+ok('isWithinCap allows exactly the cap (boundary)', () => {
+  assert.strictEqual(isWithinCap('1000000', 6, '1'), true);  // 1.00 USDC == cap
+  assert.strictEqual(isWithinCap('1000001', 6, '1'), false); // one base unit over
+});
+
+ok('isWithinCap honors a raised explicit cap', () => {
+  // 10,000 USDC allowed only when the caller/env raises the cap to >= 10000.
+  assert.strictEqual(isWithinCap('10000000000', 6, '10000'), true);
+  assert.strictEqual(isWithinCap('10000000000', 6, '9999'), false);
+});
+
+ok('isWithinCap rejects a non-integer required amount', () => {
+  assert.throws(() => isWithinCap('0.01', 6, '1'), /expected an integer base-unit amount/);
+});
+
+console.log(`\nx402-payment: ${passed}/10 passed`);

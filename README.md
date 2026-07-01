@@ -160,7 +160,7 @@ AgentWallet natively supports the [x402 open payment standard](https://x402.org)
 4. Retries the request with proof of payment
 5. Returns the final response
 
-**Always set `max_payment` to control spending:**
+**Set `max_payment` to control spending:**
 
 ```
 pay_x402(
@@ -170,7 +170,9 @@ pay_x402(
 )
 ```
 
-Supports ERC-20 tokens, SPL tokens, and native tokens on EVM and Solana. Compatible with x402 V1 and V2 (CAIP-2 chain identifiers).
+`max_payment` is enforced as a hard per-payment cap. If you omit it, `pay_x402` falls back to `AGENTWALLET_MAX_AUTOPAY` (default `1`), the same cap the auto-pay path uses, so a malicious or compromised 402 endpoint can never authorize an unbounded payment. Set `max_payment` explicitly (or raise `AGENTWALLET_MAX_AUTOPAY`) to allow a larger single payment.
+
+Supports ERC-20 tokens, SPL tokens, and native tokens on EVM and Solana. Compatible with x402 V1 and V2 (CAIP-2 chain identifiers), and reads the token address from the standard x402 `asset` field (falling back to `extra.token`).
 
 ## x402 Acceptance
 

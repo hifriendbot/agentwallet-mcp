@@ -64,3 +64,30 @@ export function deriveX402Payment(
 
   return { tokenAddress, rawAmount, decimals };
 }
+
+/**
+ * Returns true if an x402 required amount (already in base/atomic units) is
+ * within a human-readable per-payment cap.
+ *
+ * Shared by both x402 payment paths so neither can authorize an unbounded
+ * transfer: the internal auto-pay path and the public pay_x402 MCP tool both
+ * gate on this. pay_x402 uses it (instead of deriveX402Payment's throw) so it
+ * can return a structured rejection to the calling agent.
+ *
+ * @param rawAmountRequired x402 maxAmountRequired, already in base units
+ * @param decimals          token decimals
+ * @param capHuman          cap in human-readable units of the asset (e.g. "1")
+ */
+export function isWithinCap(
+  rawAmountRequired: string,
+  decimals: number,
+  capHuman: string
+): boolean {
+  if (!/^\d+$/.test(rawAmountRequired)) {
+    throw new Error(
+      `Invalid maxAmountRequired "${rawAmountRequired}" (expected an integer base-unit amount).`
+    );
+  }
+  const capRaw = toBaseUnits(capHuman, decimals);
+  return BigInt(rawAmountRequired) <= BigInt(capRaw);
+}

@@ -13,7 +13,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { deriveX402Payment } from './x402-payment.js';
+import { deriveX402Payment, isWithinCap } from './x402-payment.js';
 
 // ─── Configuration ──────────────────────────────────────────────
 
@@ -284,7 +284,7 @@ function resolveChainId(network: string): number | null {
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.7.2',
+    version: '1.8.0',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. Private keys are encrypted server-side and never exposed — agents sign and broadcast transactions without ever touching raw keys.
@@ -933,7 +933,10 @@ server.tool(
     body: z.string().optional().describe('Optional request body for POST/PUT requests'),
     max_payment: z.string().optional().describe(
       'Maximum payment in human-readable format (e.g. "1.00" for 1 USDC). ' +
-        'Rejects payments above this amount. Strongly recommended to prevent overspending.',
+        'Rejects payments above this amount. If omitted, a default cap of ' +
+        'AGENTWALLET_MAX_AUTOPAY (default "1") is applied, so an untrusted 402 ' +
+        'endpoint can never authorize an unbounded payment. Set this explicitly ' +
+        'to allow a larger single payment.',
     ),
     prefer_chain: z.number().int().optional().describe(
       'Preferred chain ID if the server accepts payment on multiple chains ' +
@@ -1006,6 +1009,7 @@ server.tool(
     type PaymentOption = {
       scheme: string; network: string; maxAmountRequired: string;
       payTo: string; requiredDecimals: number; description?: string;
+      asset?: string; // standard x402 token-address field (preferred over extra.token)
       extra?: { name?: string; token?: string };
     };
     const options = paymentInfo.accepts as PaymentOption[];
@@ -1029,37 +1033,48 @@ server.tool(
     // Calculate human-readable amount
     const amount = formatUnits(option.maxAmountRequired, option.requiredDecimals);
 
-    // Step 4: Check spending limit
-    if (max_payment) {
-      const maxRaw = parseUnits(max_payment, option.requiredDecimals);
-      if (BigInt(option.maxAmountRequired) > BigInt(maxRaw)) {
-        return jsonResponse({
-          status: 402,
-          payment_required: true,
-          payment_made: false,
-          error: `Payment of ${amount} ${option.extra?.name || 'tokens'} exceeds your max_payment limit of ${max_payment}`,
-          required_amount: amount,
-          max_allowed: max_payment,
-          token: option.extra?.name || 'native',
-          network: option.network,
-          chain_id: chainId,
-          pay_to: option.payTo,
-          description: option.description,
-        });
-      }
+    // Step 4: Enforce a hard per-payment cap. ALWAYS applied — if the caller
+    // omits max_payment we fall back to AGENTWALLET_MAX_AUTOPAY (default "1"),
+    // mirroring the internal auto-pay path (deriveX402Payment). Without this, an
+    // untrusted or compromised x402 endpoint could return an arbitrarily large
+    // maxAmountRequired and drain the wallet. The cap is never silently skipped.
+    const capSource = max_payment ? 'max_payment' : 'AGENTWALLET_MAX_AUTOPAY';
+    const effectiveMax = max_payment || process.env.AGENTWALLET_MAX_AUTOPAY || '1';
+    if (!isWithinCap(option.maxAmountRequired, option.requiredDecimals, effectiveMax)) {
+      return jsonResponse({
+        status: 402,
+        payment_required: true,
+        payment_made: false,
+        error: `Payment of ${amount} ${option.extra?.name || 'tokens'} exceeds the ` +
+          `${effectiveMax} cap (from ${capSource}).` +
+          (max_payment ? '' : ' No max_payment was provided, so the default cap was applied. ' +
+            'Pass max_payment (or raise AGENTWALLET_MAX_AUTOPAY) to allow a larger payment.'),
+        required_amount: amount,
+        max_allowed: effectiveMax,
+        cap_source: capSource,
+        token: option.extra?.name || 'native',
+        network: option.network,
+        chain_id: chainId,
+        pay_to: option.payTo,
+        description: option.description,
+      });
     }
+
+    // Standard x402 puts the token address in `asset`; AgentWallet's own server
+    // currently emits it under extra.token. Prefer the standard field, fall back.
+    const tokenAddress = option.asset || option.extra?.token || '';
 
     // Step 5: Execute payment
     let txResult: Record<string, unknown>;
 
     if (isSolanaChain(chainId)) {
       // Solana payment
-      if (option.extra?.token) {
+      if (tokenAddress) {
         // SPL token payment (e.g. USDC on Solana)
         txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', {
           to: option.payTo,
           value: option.maxAmountRequired,
-          token_mint: option.extra.token,
+          token_mint: tokenAddress,
           token_decimals: option.requiredDecimals,
           chain_id: chainId,
         })) as Record<string, unknown>;
@@ -1071,11 +1086,11 @@ server.tool(
           chain_id: chainId,
         })) as Record<string, unknown>;
       }
-    } else if (option.extra?.token) {
+    } else if (tokenAddress) {
       // EVM ERC-20 token payment (e.g. USDC)
       const calldata = '0xa9059cbb' + padAddress(option.payTo) + encodeUint256(option.maxAmountRequired);
       txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', {
-        to: option.extra.token,
+        to: tokenAddress,
         value: '0',
         data: calldata,
         chain_id: chainId,
@@ -1123,7 +1138,7 @@ server.tool(
       payment_made: true,
       amount,
       token: option.extra?.name || 'native',
-      token_address: option.extra?.token || null,
+      token_address: option.asset || option.extra?.token || null,
       network: option.network,
       chain_id: chainId,
       pay_to: option.payTo,
