@@ -4,7 +4,7 @@ Permissionless wallet infrastructure for AI agents. Create wallets, sign transac
 
 **Your keys can stay on your machine.** Set one environment variable and every signature happens in your own process. No server sees the key, no company can freeze the wallet, and you can verify that claim by reading `src/local-wallet.ts` or by running the server with the API pointed at a closed port.
 
-**No KYC. No KYT. No approval process. No transaction monitoring. No one can block your wallet. Pay with USDC on-chain — no credit card required.**
+**No KYC. No KYT. No approval process. No transaction monitoring. No one can block your wallet. Pay with USDC on-chain, no credit card required.**
 
 ## Two modes
 
@@ -12,9 +12,9 @@ Permissionless wallet infrastructure for AI agents. Create wallets, sign transac
 |---|---|---|
 | Who holds the key | You, in your own process | Encrypted on AgentWallet servers |
 | Set up | One env var, no account needed | API key |
-| Chains | EVM | EVM + Solana |
+| Chains | EVM + Solana | EVM + Solana |
 | Can anyone freeze it | No | Yes, that is what pause is for |
-| Spend guards | `AGENTWALLET_MAX_TX_NATIVE`, `AGENTWALLET_MAX_AUTOPAY` | Server-side limits, pause, rate limits |
+| Spend guards | `AGENTWALLET_MAX_TX_NATIVE`, `AGENTWALLET_MAX_TX_SOL`, `AGENTWALLET_MAX_AUTOPAY` | Server-side limits, pause, rate limits |
 | Paywalls, usage, billing | Needs an API key too | Included |
 
 Run `wallet_mode` at any time and the server will tell you which one you are in, and which address it controls.
@@ -43,35 +43,57 @@ Use `AGENTWALLET_KEYFILE=/path/to/key` instead if you would rather keep the key 
 
 `AGENTWALLET_MAX_TX_NATIVE` is a per-transaction ceiling in native units. In hosted mode the server enforces limits; in local mode there is no server, so this guard is the only one there is. Set it.
 
-**Local mode is EVM only right now.** Solana calls are refused with a clear error rather than quietly falling back to the custodial API, because silently moving your funds onto someone else's signer is exactly the behavior this mode exists to prevent.
+### Solana local signing
+
+```json
+"env": {
+  "AGENTWALLET_SOLANA_KEY": "[12,34...]",
+  "AGENTWALLET_SOLANA_RPC": "https://your-own-rpc",
+  "AGENTWALLET_MAX_TX_SOL": "1"
+}
+```
+
+Accepts whichever format you already have: a `solana-keygen` id.json array, a base58 secret key as exported by Phantom, or base64. Use `AGENTWALLET_SOLANA_KEYFILE` to point at a file instead. Native SOL and SPL token transfers are both signed locally, and a missing associated token account is created for the recipient automatically.
+
+Set either key, or both. They are independent: run EVM locally and Solana hosted, or the reverse.
+
+**An operation with no matching local key is refused, never silently routed to the hosted signer.** If you have an EVM key configured and ask for a Solana transfer with no Solana key, the server stops and tells you which variable is missing. Quietly moving funds onto a key you do not hold, while you believe you are in self-custody, is the worst thing this server could do.
+
+### About the dependency tree
+
+Local signing uses [viem](https://viem.sh) for EVM and `@solana/web3.js` for Solana, plus `bs58` for key parsing. SPL instructions are built by hand rather than with `@solana/spl-token`, because that package pulls in `bigint-buffer`, which carries a high severity buffer overflow advisory. A wallet has no business shipping that to save a dozen lines of instruction encoding.
+
+`npm audit` currently reports issues inside `@modelcontextprotocol/sdk`'s HTTP transport dependencies. This server speaks stdio, so that code never loads, and the SDK is not something this package can patch. Run the audit yourself. Publishing a tree you can inspect is the point.
 
 <p align="center">
-  <img src="assets/demo.svg" alt="AgentWallet demo — AI agent pays x402 invoice automatically" width="800">
+  <img src="assets/demo.svg" alt="AgentWallet demo, AI agent pays x402 invoice automatically" width="800">
 </p>
 
 ## Features
 
-- **31 MCP tools** — create wallets, send transactions, approve tokens, wrap ETH, transfer SPL tokens, pay and accept x402 payments, verify custody mode, and more
-- **EVM + Solana** — Ethereum, Base, Polygon, BSC, Arbitrum, Optimism, Avalanche, Zora, PulseChain, Solana, and any other EVM-compatible chain
-- **SOL + SPL tokens** — native SOL transfers and SPL token transfers (USDC, USDT, etc.) with automatic account creation
-- **Built-in guards** — daily spending limits, gas price protection, emergency pause, rate limiting, replay protection, and on-chain verification — all active by default
-- **x402 payments** — pay for x402-enabled APIs automatically, or accept x402 payments on your own endpoints (EVM and Solana)
-- **Self-custody option** — run local mode and the key never leaves your machine. In hosted mode, keys are encrypted at rest, decrypted only during signing, and zeroed from memory immediately after. Either way you can export and walk away.
-- **Permissionless** — No KYC. No KYT. No identity verification. No approval process. No compliance gatekeeping. Sign up, get an API key, and start transacting immediately.
-- **30-second setup** — three lines of config. No SDK to install. No dependencies to manage.
+- **31 MCP tools**: create wallets, send transactions, approve tokens, wrap ETH, transfer SPL tokens, pay and accept x402 payments, verify custody mode, and more
+- **EVM + Solana**: Ethereum, Base, Polygon, BSC, Arbitrum, Optimism, Avalanche, Zora, PulseChain, Solana, and any other EVM-compatible chain
+- **SOL + SPL tokens**: native SOL transfers and SPL token transfers (USDC, USDT, etc.) with automatic account creation
+- **Built-in guards**: daily spending limits, gas price protection, emergency pause, rate limiting, replay protection, and on-chain verification, all active by default
+- **x402 payments**: pay for x402-enabled APIs automatically, or accept x402 payments on your own endpoints (EVM and Solana)
+- **Self-custody option**: run local mode and the key never leaves your machine. In hosted mode, keys are encrypted at rest, decrypted only during signing, and zeroed from memory immediately after. Either way you can export and walk away.
+- **Permissionless**: No KYC. No KYT. No identity verification. No approval process. No compliance gatekeeping. Sign up, get an API key, and start transacting immediately.
+- **30-second setup**: three lines of config. No SDK to install. No dependencies to manage.
 
 ## Pricing
 
-- **$0.00345 per operation** (31% under Coinbase CDP list pricing, checked 2026-07-29)
+- **$0.00345 per operation**
 - **6,000 free operations/month**
-- **$0.0005 per x402 verification** (50% under Coinbase, checked 2026-07-29)
+- **$0.0005 per x402 verification**
 - **1,000 free x402 verifications/month**
-- **Pay with USDC on-chain** via x402 — no credit card required
-- No monthly fee, no tiers — just pay as you go
+- **Pay with USDC on-chain** via x402, no credit card required
+- No monthly fee, no tiers, just pay as you go
+
+Competitor comparisons are kept at [hifriendbot.com/wallet/#pricing](https://hifriendbot.com/wallet/#pricing) with the date they were last verified. They live there rather than here because a published npm README cannot be corrected when someone else changes their prices.
 
 ## Quick Start
 
-Get your free API key at [hifriendbot.com/wallet](https://hifriendbot.com/wallet) — no credit card required, no KYC, no approval wait.
+Get your free API key at [hifriendbot.com/wallet](https://hifriendbot.com/wallet), no credit card required, no KYC, no approval wait.
 
 ### Claude Desktop / OpenClaw
 
@@ -239,14 +261,14 @@ When an agent hits the paywall URL:
 3. Retries with proof of payment
 4. Receives the protected content
 
-On-chain verification ensures every payment is real. Replay protection prevents double-spending. Revenue tracking shows you who paid, how much, and when. 1,000 free verifications/month, then $0.0005 each, 50% under Coinbase as of 2026-07-29.
+On-chain verification ensures every payment is real. Replay protection prevents double-spending. Revenue tracking shows you who paid, how much, and when. 1,000 free verifications/month, then $0.0005 each. See the [pricing comparison](https://hifriendbot.com/wallet/#pricing) for how that stacks up.
 
 ## How We Compare
 
 | Feature | Coinbase CDP | AgentWallet |
 |---------|-------------|-------------|
 | Setup Time | Install SDK + configure | **3 lines of config** |
-| Approval Process | Identity verification required | **None — instant access** |
+| Approval Process | Identity verification required | **None, instant access** |
 | KYC Required | Yes | **No** |
 | KYT / Transaction Monitoring | Yes | **No** |
 | Can Block Your Wallet | Yes | **No** |
@@ -261,27 +283,27 @@ On-chain verification ensures every payment is real. Replay protection prevents 
 | Token Tools | Yes | **ERC-20 + SPL (29 tools)** |
 | MCP Server | Yes | **Yes** |
 
-## Pay with Crypto — No Credit Card Required
+## Pay with Crypto, No Credit Card Required
 
-AgentWallet is the only AI agent wallet infrastructure that accepts crypto for its own API fees. Every competitor — Coinbase CDP, Circle, MoonPay, Crossmint, Turnkey — requires a credit card or monthly invoice. With AgentWallet, your agent can pay for operations with USDC on-chain via the x402 protocol. No credit card, no invoice, no billing portal. Just on-chain payments.
+AgentWallet is the only AI agent wallet infrastructure that accepts crypto for its own API fees. Every competitor, Coinbase CDP, Circle, MoonPay, Crossmint, Turnkey, requires a credit card or monthly invoice. With AgentWallet, your agent can pay for operations with USDC on-chain via the x402 protocol. No credit card, no invoice, no billing portal. Just on-chain payments.
 
 When your agent exceeds the free tier (6,000 ops/month) without a credit card configured, the API returns HTTP 402 with USDC payment instructions. Your agent pays on-chain, retries with proof of payment, and the operation executes. Fully automated via the MCP server.
 
-You can also pre-purchase x402 verification credits with USDC using the `buy_verification_credits` tool — keeping your paywalls running beyond the free 1,000 verifications/month without needing a credit card.
+You can also pre-purchase x402 verification credits with USDC using the `buy_verification_credits` tool, keeping your paywalls running beyond the free 1,000 verifications/month without needing a credit card.
 
 ## Built-in Guards
 
-All guards are active by default — no configuration required.
+All guards are active by default, no configuration required.
 
-- **Encrypted at rest** — private keys encrypted before storage and never leave the server
-- **Memory zeroing** — keys wiped from memory immediately after every signing operation
-- **Daily spending limits** — set a per-wallet daily cap in USD, enforced automatically on every transaction
-- **Gas price protection** — transactions blocked when gas prices spike above safe thresholds
-- **Emergency pause** — instantly freeze any wallet or all wallets with one click
-- **Rate limiting** — API requests capped per minute to prevent abuse and brute force attacks
-- **Replay protection** — every x402 payment verified on-chain with unique transaction tracking
-- **On-chain verification** — x402 payments verified directly on the blockchain with finalized commitment
-- Bug bounty program: $50–$500 for responsible disclosure ([details](https://hifriendbot.com/wallet))
+- **Encrypted at rest**: private keys encrypted before storage and never leave the server
+- **Memory zeroing**: keys wiped from memory immediately after every signing operation
+- **Daily spending limits**: set a per-wallet daily cap in USD, enforced automatically on every transaction
+- **Gas price protection**: transactions blocked when gas prices spike above safe thresholds
+- **Emergency pause**: instantly freeze any wallet or all wallets with one click
+- **Rate limiting**: API requests capped per minute to prevent abuse and brute force attacks
+- **Replay protection**: every x402 payment verified on-chain with unique transaction tracking
+- **On-chain verification**: x402 payments verified directly on the blockchain with finalized commitment
+- Bug bounty program: $50,$500 for responsible disclosure ([details](https://hifriendbot.com/wallet))
 
 ## Links
 

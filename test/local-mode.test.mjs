@@ -11,6 +11,7 @@
 
 import { spawn } from 'node:child_process';
 import assert from 'node:assert/strict';
+import { Keypair } from '@solana/web3.js';
 
 /* Well-known throwaway key from the go-ethereum docs. Never used for funds. */
 const TEST_KEY = '0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318';
@@ -92,7 +93,8 @@ check('wallet_mode reports self-custody and the right address', () => {
   const m = textOf(byId(100));
   assert.equal(m.mode, 'local');
   assert.equal(m.custody, 'self');
-  assert.equal(m.address, TEST_ADDRESS);
+  assert.equal(m.evm.address, TEST_ADDRESS);
+  assert.match(String(m.solana), /no local Solana key/);
 });
 
 check('native balance reads without touching the hosted API', () => {
@@ -121,10 +123,57 @@ check('export_wallet_key says you already hold the key', () => {
   assert.equal(e.exportable, true);
 });
 
-check('Solana is refused, not silently sent to the custodial API', () => {
-  const r = byId(105);
-  const text = JSON.stringify(r);
-  assert.match(text, /EVM chains only|refused/i);
+check('Solana with no Solana key is refused, not sent to the custodial API', () => {
+  const text = JSON.stringify(byId(105));
+  assert.match(text, /no local Solana key is configured|Refusing/i);
+});
+
+console.log('\nSolana local mode, same closed-port conditions\n');
+
+/* Deterministic throwaway keypair: seed of 32 bytes, all 0x07. Never funded. */
+const solKp = Keypair.fromSeed(new Uint8Array(32).fill(7));
+const SOL_SECRET = { key: JSON.stringify(Array.from(solKp.secretKey)), address: solKp.publicKey.toBase58() };
+
+const sol = await callTools(
+  [
+    { name: 'wallet_mode', arguments: {} },
+    { name: 'get_balance', arguments: { wallet_id: 1, chain_id: 900 } },
+    { name: 'list_wallets', arguments: {} },
+    { name: 'transfer', arguments: { wallet_id: 1, to: SOL_SECRET.address, amount: '0.001', chain_id: 1 } },
+  ],
+  { AGENTWALLET_SOLANA_KEY: SOL_SECRET.key, AGENTWALLET_PRIVATE_KEY: '', AGENTWALLET_API_URL: DEAD_API },
+);
+
+const solById = (id) => sol.responses.find((r) => r.id === id);
+
+check('Solana key loads and is announced at startup', () => {
+  assert.match(sol.stderr, /LOCAL signing mode/);
+  assert.match(sol.stderr, new RegExp(SOL_SECRET.address));
+});
+
+check('wallet_mode reports the Solana address and no EVM key', () => {
+  const m = textOf(solById(100));
+  assert.equal(m.mode, 'local');
+  assert.equal(m.solana.address, SOL_SECRET.address);
+  assert.match(String(m.evm), /no local EVM key/);
+});
+
+check('SOL balance reads without the hosted API', () => {
+  const b = textOf(solById(101));
+  assert.equal(b.mode, 'local');
+  assert.equal(b.address, SOL_SECRET.address);
+  assert.ok(typeof b.balance_lamports === 'string');
+});
+
+check('list_wallets shows the Solana key only', () => {
+  const w = textOf(solById(102));
+  assert.equal(w.wallets.length, 1);
+  assert.equal(w.wallets[0].wallet_type, 'solana');
+});
+
+check('EVM op with only a Solana key is refused, not sent to the hosted signer', () => {
+  const text = JSON.stringify(solById(103));
+  assert.match(text, /no local EVM key is configured|Refusing/i);
 });
 
 console.log('\nCustodial mode still behaves as before\n');

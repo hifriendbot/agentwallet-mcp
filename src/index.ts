@@ -25,6 +25,21 @@ import {
   localSignMessage,
   resolveRpcUrl,
 } from './local-wallet.js';
+import {
+  isSolanaLocalMode,
+  getSolanaAddress,
+  solanaWalletRecord,
+  localSolBalance,
+  localSplBalance,
+  localSolTransfer,
+  localSplTransfer,
+  resolveSolanaRpc,
+} from './local-solana.js';
+
+/** True when either chain family is running non-custodially. */
+function anyLocalMode(): boolean {
+  return isLocalMode() || isSolanaLocalMode();
+}
 
 // ─── Configuration ──────────────────────────────────────────────
 
@@ -70,11 +85,24 @@ function localChainId(body?: Record<string, unknown>, qs?: URLSearchParams): num
   return 8453; // Base, matching the custodial default
 }
 
-function refuseSolanaLocally(): never {
+/**
+ * Refuse rather than silently hand the operation to someone else's signer.
+ *
+ * Reached when the operator is running non-custodially for one chain family but
+ * has supplied no key for the other. Falling through to the hosted API here
+ * would move funds onto a key they do not hold, while they believe they are in
+ * self-custody. That is the single worst thing this server could do, so it
+ * stops and says exactly which variable is missing.
+ */
+function refuseMissingLocalKey(family: 'solana' | 'evm'): never {
+  const wanted = family === 'solana'
+    ? 'AGENTWALLET_SOLANA_KEY (or AGENTWALLET_SOLANA_KEYFILE)'
+    : 'AGENTWALLET_PRIVATE_KEY (or AGENTWALLET_KEYFILE)';
   throw new Error(
-    'Local signing mode currently supports EVM chains only. Solana keys are not signed in-process yet, ' +
-    'so this call was refused rather than silently routed through the hosted custodial API. ' +
-    'Unset AGENTWALLET_PRIVATE_KEY to use the custodial path for Solana.'
+    `This is a ${family === 'solana' ? 'Solana' : 'EVM'} operation and no local ${family === 'solana' ? 'Solana' : 'EVM'} key is configured, ` +
+    `but this server is running in local signing mode. Refusing rather than routing it through the hosted ` +
+    `custodial signer while you believe you hold the keys. Set ${wanted} to sign it here, or unset the other ` +
+    `local key variables to use the hosted path for everything.`
   );
 }
 
@@ -88,9 +116,26 @@ async function routeLocally(
 
   // POST /wallets/{id}/send
   if (method === 'POST' && /^\/wallets\/[^/]*\/send$/.test(rawPath)) {
-    if (body?.token_mint) refuseSolanaLocally();
     const chainId = localChainId(body, qs);
-    if (SOLANA_CHAIN_IDS.has(chainId)) refuseSolanaLocally();
+    const solanaOp = SOLANA_CHAIN_IDS.has(chainId) || Boolean(body?.token_mint);
+
+    if (solanaOp) {
+      if (!isSolanaLocalMode()) refuseMissingLocalKey('solana');
+      const to = String(body?.to || '');
+      const value = String(body?.value ?? '0');
+      if (body?.token_mint) {
+        return localSplTransfer(
+          String(body.token_mint),
+          to,
+          value,
+          Number(body.token_decimals ?? 6),
+          chainId
+        );
+      }
+      return localSolTransfer(to, value, chainId);
+    }
+
+    if (!isLocalMode()) refuseMissingLocalKey('evm');
 
     const to = String(body?.to || '');
     const value = BigInt(String(body?.value ?? '0'));
@@ -105,15 +150,24 @@ async function routeLocally(
   // GET /wallets/{id}/balance
   if (method === 'GET' && /^\/wallets\/[^/]*\/balance$/.test(rawPath)) {
     const chainId = localChainId(body, qs);
-    if (SOLANA_CHAIN_IDS.has(chainId)) refuseSolanaLocally();
+    if (SOLANA_CHAIN_IDS.has(chainId)) {
+      if (!isSolanaLocalMode()) refuseMissingLocalKey('solana');
+      return localSolBalance(chainId);
+    }
+    if (!isLocalMode()) refuseMissingLocalKey('evm');
     return localNativeBalance(chainId);
   }
 
   // GET /wallets/{id}/token-balance
   if (method === 'GET' && /^\/wallets\/[^/]*\/token-balance$/.test(rawPath)) {
     const chainId = localChainId(body, qs);
-    if (SOLANA_CHAIN_IDS.has(chainId)) refuseSolanaLocally();
-    const token = qs.get('token') || qs.get('token_address') || '';
+    const token0 = qs.get('token') || qs.get('token_address') || '';
+    if (SOLANA_CHAIN_IDS.has(chainId)) {
+      if (!isSolanaLocalMode()) refuseMissingLocalKey('solana');
+      return localSplBalance(token0, chainId);
+    }
+    if (!isLocalMode()) refuseMissingLocalKey('evm');
+    const token = token0;
     if (!/^0x[a-fA-F0-9]{40}$/.test(token)) {
       throw new Error(`Local mode needs an EVM token address, got "${token}".`);
     }
@@ -130,9 +184,16 @@ async function routeLocally(
     );
   }
 
-  // Wallet listing and lookup describe the one local key.
-  if (method === 'GET' && rawPath === '/wallets') return { wallets: [localWalletRecord()] };
-  if (method === 'GET' && /^\/wallets\/[^/]+$/.test(rawPath)) return localWalletRecord();
+  // Wallet listing and lookup describe whichever local keys are configured.
+  if (method === 'GET' && rawPath === '/wallets') {
+    const wallets = [];
+    if (isLocalMode()) wallets.push(localWalletRecord());
+    if (isSolanaLocalMode()) wallets.push(solanaWalletRecord());
+    return { wallets };
+  }
+  if (method === 'GET' && /^\/wallets\/[^/]+$/.test(rawPath)) {
+    return isLocalMode() ? localWalletRecord() : solanaWalletRecord();
+  }
 
   if (method === 'POST' && rawPath === '/wallets') {
     throw new Error(
@@ -160,7 +221,7 @@ async function api(path: string, method = 'GET', body?: Record<string, unknown>,
   /* Local mode intercepts here rather than inside each tool. Routing at the
      single choke point every funds operation already passes through means no
      tool can quietly stay custodial because someone forgot to update it. */
-  if (isLocalMode()) {
+  if (anyLocalMode()) {
     const handled = await routeLocally(path, method, body);
     if (handled !== NOT_HANDLED) return handled;
   }
@@ -184,7 +245,7 @@ async function api(path: string, method = 'GET', body?: Record<string, unknown>,
   const data = await res.json();
 
   // Handle 402 Payment Required — auto-pay if a wallet or a local key is configured
-  if (res.status === 402 && (X402_WALLET_ID || isLocalMode()) && !extraHeaders?.['X-PAYMENT']) {
+  if (res.status === 402 && (X402_WALLET_ID || anyLocalMode()) && !extraHeaders?.['X-PAYMENT']) {
     return handleX402Payment(data as X402Response, path, method, body);
   }
 
@@ -1520,33 +1581,52 @@ server.tool(
     'or through the hosted AgentWallet API (custodial). Use this to verify custody before moving funds.',
   {},
   async () => {
-    if (!isLocalMode()) {
+    if (!anyLocalMode()) {
       return jsonResponse({
         mode: 'custodial',
         custody: 'agentwallet',
         signing: 'AgentWallet servers hold an encrypted key and sign on your behalf.',
         api_base: API_BASE,
         to_self_custody:
-          'Set AGENTWALLET_PRIVATE_KEY (or AGENTWALLET_KEYFILE) and restart. ' +
+          'Set AGENTWALLET_PRIVATE_KEY for EVM and/or AGENTWALLET_SOLANA_KEY for Solana, then restart. ' +
           'Use export_wallet_key first if you want to carry an existing hosted wallet across.',
       });
     }
 
-    let rpc = 'default public endpoint';
-    try {
-      rpc = resolveRpcUrl(parseInt(process.env.AGENTWALLET_CHAIN_ID || '8453', 10));
-    } catch { /* chain has no default; not worth failing the report over */ }
-
-    return jsonResponse({
+    const report: Record<string, unknown> = {
       mode: 'local',
       custody: 'self',
-      address: getLocalAddress(),
-      signing: 'Signed in this process. The private key is never sent to AgentWallet or anyone else.',
-      rpc_endpoint: rpc,
-      chains: 'EVM only in local mode. Solana calls are refused rather than routed to the custodial API.',
-      per_tx_cap_native: process.env.AGENTWALLET_MAX_TX_NATIVE || 'not set',
+      signing: 'Signed in this process. Keys are never sent to AgentWallet or anyone else.',
       max_autopay: process.env.AGENTWALLET_MAX_AUTOPAY || '1',
-    });
+    };
+
+    if (isLocalMode()) {
+      let rpc = 'default public endpoint';
+      try {
+        rpc = resolveRpcUrl(parseInt(process.env.AGENTWALLET_CHAIN_ID || '8453', 10));
+      } catch { /* chain has no default; not worth failing the report over */ }
+      report.evm = {
+        address: getLocalAddress(),
+        rpc_endpoint: rpc,
+        per_tx_cap_native: process.env.AGENTWALLET_MAX_TX_NATIVE || 'not set',
+      };
+    } else {
+      report.evm = 'no local EVM key. EVM operations are refused, not sent to the hosted signer.';
+    }
+
+    if (isSolanaLocalMode()) {
+      let rpc = 'default public endpoint';
+      try { rpc = resolveSolanaRpc(900); } catch { /* fall through to the default label */ }
+      report.solana = {
+        address: getSolanaAddress(),
+        rpc_endpoint: rpc,
+        per_tx_cap_sol: process.env.AGENTWALLET_MAX_TX_SOL || 'not set',
+      };
+    } else {
+      report.solana = 'no local Solana key. Solana operations are refused, not sent to the hosted signer.';
+    }
+
+    return jsonResponse(report);
   },
 );
 
@@ -1561,13 +1641,13 @@ server.tool(
     wallet_id: z.number().int().optional().describe('Hosted wallet ID to export'),
   },
   async ({ wallet_id }) => {
-    if (isLocalMode()) {
+    if (anyLocalMode()) {
       return jsonResponse({
         exportable: true,
         mode: 'local',
         note:
-          'You are already in self-custody. The key is the one you supplied via AGENTWALLET_PRIVATE_KEY ' +
-          'or AGENTWALLET_KEYFILE, and this server has no copy of it beyond this process.',
+          'You are already in self-custody. The keys are the ones you supplied via AGENTWALLET_PRIVATE_KEY, ' +
+          'AGENTWALLET_SOLANA_KEY or their KEYFILE variants, and this server keeps no copy beyond this process.',
       });
     }
 
@@ -1596,11 +1676,14 @@ async function main() {
 
   /* stderr, so it never corrupts the stdio JSON-RPC stream. Announcing custody
      at startup means an operator sees which mode they are in without asking. */
-  if (isLocalMode()) {
+  if (anyLocalMode()) {
     try {
-      console.error(`AgentWallet MCP: LOCAL signing mode. Address ${getLocalAddress()}. Key never leaves this machine.`);
+      const parts: string[] = [];
+      if (isLocalMode()) parts.push(`EVM ${getLocalAddress()}`);
+      if (isSolanaLocalMode()) parts.push(`Solana ${getSolanaAddress()}`);
+      console.error(`AgentWallet MCP: LOCAL signing mode. ${parts.join(', ')}. Keys never leave this machine.`);
     } catch (e) {
-      console.error(`AgentWallet MCP: local signing configured but the key could not be loaded: ${(e as Error).message}`);
+      console.error(`AgentWallet MCP: local signing configured but a key could not be loaded: ${(e as Error).message}`);
       process.exit(1);
     }
   } else {
