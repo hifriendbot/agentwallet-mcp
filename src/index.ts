@@ -14,6 +14,17 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { deriveX402Payment, isWithinCap } from './x402-payment.js';
+import {
+  isLocalMode,
+  getLocalAddress,
+  localWalletRecord,
+  localSend,
+  localTransferToken,
+  localNativeBalance,
+  localTokenBalance,
+  localSignMessage,
+  resolveRpcUrl,
+} from './local-wallet.js';
 
 // ─── Configuration ──────────────────────────────────────────────
 
@@ -21,6 +32,7 @@ const API_BASE = process.env.AGENTWALLET_API_URL || 'https://hifriendbot.com/wp-
 const API_USER = process.env.AGENTWALLET_USER || '';
 const API_PASS = process.env.AGENTWALLET_PASS || '';  // WordPress application password
 const X402_WALLET_ID = process.env.AGENTWALLET_WALLET_ID || '';  // Wallet ID for x402 auto-pay
+const DASHBOARD_URL = process.env.AGENTWALLET_DASHBOARD_URL || 'https://hifriendbot.com/wallet/';
 
 // ─── API Helper ─────────────────────────────────────────────────
 
@@ -40,11 +52,119 @@ interface X402Response {
   error: string;
 }
 
+/* ── Local-mode routing ──────────────────────────────────────────
+   Translates the REST paths the tools already speak into in-process signing
+   calls. Anything not listed here falls through to the hosted API, so
+   non-custodial concerns (paywalls, billing, usage) still work if the operator
+   has also configured credentials. */
+
+const NOT_HANDLED = Symbol('not-handled');
+
+function localChainId(body?: Record<string, unknown>, qs?: URLSearchParams): number {
+  const fromBody = body?.chain_id;
+  if (typeof fromBody === 'number') return fromBody;
+  const fromQs = qs?.get('chain_id');
+  if (fromQs) return parseInt(fromQs, 10);
+  const fromEnv = (process.env.AGENTWALLET_CHAIN_ID || '').trim();
+  if (fromEnv) return parseInt(fromEnv, 10);
+  return 8453; // Base, matching the custodial default
+}
+
+function refuseSolanaLocally(): never {
+  throw new Error(
+    'Local signing mode currently supports EVM chains only. Solana keys are not signed in-process yet, ' +
+    'so this call was refused rather than silently routed through the hosted custodial API. ' +
+    'Unset AGENTWALLET_PRIVATE_KEY to use the custodial path for Solana.'
+  );
+}
+
+async function routeLocally(
+  path: string,
+  method: string,
+  body?: Record<string, unknown>
+): Promise<unknown | typeof NOT_HANDLED> {
+  const [rawPath, rawQs = ''] = path.split('?');
+  const qs = new URLSearchParams(rawQs);
+
+  // POST /wallets/{id}/send
+  if (method === 'POST' && /^\/wallets\/[^/]*\/send$/.test(rawPath)) {
+    if (body?.token_mint) refuseSolanaLocally();
+    const chainId = localChainId(body, qs);
+    if (SOLANA_CHAIN_IDS.has(chainId)) refuseSolanaLocally();
+
+    const to = String(body?.to || '');
+    const value = BigInt(String(body?.value ?? '0'));
+    const data = String(body?.data || '');
+    if (!/^0x[a-fA-F0-9]{40}$/.test(to)) {
+      throw new Error(`Local mode expects an EVM address, got "${to}".`);
+    }
+    const hasData = data && data !== '0x';
+    return localSend(chainId, to as `0x${string}`, value, hasData ? (data as `0x${string}`) : undefined);
+  }
+
+  // GET /wallets/{id}/balance
+  if (method === 'GET' && /^\/wallets\/[^/]*\/balance$/.test(rawPath)) {
+    const chainId = localChainId(body, qs);
+    if (SOLANA_CHAIN_IDS.has(chainId)) refuseSolanaLocally();
+    return localNativeBalance(chainId);
+  }
+
+  // GET /wallets/{id}/token-balance
+  if (method === 'GET' && /^\/wallets\/[^/]*\/token-balance$/.test(rawPath)) {
+    const chainId = localChainId(body, qs);
+    if (SOLANA_CHAIN_IDS.has(chainId)) refuseSolanaLocally();
+    const token = qs.get('token') || qs.get('token_address') || '';
+    if (!/^0x[a-fA-F0-9]{40}$/.test(token)) {
+      throw new Error(`Local mode needs an EVM token address, got "${token}".`);
+    }
+    return localTokenBalance(chainId, token as `0x${string}`);
+  }
+
+  // POST /wallets/{id}/sign  (message signing only; tx signing goes through send)
+  if (method === 'POST' && /^\/wallets\/[^/]*\/sign$/.test(rawPath)) {
+    const message = body?.message;
+    if (typeof message === 'string' && message) return localSignMessage(message);
+    throw new Error(
+      'Local mode signs messages in-process. For transactions use send_transaction, ' +
+      'which signs and broadcasts locally in one step.'
+    );
+  }
+
+  // Wallet listing and lookup describe the one local key.
+  if (method === 'GET' && rawPath === '/wallets') return { wallets: [localWalletRecord()] };
+  if (method === 'GET' && /^\/wallets\/[^/]+$/.test(rawPath)) return localWalletRecord();
+
+  if (method === 'POST' && rawPath === '/wallets') {
+    throw new Error(
+      'Local signing mode uses the single key you supplied, so there is nothing to create. ' +
+      'Generate another key yourself and run a second instance with a different ' +
+      'AGENTWALLET_PRIVATE_KEY, or unset it to create hosted wallets.'
+    );
+  }
+
+  if (/^\/wallets\/[^/]*\/(pause|unpause)$/.test(rawPath) || (method === 'DELETE' && /^\/wallets\/[^/]+$/.test(rawPath))) {
+    throw new Error(
+      'Pause, unpause and delete are custodial controls: they work by refusing to sign on the server. ' +
+      'In local mode the key is yours, so nothing can freeze it. Stop the process or move the funds.'
+    );
+  }
+
+  return NOT_HANDLED;
+}
+
 /**
  * Make an API call. If the response is 402 and auto-pay is configured,
  * automatically pay via x402 and retry the request.
  */
 async function api(path: string, method = 'GET', body?: Record<string, unknown>, extraHeaders?: Record<string, string>): Promise<unknown> {
+  /* Local mode intercepts here rather than inside each tool. Routing at the
+     single choke point every funds operation already passes through means no
+     tool can quietly stay custodial because someone forgot to update it. */
+  if (isLocalMode()) {
+    const handled = await routeLocally(path, method, body);
+    if (handled !== NOT_HANDLED) return handled;
+  }
+
   const url = `${API_BASE}${path}`;
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -63,8 +183,8 @@ async function api(path: string, method = 'GET', body?: Record<string, unknown>,
   const res = await fetch(url, options);
   const data = await res.json();
 
-  // Handle 402 Payment Required — auto-pay if wallet configured
-  if (res.status === 402 && X402_WALLET_ID && !extraHeaders?.['X-PAYMENT']) {
+  // Handle 402 Payment Required — auto-pay if a wallet or a local key is configured
+  if (res.status === 402 && (X402_WALLET_ID || isLocalMode()) && !extraHeaders?.['X-PAYMENT']) {
     return handleX402Payment(data as X402Response, path, method, body);
   }
 
@@ -1392,11 +1512,100 @@ server.tool(
   },
 );
 
+// ─── Tool: wallet_mode ──────────────────────────────────────────
+
+server.tool(
+  'wallet_mode',
+  'Report whether this server is signing locally (self-custody, the private key never leaves this machine) ' +
+    'or through the hosted AgentWallet API (custodial). Use this to verify custody before moving funds.',
+  {},
+  async () => {
+    if (!isLocalMode()) {
+      return jsonResponse({
+        mode: 'custodial',
+        custody: 'agentwallet',
+        signing: 'AgentWallet servers hold an encrypted key and sign on your behalf.',
+        api_base: API_BASE,
+        to_self_custody:
+          'Set AGENTWALLET_PRIVATE_KEY (or AGENTWALLET_KEYFILE) and restart. ' +
+          'Use export_wallet_key first if you want to carry an existing hosted wallet across.',
+      });
+    }
+
+    let rpc = 'default public endpoint';
+    try {
+      rpc = resolveRpcUrl(parseInt(process.env.AGENTWALLET_CHAIN_ID || '8453', 10));
+    } catch { /* chain has no default; not worth failing the report over */ }
+
+    return jsonResponse({
+      mode: 'local',
+      custody: 'self',
+      address: getLocalAddress(),
+      signing: 'Signed in this process. The private key is never sent to AgentWallet or anyone else.',
+      rpc_endpoint: rpc,
+      chains: 'EVM only in local mode. Solana calls are refused rather than routed to the custodial API.',
+      per_tx_cap_native: process.env.AGENTWALLET_MAX_TX_NATIVE || 'not set',
+      max_autopay: process.env.AGENTWALLET_MAX_AUTOPAY || '1',
+    });
+  },
+);
+
+// ─── Tool: export_wallet_key ────────────────────────────────────
+
+server.tool(
+  'export_wallet_key',
+  'Explain how to export the private key of a hosted (custodial) AgentWallet so it can be moved ' +
+    'to self-custody or any other wallet. Export itself is deliberately human-gated and is not ' +
+    'performed by this tool.',
+  {
+    wallet_id: z.number().int().optional().describe('Hosted wallet ID to export'),
+  },
+  async ({ wallet_id }) => {
+    if (isLocalMode()) {
+      return jsonResponse({
+        exportable: true,
+        mode: 'local',
+        note:
+          'You are already in self-custody. The key is the one you supplied via AGENTWALLET_PRIVATE_KEY ' +
+          'or AGENTWALLET_KEYFILE, and this server has no copy of it beyond this process.',
+      });
+    }
+
+    return jsonResponse({
+      exportable: true,
+      mode: 'custodial',
+      how: `Sign in at ${DASHBOARD_URL} and use Export key on the wallet. ` +
+        'The key is shown once and the export is logged.',
+      wallet_id: wallet_id ?? 'all wallets are exportable',
+      why_not_here:
+        'Export is gated behind a browser login rather than the API key on purpose. An API key can ' +
+        'spend within your limits; if it could also export keys, a leaked key would mean instant total loss. ' +
+        'Your funds stay portable either way: nothing here is locked in.',
+      after_export:
+        'Set AGENTWALLET_PRIVATE_KEY to the exported key and restart to run non-custodially, ' +
+        'or import it into any wallet you like.',
+    });
+  },
+);
+
 // ─── Start ──────────────────────────────────────────────────────
 
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  /* stderr, so it never corrupts the stdio JSON-RPC stream. Announcing custody
+     at startup means an operator sees which mode they are in without asking. */
+  if (isLocalMode()) {
+    try {
+      console.error(`AgentWallet MCP: LOCAL signing mode. Address ${getLocalAddress()}. Key never leaves this machine.`);
+    } catch (e) {
+      console.error(`AgentWallet MCP: local signing configured but the key could not be loaded: ${(e as Error).message}`);
+      process.exit(1);
+    }
+  } else {
+    console.error('AgentWallet MCP: custodial mode via ' + API_BASE + '. Run wallet_mode for details.');
+  }
 }
 
 main().catch((error) => {

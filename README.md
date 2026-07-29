@@ -1,8 +1,49 @@
 # AgentWallet MCP Server
 
-Permissionless wallet infrastructure for AI agents. Create wallets, sign transactions, and broadcast on-chain — on any EVM chain and Solana. Up to 50% less expensive than Coinbase. Built-in guards. No KYC. The only AI agent wallet that accepts crypto for its own API fees.
+Permissionless wallet infrastructure for AI agents. Create wallets, sign transactions, and broadcast on-chain, on any EVM chain and Solana. Built-in guards. No KYC. The only AI agent wallet that accepts crypto for its own API fees.
+
+**Your keys can stay on your machine.** Set one environment variable and every signature happens in your own process. No server sees the key, no company can freeze the wallet, and you can verify that claim by reading `src/local-wallet.ts` or by running the server with the API pointed at a closed port.
 
 **No KYC. No KYT. No approval process. No transaction monitoring. No one can block your wallet. Pay with USDC on-chain — no credit card required.**
+
+## Two modes
+
+| | Local (self-custody) | Hosted (custodial) |
+|---|---|---|
+| Who holds the key | You, in your own process | Encrypted on AgentWallet servers |
+| Set up | One env var, no account needed | API key |
+| Chains | EVM | EVM + Solana |
+| Can anyone freeze it | No | Yes, that is what pause is for |
+| Spend guards | `AGENTWALLET_MAX_TX_NATIVE`, `AGENTWALLET_MAX_AUTOPAY` | Server-side limits, pause, rate limits |
+| Paywalls, usage, billing | Needs an API key too | Included |
+
+Run `wallet_mode` at any time and the server will tell you which one you are in, and which address it controls.
+
+### Local signing in one variable
+
+```json
+{
+  "mcpServers": {
+    "agentwallet": {
+      "command": "npx",
+      "args": ["-y", "agentwallet-mcp"],
+      "env": {
+        "AGENTWALLET_PRIVATE_KEY": "0xyour_key",
+        "AGENTWALLET_RPC_8453": "https://your-own-rpc",
+        "AGENTWALLET_MAX_TX_NATIVE": "0.05"
+      }
+    }
+  }
+}
+```
+
+Use `AGENTWALLET_KEYFILE=/path/to/key` instead if you would rather keep the key out of your shell config. The key is read once, never written to disk, never logged, and never included in an error message.
+
+`AGENTWALLET_RPC_<chainId>` (or `AGENTWALLET_RPC_URL` for all chains) points at an endpoint you trust. Without it a public RPC is used, and a public RPC can see which addresses you ask about.
+
+`AGENTWALLET_MAX_TX_NATIVE` is a per-transaction ceiling in native units. In hosted mode the server enforces limits; in local mode there is no server, so this guard is the only one there is. Set it.
+
+**Local mode is EVM only right now.** Solana calls are refused with a clear error rather than quietly falling back to the custodial API, because silently moving your funds onto someone else's signer is exactly the behavior this mode exists to prevent.
 
 <p align="center">
   <img src="assets/demo.svg" alt="AgentWallet demo — AI agent pays x402 invoice automatically" width="800">
@@ -10,20 +51,20 @@ Permissionless wallet infrastructure for AI agents. Create wallets, sign transac
 
 ## Features
 
-- **29 MCP tools** — create wallets, send transactions, approve tokens, wrap ETH, transfer SPL tokens, pay and accept x402 payments, and more
+- **31 MCP tools** — create wallets, send transactions, approve tokens, wrap ETH, transfer SPL tokens, pay and accept x402 payments, verify custody mode, and more
 - **EVM + Solana** — Ethereum, Base, Polygon, BSC, Arbitrum, Optimism, Avalanche, Zora, PulseChain, Solana, and any other EVM-compatible chain
 - **SOL + SPL tokens** — native SOL transfers and SPL token transfers (USDC, USDT, etc.) with automatic account creation
 - **Built-in guards** — daily spending limits, gas price protection, emergency pause, rate limiting, replay protection, and on-chain verification — all active by default
 - **x402 payments** — pay for x402-enabled APIs automatically, or accept x402 payments on your own endpoints (EVM and Solana)
-- **Secure** — Private keys encrypted at rest, decrypted only during signing, zeroed from memory immediately after
+- **Self-custody option** — run local mode and the key never leaves your machine. In hosted mode, keys are encrypted at rest, decrypted only during signing, and zeroed from memory immediately after. Either way you can export and walk away.
 - **Permissionless** — No KYC. No KYT. No identity verification. No approval process. No compliance gatekeeping. Sign up, get an API key, and start transacting immediately.
 - **30-second setup** — three lines of config. No SDK to install. No dependencies to manage.
 
 ## Pricing
 
-- **$0.00345 per operation** (31% less expensive than Coinbase CDP)
+- **$0.00345 per operation** (31% under Coinbase CDP list pricing, checked 2026-07-29)
 - **6,000 free operations/month**
-- **$0.0005 per x402 verification** (50% less expensive than Coinbase)
+- **$0.0005 per x402 verification** (50% under Coinbase, checked 2026-07-29)
 - **1,000 free x402 verifications/month**
 - **Pay with USDC on-chain** via x402 — no credit card required
 - No monthly fee, no tiers — just pay as you go
@@ -115,6 +156,8 @@ Add to your settings:
 | `delete_paywall` | Delete a paywall |
 | `get_paywall_payments` | View payment history for a paywall |
 | `get_x402_revenue` | Aggregate revenue stats across all paywalls |
+| `wallet_mode` | Report whether signing is local (self-custody) or hosted, and which address is in use |
+| `export_wallet_key` | How to export a hosted wallet key and move to self-custody |
 | `buy_verification_credits` | Buy x402 verification credits with USDC on-chain |
 | `get_usage` | Check your monthly usage and billing |
 | `get_chains` | List all supported chains |
@@ -196,7 +239,7 @@ When an agent hits the paywall URL:
 3. Retries with proof of payment
 4. Receives the protected content
 
-On-chain verification ensures every payment is real. Replay protection prevents double-spending. Revenue tracking shows you who paid, how much, and when. 1,000 free verifications/month, then $0.0005 each — 50% less expensive than Coinbase.
+On-chain verification ensures every payment is real. Replay protection prevents double-spending. Revenue tracking shows you who paid, how much, and when. 1,000 free verifications/month, then $0.0005 each, 50% under Coinbase as of 2026-07-29.
 
 ## How We Compare
 

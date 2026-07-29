@@ -1,8 +1,8 @@
 {
   "name": "agentwallet-mcp",
   "mcpName": "io.github.hifriendbot/agentwallet",
-  "version": "1.8.0",
-  "description": "MCP server for AgentWallet: lets AI agents create wallets, sign transactions, broadcast on EVM + Solana, pay x402 invoices, and accept x402 payments",
+  "version": "1.9.0",
+  "description": "MCP server for AgentWallet: self-custody local signing or hosted wallets. Lets AI agents sign and broadcast on EVM + Solana, pay x402 invoices, and accept x402 payments.",
   "type": "module",
   "main": "build/index.js",
   "bin": {
@@ -16,7 +16,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node build/index.js",
-    "test": "node test/x402-payment.test.mjs",
+    "test": "node test/x402-payment.test.mjs && node test/local-mode.test.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -43,7 +43,10 @@
     "x402",
     "http-402",
     "agent-payments",
-    "agentwallet"
+    "agentwallet",
+    "self-custody",
+    "non-custodial",
+    "local-signing"
   ],
   "author": "HiFriendbot (https://hifriendbot.com)",
   "license": "MIT",
@@ -53,6 +56,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.11.4",
+    "viem": "^2.55.10",
     "zod": "^3.24.0"
   },
   "devDependencies": {
