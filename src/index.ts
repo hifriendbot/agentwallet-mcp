@@ -36,10 +36,38 @@ import {
   localSplTransfer,
   resolveSolanaRpc,
 } from './local-solana.js';
+import {
+  isCasperLocalMode,
+  getCasperAddress,
+  casperWalletRecord,
+  localCsprBalance,
+  localCsprTransfer,
+  csprToMotes,
+  motesToCspr,
+  isValidCasperPublicKey,
+  resolveCasperRpc,
+  CASPER_MAINNET_CHAIN_ID,
+  CASPER_TESTNET_CHAIN_ID,
+} from './local-casper.js';
+import {
+  isCasperChain,
+  isCasperNetwork,
+  resolveCasperChainId,
+  selectCasperAccept,
+  resolveCasperRequirement,
+  isWithinCasperCap,
+  buildCasperPayment,
+  encodePaymentHeader,
+  verifyPayment,
+  settlePayment,
+  facilitatorUrl,
+  CASPER_X402_NETWORKS,
+  type CasperAccept,
+} from './casper-x402.js';
 
 /** True when either chain family is running non-custodially. */
 function anyLocalMode(): boolean {
-  return isLocalMode() || isSolanaLocalMode();
+  return isLocalMode() || isSolanaLocalMode() || isCasperLocalMode();
 }
 
 // ─── Configuration ──────────────────────────────────────────────
@@ -95,12 +123,15 @@ function localChainId(body?: Record<string, unknown>, qs?: URLSearchParams): num
  * self-custody. That is the single worst thing this server could do, so it
  * stops and says exactly which variable is missing.
  */
-function refuseMissingLocalKey(family: 'solana' | 'evm'): never {
+function refuseMissingLocalKey(family: 'solana' | 'evm' | 'casper'): never {
   const wanted = family === 'solana'
     ? 'AGENTWALLET_SOLANA_KEY (or AGENTWALLET_SOLANA_KEYFILE)'
-    : 'AGENTWALLET_PRIVATE_KEY (or AGENTWALLET_KEYFILE)';
+    : family === 'casper'
+      ? 'AGENTWALLET_CASPER_KEY (or AGENTWALLET_CASPER_KEYFILE)'
+      : 'AGENTWALLET_PRIVATE_KEY (or AGENTWALLET_KEYFILE)';
+  const label = family === 'solana' ? 'Solana' : family === 'casper' ? 'Casper' : 'EVM';
   throw new Error(
-    `This is a ${family === 'solana' ? 'Solana' : 'EVM'} operation and no local ${family === 'solana' ? 'Solana' : 'EVM'} key is configured, ` +
+    `This is a ${label} operation and no local ${label} key is configured, ` +
     `but this server is running in local signing mode. Refusing rather than routing it through the hosted ` +
     `custodial signer while you believe you hold the keys. Set ${wanted} to sign it here, or unset the other ` +
     `local key variables to use the hosted path for everything.`
@@ -118,6 +149,12 @@ async function routeLocally(
   // POST /wallets/{id}/send
   if (method === 'POST' && /^\/wallets\/[^/]*\/send$/.test(rawPath)) {
     const chainId = localChainId(body, qs);
+
+    if (isCasperChain(chainId)) {
+      if (!isCasperLocalMode()) refuseMissingLocalKey('casper');
+      return localCsprTransfer(String(body?.to || ''), String(body?.value ?? '0'), chainId);
+    }
+
     const solanaOp = SOLANA_CHAIN_IDS.has(chainId) || Boolean(body?.token_mint);
 
     if (solanaOp) {
@@ -151,6 +188,10 @@ async function routeLocally(
   // GET /wallets/{id}/balance
   if (method === 'GET' && /^\/wallets\/[^/]*\/balance$/.test(rawPath)) {
     const chainId = localChainId(body, qs);
+    if (isCasperChain(chainId)) {
+      if (!isCasperLocalMode()) refuseMissingLocalKey('casper');
+      return localCsprBalance(chainId);
+    }
     if (SOLANA_CHAIN_IDS.has(chainId)) {
       if (!isSolanaLocalMode()) refuseMissingLocalKey('solana');
       return localSolBalance(chainId);
@@ -190,6 +231,7 @@ async function routeLocally(
     const wallets = [];
     if (isLocalMode()) wallets.push(localWalletRecord());
     if (isSolanaLocalMode()) wallets.push(solanaWalletRecord());
+    if (isCasperLocalMode()) wallets.push(casperWalletRecord());
     return { wallets };
   }
   if (method === 'GET' && /^\/wallets\/[^/]+$/.test(rawPath)) {
@@ -449,6 +491,9 @@ function resolveChainId(network: string): number | null {
   if (X402_NETWORKS[lower]) return X402_NETWORKS[lower];
   const caipMatch = network.match(/^eip155:(\d+)$/);
   if (caipMatch) return parseInt(caipMatch[1], 10);
+  // Casper CAIP-2: casper:casper (mainnet) and casper:casper-test (testnet)
+  const casperChainId = resolveCasperChainId(network);
+  if (casperChainId !== null) return casperChainId;
   // Solana CAIP-2: solana:<genesis_prefix>
   const solanaMatch = network.match(/^solana:(.+)$/);
   if (solanaMatch) {
@@ -1101,6 +1146,138 @@ server.tool(
 
 // ─── Tool: pay_x402 ─────────────────────────────────────────────
 
+// ─── Tools: Casper ──────────────────────────────────────────────
+//
+// Registered unconditionally, like every other tool here, so the tool list is
+// identical whether or not a Casper key is configured. The tools themselves
+// refuse with a clear message when AGENTWALLET_CASPER_KEY is absent, which is
+// the same contract the EVM and Solana local paths already have.
+
+function requireCasperLocalMode(): void {
+  if (!isCasperLocalMode()) {
+    throw new Error(
+      'Casper operations need a local Casper key. Set AGENTWALLET_CASPER_KEY (a PEM secret key or ' +
+      'a 32-byte hex secret) or AGENTWALLET_CASPER_KEYFILE (a path to secret_key.pem).'
+    );
+  }
+}
+
+server.tool(
+  'get_casper_balance',
+  'Get the native CSPR balance of the locally configured Casper account. ' +
+    'Returns the balance in both motes (1 CSPR = 1,000,000,000 motes) and human-readable CSPR.',
+  {
+    chain_id: z.number().int().default(CASPER_MAINNET_CHAIN_ID).describe(
+      `Casper chain ID (${CASPER_MAINNET_CHAIN_ID}=Casper mainnet, ${CASPER_TESTNET_CHAIN_ID}=Casper testnet)`,
+    ),
+  },
+  async ({ chain_id }) => {
+    requireCasperLocalMode();
+    if (!isCasperChain(chain_id)) {
+      throw new Error(`Chain ${chain_id} is not a Casper network. Use ${CASPER_MAINNET_CHAIN_ID} or ${CASPER_TESTNET_CHAIN_ID}.`);
+    }
+    return jsonResponse(await localCsprBalance(chain_id));
+  },
+);
+
+server.tool(
+  'transfer_cspr',
+  'Send native CSPR to a Casper account. The deploy is built and signed in-process — the secret key ' +
+    'never leaves this server — and submitted to a Casper node. Returns the deploy hash.',
+  {
+    to: z.string().describe('Recipient Casper account public key (hex, 01… for ed25519 or 02… for secp256k1)'),
+    amount: z.string().describe('Amount in CSPR (e.g. "2.5"). Rejected if it has more than 9 decimals.'),
+    chain_id: z.number().int().default(CASPER_MAINNET_CHAIN_ID).describe(
+      `Casper chain ID (${CASPER_MAINNET_CHAIN_ID}=Casper mainnet, ${CASPER_TESTNET_CHAIN_ID}=Casper testnet)`,
+    ),
+  },
+  async ({ to, amount, chain_id }) => {
+    requireCasperLocalMode();
+    if (!isCasperChain(chain_id)) {
+      throw new Error(`Chain ${chain_id} is not a Casper network. Use ${CASPER_MAINNET_CHAIN_ID} or ${CASPER_TESTNET_CHAIN_ID}.`);
+    }
+    if (!isValidCasperPublicKey(to)) {
+      throw new Error(`Invalid Casper address "${to}". Expected a hex account public key (01… or 02…).`);
+    }
+    const motes = csprToMotes(amount);
+    const result = await localCsprTransfer(to, motes.toString(), chain_id);
+    return jsonResponse({ ...result, amount_cspr: motesToCspr(motes) });
+  },
+);
+
+server.tool(
+  'get_casper_info',
+  'Show the Casper configuration this server is running with: the local account public key (if any), ' +
+    'the RPC endpoints, the x402 facilitator, and the supported x402 networks. Reads only — no key material.',
+  {},
+  async () => jsonResponse({
+    configured: isCasperLocalMode(),
+    address: isCasperLocalMode() ? getCasperAddress() : null,
+    mode: isCasperLocalMode() ? 'local' : 'not-configured',
+    chains: [
+      { chain_id: CASPER_MAINNET_CHAIN_ID, name: 'casper', x402_network: 'casper:casper', rpc: resolveCasperRpc(CASPER_MAINNET_CHAIN_ID) },
+      { chain_id: CASPER_TESTNET_CHAIN_ID, name: 'casper-test', x402_network: 'casper:casper-test', rpc: resolveCasperRpc(CASPER_TESTNET_CHAIN_ID) },
+    ],
+    x402_facilitator: facilitatorUrl(),
+    x402_networks: Object.keys(CASPER_X402_NETWORKS),
+    settlement_asset: 'wCSPR (CEP-18, 9 decimals)',
+    native_decimals: 9,
+  }),
+);
+
+/**
+ * Pay a Casper x402 requirement.
+ *
+ * Casper settles through a facilitator rather than by broadcasting the payment
+ * ourselves: the wCSPR CEP-18 transfer deploy is signed here, verified by the
+ * facilitator, and only submitted once verification passes. Both facilitator
+ * calls fail closed, so a network error or an unparseable answer aborts the
+ * payment instead of letting the caller believe it went through.
+ */
+async function payCasperX402(accept: CasperAccept, x402Version: number, effectiveMax: string, capSource: string) {
+  const req = resolveCasperRequirement(accept);
+
+  if (!isWithinCasperCap(req.amountMotes.toString(), effectiveMax)) {
+    return {
+      blocked: true as const,
+      body: {
+        status: 402,
+        payment_required: true,
+        payment_made: false,
+        error: `Payment of ${req.humanAmount} wCSPR exceeds the ${effectiveMax} cap (from ${capSource}).`,
+        required_amount: req.humanAmount,
+        max_allowed: effectiveMax,
+        cap_source: capSource,
+        token: 'wCSPR',
+        network: req.network,
+        chain_id: req.chainId,
+        pay_to: req.payTo,
+      },
+    };
+  }
+
+  requireCasperLocalMode();
+  const payment = buildCasperPayment(accept, x402Version);
+
+  const verified = await verifyPayment(payment, accept);
+  if (!verified.ok) {
+    throw new Error(`Casper x402 payment rejected during verification: ${verified.reason}`);
+  }
+
+  const settled = await settlePayment(payment, accept);
+  if (!settled.ok) {
+    throw new Error(`Casper x402 payment failed to settle: ${settled.reason}`);
+  }
+
+  return {
+    blocked: false as const,
+    header: encodePaymentHeader(payment),
+    txHash: settled.transaction || payment.payload.deployHash,
+    amount: req.humanAmount,
+    chainId: req.chainId,
+  };
+}
+
 server.tool(
   'pay_x402',
   'Handle an x402 payment flow. Fetches a URL, and if the server returns HTTP 402 Payment Required, ' +
@@ -1186,6 +1363,50 @@ server.tool(
       extra?: { name?: string; token?: string };
     };
     const options = paymentInfo.accepts as PaymentOption[];
+
+    // Casper settles through a facilitator rather than a direct broadcast, so
+    // it is handled on its own path before the EVM/Solana chain resolution.
+    // Only taken when the server actually offers a Casper option AND a Casper
+    // key is configured, so nothing changes for existing deployments.
+    const casperAccept = isCasperLocalMode()
+      ? selectCasperAccept(options as unknown as CasperAccept[], prefer_chain)
+      : null;
+    if (casperAccept && (!prefer_chain || isCasperChain(prefer_chain))) {
+      const casperCapSource = max_payment ? 'max_payment' : 'AGENTWALLET_MAX_AUTOPAY';
+      const casperCap = max_payment || process.env.AGENTWALLET_MAX_AUTOPAY || '1';
+      const paid = await payCasperX402(
+        casperAccept,
+        paymentInfo.x402Version || 2,
+        casperCap,
+        casperCapSource,
+      );
+      if (paid.blocked) return jsonResponse(paid.body);
+
+      const casperRetry: RequestInit = {
+        method,
+        headers: { ...reqHeaders, 'X-PAYMENT': paid.header },
+        signal: AbortSignal.timeout(30_000),
+      };
+      if (reqBody && method !== 'GET') casperRetry.body = reqBody;
+
+      const casperRes = await safeFetch(url, casperRetry);
+      const casperText = await casperRes.text();
+      let casperParsed: unknown;
+      try { casperParsed = JSON.parse(casperText); } catch { casperParsed = casperText; }
+
+      return jsonResponse({
+        status: casperRes.status,
+        payment_required: true,
+        payment_made: true,
+        amount_paid: paid.amount,
+        token: 'wCSPR',
+        network: casperAccept.network,
+        chain_id: paid.chainId,
+        tx_hash: paid.txHash,
+        facilitator: facilitatorUrl(),
+        response: casperParsed,
+      });
+    }
 
     let option: PaymentOption;
     if (prefer_chain) {

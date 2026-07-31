@@ -16,7 +16,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node build/index.js",
-    "test": "node test/x402-payment.test.mjs && node test/local-mode.test.mjs && node test/ssrf-guard.test.mjs",
+    "test": "node test/x402-payment.test.mjs && node test/local-mode.test.mjs && node test/ssrf-guard.test.mjs && node test/casper-x402.test.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

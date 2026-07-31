@@ -55,7 +55,23 @@ Use `AGENTWALLET_KEYFILE=/path/to/key` instead if you would rather keep the key 
 
 Accepts whichever format you already have: a `solana-keygen` id.json array, a base58 secret key as exported by Phantom, or base64. Use `AGENTWALLET_SOLANA_KEYFILE` to point at a file instead. Native SOL and SPL token transfers are both signed locally, and a missing associated token account is created for the recipient automatically.
 
-Set either key, or both. They are independent: run EVM locally and Solana hosted, or the reverse.
+### Casper local signing
+
+```json
+"env": {
+  "AGENTWALLET_CASPER_KEYFILE": "/path/to/secret_key.pem",
+  "AGENTWALLET_CASPER_RPC": "https://your-own-node/rpc",
+  "AGENTWALLET_MAX_TX_CSPR": "100"
+}
+```
+
+Accepts whichever format you already have: a `casper-client keygen` `secret_key.pem` (ed25519 or secp256k1), or a raw 32-byte hex secret in `AGENTWALLET_CASPER_KEY`, with `AGENTWALLET_CASPER_ALGO` selecting the curve for the hex form (default `ed25519`). Deploys are built and signed in-process and submitted straight to a Casper node.
+
+CSPR has 9 decimals (motes). Amounts are converted with exact integer math and an amount finer than one mote is **rejected, never truncated** — silently dropping a digit is how a payment under-pays an invoice and then cannot be explained.
+
+Casper chain IDs are `5000` (mainnet) and `5001` (testnet).
+
+Set any of the keys, or all of them. They are independent: run EVM locally and Solana hosted, or the reverse.
 
 **An operation with no matching local key is refused, never silently routed to the hosted signer.** If you have an EVM key configured and ask for a Solana transfer with no Solana key, the server stops and tells you which variable is missing. Quietly moving funds onto a key you do not hold, while you believe you are in self-custody, is the worst thing this server could do.
 
@@ -163,6 +179,9 @@ Add to your settings:
 | `get_token_info` | Get ERC-20 token name, symbol, and decimals |
 | `transfer` | Send native tokens (ETH, SOL, POL, BNB, etc.) |
 | `transfer_token` | Send ERC-20 or SPL tokens (USDC, USDT, etc.) |
+| `transfer_cspr` | Send native CSPR on Casper |
+| `get_casper_balance` | Check native CSPR balance (motes + CSPR) |
+| `get_casper_info` | Show the Casper account, RPCs, and x402 facilitator in use |
 | `send_transaction` | Sign and broadcast a raw transaction |
 | `sign_transaction` | Sign a transaction without broadcasting |
 | `call_contract` | Read-only contract call (eth_call) |
@@ -202,6 +221,8 @@ Add to your settings:
 | PulseChain | 369 | PLS | USDC |
 | Solana | 900 | SOL | USDC |
 | Solana Devnet | 901 | SOL | USDC |
+| Casper | 5000 | CSPR | wCSPR |
+| Casper Testnet | 5001 | CSPR | wCSPR |
 
 ## Use Case: GuessMarket
 
@@ -238,6 +259,16 @@ pay_x402(
 `max_payment` is enforced as a hard per-payment cap. If you omit it, `pay_x402` falls back to `AGENTWALLET_MAX_AUTOPAY` (default `1`), the same cap the auto-pay path uses, so a malicious or compromised 402 endpoint can never authorize an unbounded payment. Set `max_payment` explicitly (or raise `AGENTWALLET_MAX_AUTOPAY`) to allow a larger single payment.
 
 Supports ERC-20 tokens, SPL tokens, and native tokens on EVM and Solana. Compatible with x402 V1 and V2 (CAIP-2 chain identifiers), and reads the token address from the standard x402 `asset` field (falling back to `extra.token`).
+
+### Casper x402
+
+`pay_x402` also settles on Casper, on networks `casper:casper` (mainnet) and `casper:casper-test` (testnet), using x402 v2 payload and `accepts[]` shapes. The settlement asset is wCSPR, a CEP-18 token with the same 9 decimals as CSPR itself.
+
+Casper does not broadcast the payment directly. The wCSPR transfer deploy is signed in this process, sent to a facilitator for `/verify`, and only submitted through `/settle` once verification passes. The default facilitator is [`https://x402-facilitator.cspr.cloud`](https://docs.cspr.cloud); override it with `AGENTWALLET_CASPER_FACILITATOR_URL`.
+
+The facilitator client **fails closed**. A non-2xx status, an unparseable body, a missing verdict, an unreachable host, or anything other than a literal `true` is treated as a payment failure. A payment that "might" have settled is treated as one that did not.
+
+The Casper path is only taken when a Casper key is configured *and* the 402 response actually offers a Casper option. With no Casper key set, nothing changes: the tool list, the EVM path, and the Solana path all behave exactly as before.
 
 ## x402 Acceptance
 
