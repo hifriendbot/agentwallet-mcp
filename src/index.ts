@@ -13,6 +13,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { assertPublicUrl, safeFetch } from './ssrf-guard.js';
 import { deriveX402Payment, isWithinCap } from './x402-payment.js';
 import {
   isLocalMode,
@@ -465,7 +466,7 @@ function resolveChainId(network: string): number | null {
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.8.0',
+    version: '1.10.1',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. Private keys are encrypted server-side and never exposed — agents sign and broadcast transactions without ever touching raw keys.
@@ -1135,19 +1136,10 @@ server.tool(
       }
     }
 
-    // Validate URL — block private IPs and cloud metadata endpoints
-    const urlObj = new URL(url);
-    const hostname = urlObj.hostname.toLowerCase();
-    const blockedHosts = ['localhost', '127.0.0.1', '0.0.0.0', '[::1]', '169.254.169.254', 'metadata.google.internal'];
-    const blockedPrefixes = ['10.', '172.16.', '172.17.', '172.18.', '172.19.', '172.20.', '172.21.',
-      '172.22.', '172.23.', '172.24.', '172.25.', '172.26.', '172.27.', '172.28.', '172.29.',
-      '172.30.', '172.31.', '192.168.'];
-    if (blockedHosts.includes(hostname) || blockedPrefixes.some(p => hostname.startsWith(p))) {
-      throw new Error('URL points to a private/internal address. Only public URLs are allowed.');
-    }
-    if (urlObj.protocol !== 'https:') {
-      throw new Error('Only HTTPS URLs are supported for x402 payments.');
-    }
+    // Validate URL: canonicalizes IP literals (including IPv4-mapped IPv6) and
+    // resolves DNS names, rejecting any private/internal destination. Redirect
+    // hops are re-validated by safeFetch below.
+    await assertPublicUrl(url);
 
     // Step 1: Make initial request
     const reqOptions: RequestInit = {
@@ -1160,7 +1152,7 @@ server.tool(
       if (!reqHeaders['Content-Type']) reqHeaders['Content-Type'] = 'application/json';
     }
 
-    const initialRes = await fetch(url, reqOptions);
+    const initialRes = await safeFetch(url, reqOptions);
 
     // If not 402, return the response as-is (no payment needed)
     if (initialRes.status !== 402) {
@@ -1308,7 +1300,7 @@ server.tool(
       retryOptions.body = reqBody;
     }
 
-    const retryRes = await fetch(url, retryOptions);
+    const retryRes = await safeFetch(url, retryOptions);
     const retryText = await retryRes.text();
     let retryParsed: unknown;
     try { retryParsed = JSON.parse(retryText); } catch { retryParsed = retryText; }

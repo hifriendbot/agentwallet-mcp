@@ -311,6 +311,16 @@ All guards are active by default, no configuration required.
 - **npm:** [agentwallet-mcp](https://www.npmjs.com/package/agentwallet-mcp)
 - **Security:** [security@hifriendbot.com](mailto:security@hifriendbot.com)
 
+
+## Security
+
+`pay_x402` validates the target URL before every outbound request and again on
+each redirect hop. IP literals are canonicalized (including IPv4-mapped IPv6
+such as `[::ffff:127.0.0.1]`) and hostnames are resolved, with loopback,
+private, link-local, carrier-grade NAT, multicast and cloud-metadata
+destinations refused. Report security issues privately to
+security@hifriendbot.com.
+
 ## License
 
 MIT
