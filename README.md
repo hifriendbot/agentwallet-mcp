@@ -41,7 +41,9 @@ Use `AGENTWALLET_KEYFILE=/path/to/key` instead if you would rather keep the key 
 
 `AGENTWALLET_RPC_<chainId>` (or `AGENTWALLET_RPC_URL` for all chains) points at an endpoint you trust. Without it a public RPC is used, and a public RPC can see which addresses you ask about.
 
-`AGENTWALLET_MAX_TX_NATIVE` is a per-transaction ceiling in native units. In hosted mode the server enforces limits; in local mode there is no server, so this guard is the only one there is. Set it.
+`AGENTWALLET_MAX_TX_NATIVE` is a per-transaction ceiling in native units (ETH, MATIC and so on). In hosted mode the server enforces limits; in local mode there is no server, so these guards are the only ones there are. Set them.
+
+`AGENTWALLET_MAX_TX_TOKEN` is the equivalent ceiling for ERC-20 movement, in human units of the token. **Set this one too if you hold stablecoins.** The native cap cannot see a token transfer: an ERC-20 send carries `value = 0` with the amount in the calldata, so `AGENTWALLET_MAX_TX_NATIVE` alone leaves a USDC balance uncapped. `AGENTWALLET_MAX_TX_TOKEN` covers `transfer`, `transferFrom` and `approve`, the last because an unbounded allowance is a drain waiting to happen. Decimals are resolved locally; unknown tokens are evaluated at 6 decimals, the tightest common value, so it fails closed rather than open.
 
 ### Solana local signing
 
@@ -318,8 +320,15 @@ All guards are active by default, no configuration required.
 each redirect hop. IP literals are canonicalized (including IPv4-mapped IPv6
 such as `[::ffff:127.0.0.1]`) and hostnames are resolved, with loopback,
 private, link-local, carrier-grade NAT, multicast and cloud-metadata
-destinations refused. Report security issues privately to
-security@hifriendbot.com.
+destinations refused.
+
+Validation and connection use the same DNS answer. Each hop resolves once, and
+the socket is pinned to an address from that answer, so a hostname cannot
+resolve public for the check and private for the connection. The hostname is
+still used for the `Host` header and for TLS SNI and certificate validation, so
+pinning is invisible to legitimate endpoints.
+
+Report security issues privately to security@hifriendbot.com.
 
 ## License
 

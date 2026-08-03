@@ -24,6 +24,7 @@ import {
   LAMPORTS_PER_SOL,
 } from '@solana/web3.js';
 import bs58 from 'bs58';
+import { lookupTrustedDecimals } from './x402-payment.js';
 
 /* ── Program IDs ─────────────────────────────────────────────────── */
 
@@ -142,6 +143,36 @@ function assertWithinSolCap(lamports: bigint) {
   }
 }
 
+/**
+ * Bound SPL movement. AGENTWALLET_MAX_TX_SOL only ever covered native SOL, so
+ * an SPL transfer, which is how USDC moves on Solana and the whole point of the
+ * x402 rail here, went out with no local ceiling at all. Mirrors
+ * AGENTWALLET_MAX_TX_TOKEN on the EVM side and uses the same variable so an
+ * operator sets one token cap, not one per chain family.
+ *
+ * Decimals for the cap come from the trusted table when the mint is known.
+ * The caller-supplied value is not used for the ceiling: an inflated one would
+ * inflate the cap exactly like the x402 bypass. When the mint is unknown we
+ * assume 6, the tightest common value, so it fails closed.
+ */
+function assertWithinSplCap(mint: string, rawAmount: bigint) {
+  const cap = (process.env.AGENTWALLET_MAX_TX_TOKEN || '').trim();
+  if (!cap) return;
+  if (!/^\d+(\.\d+)?$/.test(cap)) {
+    throw new Error(`AGENTWALLET_MAX_TX_TOKEN must be a decimal number, got "${cap}".`);
+  }
+  const decimals = lookupTrustedDecimals(900, mint) ?? 6;
+  const [whole, frac = ''] = cap.split('.');
+  const capRaw = BigInt(whole + frac.padEnd(decimals, '0').slice(0, decimals));
+  if (rawAmount > capRaw) {
+    throw new Error(
+      `Blocked by local guard: SPL transfer of ${rawAmount} base units exceeds ` +
+      `AGENTWALLET_MAX_TX_TOKEN (${cap}, evaluated at ${decimals} decimals). ` +
+      `Raise the cap deliberately if this is intended.`
+    );
+  }
+}
+
 /* ── Reads ───────────────────────────────────────────────────────── */
 
 export async function localSolBalance(chainId = 900) {
@@ -208,6 +239,11 @@ export interface LocalSolResult {
 export async function localSolTransfer(to: string, lamports: string, chainId = 900): Promise<LocalSolResult> {
   const amount = BigInt(lamports);
   assertWithinSolCap(amount);
+  // Number() silently loses precision past 2**53 lamports. Refuse rather than
+  // sign a transaction for an amount other than the one that was requested.
+  if (amount > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new Error(`Amount ${lamports} lamports exceeds safe integer range and was refused.`);
+  }
 
   const conn = connection(chainId);
   const payer = getSolanaKeypair();
@@ -290,6 +326,10 @@ export async function localSplTransfer(
   decimals: number,
   chainId = 900
 ): Promise<LocalSolResult> {
+  // Checked before any RPC round trip: a blocked transfer should cost nothing
+  // and should not announce itself to the RPC provider first.
+  assertWithinSplCap(mintStr, BigInt(rawAmount));
+
   const conn = connection(chainId);
   const payer = getSolanaKeypair();
   const mint = new PublicKey(mintStr);

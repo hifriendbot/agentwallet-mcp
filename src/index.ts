@@ -14,7 +14,12 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { assertPublicUrl, safeFetch } from './ssrf-guard.js';
-import { deriveX402Payment, isWithinCap } from './x402-payment.js';
+import {
+  deriveX402Payment,
+  isWithinCap,
+  lookupTrustedDecimals,
+  assertDeclaredDecimals,
+} from './x402-payment.js';
 import {
   isLocalMode,
   getLocalAddress,
@@ -259,6 +264,61 @@ async function api(path: string, method = 'GET', body?: Record<string, unknown>,
 }
 
 /**
+ * Resolve an asset's decimals from a source the paying party controls, never
+ * from the 402 response.
+ *
+ * Order: known-asset registry first (offline, works in local self-custody mode
+ * where there may be no reachable API), then the token contract's own
+ * decimals() via eth_call. If neither answers we refuse rather than guess,
+ * because guessing is exactly what let a hostile endpoint inflate the cap.
+ */
+const decimalsCache = new Map<string, number>();
+
+async function resolveTrustedDecimals(chainId: number, token: string): Promise<number> {
+  const key = `${chainId}:${token.toLowerCase()}`;
+  const cached = decimalsCache.get(key);
+  if (typeof cached === 'number') return cached;
+
+  const known = lookupTrustedDecimals(chainId, token);
+  if (known !== null) {
+    decimalsCache.set(key, known);
+    return known;
+  }
+
+  if (isSolanaChain(chainId)) {
+    throw new Error(
+      `x402 blocked: cannot verify decimals for SPL mint ${token} on chain ${chainId}. ` +
+      `Unknown mints are refused because the payment cap cannot be checked without trusted decimals.`
+    );
+  }
+
+  // decimals() selector
+  let onChain: number | null = null;
+  try {
+    const r = (await api('/eth-call', 'POST', {
+      chain_id: chainId, to: token, data: '0x313ce567',
+    }, { 'X-AGW-SKIP-X402': 'true' })) as { result?: string };
+    const hex = (r?.result || '').replace(/^0x/, '');
+    if (hex && /^[0-9a-fA-F]+$/.test(hex)) {
+      const n = parseInt(hex, 16);
+      if (Number.isInteger(n) && n >= 0 && n <= 36) onChain = n;
+    }
+  } catch {
+    onChain = null; // fall through to the refusal below
+  }
+
+  if (onChain === null) {
+    throw new Error(
+      `x402 blocked: could not resolve on-chain decimals for ${token} on chain ${chainId}. ` +
+      `The payment cap cannot be enforced without them, so the payment was refused.`
+    );
+  }
+
+  decimalsCache.set(key, onChain);
+  return onChain;
+}
+
+/**
  * Handle x402 auto-payment: pay on-chain, then retry the original request
  */
 async function handleX402Payment(
@@ -287,7 +347,11 @@ async function handleX402Payment(
   // 402 response cannot drain the wallet. AGENTWALLET_MAX_AUTOPAY is in
   // human-readable units of the asset; default 1.
   const maxAutopay = process.env.AGENTWALLET_MAX_AUTOPAY || '1';
-  const { tokenAddress, rawAmount, decimals } = deriveX402Payment(accept, maxAutopay);
+  const assetForDecimals = accept.asset || accept.extra?.token || '';
+  const trustedDecimals = assetForDecimals
+    ? await resolveTrustedDecimals(chainId, assetForDecimals)
+    : 18; // native asset: value is already in wei-equivalent base units
+  const { tokenAddress, rawAmount, decimals } = deriveX402Payment(accept, maxAutopay, trustedDecimals);
 
   // Send payment using our wallet (with X-AGW-SKIP-X402 to prevent recursion)
   let txHash: string;
@@ -463,10 +527,26 @@ function resolveChainId(network: string): number | null {
 
 // ─── Server ──────────────────────────────────────────────────────
 
+/**
+ * Destination address shape, EVM or Solana.
+ *
+ * The contract-address params were regex-guarded but the DESTINATION on every
+ * transfer tool was a bare z.string(), so a truncated or mistyped address went
+ * straight into a signed transaction. On-chain sends are irreversible, and the
+ * chain will happily accept any well-formed address, so the cheapest place to
+ * catch a malformed one is before it is signed. This does not validate the
+ * EIP-55 checksum, only the shape; a wrong-but-well-formed address is still the
+ * caller's responsibility.
+ */
+const AddressSchema = z.string().regex(
+  /^(0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})$/,
+  'Must be a 0x-prefixed 40-hex EVM address or a base58 Solana address'
+);
+
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.10.1',
+    version: '1.10.4',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. Private keys are encrypted server-side and never exposed — agents sign and broadcast transactions without ever touching raw keys.
@@ -617,7 +697,7 @@ server.tool(
     'Does NOT broadcast — use send_transaction for sign + broadcast.',
   {
     wallet_id: z.number().int().describe('Wallet ID'),
-    to: z.string().describe('Destination address (0x-prefixed for EVM, Base58 for Solana)'),
+    to: AddressSchema.describe('Destination address (0x-prefixed for EVM, Base58 for Solana)'),
     chain_id: z.number().int().optional().describe('Chain ID (defaults to wallet\'s default)'),
     value: z.string().default('0').describe('Value in wei/lamports (decimal string)'),
     data: z.string().default('').describe('Hex-encoded calldata (0x-prefixed) for EVM contract calls'),
@@ -662,7 +742,7 @@ server.tool(
     'The transaction is signed server-side and broadcast via RPC.',
   {
     wallet_id: z.number().int().describe('Wallet ID'),
-    to: z.string().describe('Destination address (0x-prefixed for EVM, Base58 for Solana)'),
+    to: AddressSchema.describe('Destination address (0x-prefixed for EVM, Base58 for Solana)'),
     chain_id: z.number().int().optional().describe('Chain ID (defaults to wallet\'s default)'),
     value: z.string().default('0').describe('Value in wei/lamports (decimal string)'),
     data: z.string().default('').describe('Hex-encoded calldata (0x-prefixed) for EVM contract calls'),
@@ -707,7 +787,7 @@ server.tool(
     'The amount is converted to wei/lamports automatically. Signs and broadcasts the transaction.',
   {
     wallet_id: z.number().int().describe('Wallet ID to send from'),
-    to: z.string().describe('Destination address (0x-prefixed for EVM, Base58 for Solana)'),
+    to: AddressSchema.describe('Destination address (0x-prefixed for EVM, Base58 for Solana)'),
     amount: z.string().describe('Amount to send in human-readable format (e.g. "0.1" for 0.1 ETH)'),
     chain_id: z.number().int().describe('Chain ID (1=Ethereum, 8453=Base, 42161=Arbitrum, 10=Optimism, 137=Polygon, 43114=Avalanche, 56=BSC, 7777777=Zora, 369=PulseChain, 900=Solana, 901=Solana Devnet)'),
   },
@@ -792,7 +872,7 @@ server.tool(
   {
     wallet_id: z.number().int().describe('Wallet ID to send from'),
     token: z.string().describe('Token address (0x-prefixed ERC-20 contract for EVM, Base58 mint for Solana)'),
-    to: z.string().describe('Recipient address (0x-prefixed for EVM, Base58 for Solana)'),
+    to: AddressSchema.describe('Recipient address (0x-prefixed for EVM, Base58 for Solana)'),
     amount: z.string().describe('Amount in human-readable format (e.g. "100" for 100 USDC)'),
     chain_id: z.number().int().describe('Chain ID'),
     decimals: z.number().int().default(18).describe('Token decimals (6 for USDC, 18 for most tokens)'),
@@ -1137,8 +1217,10 @@ server.tool(
     }
 
     // Validate URL: canonicalizes IP literals (including IPv4-mapped IPv6) and
-    // resolves DNS names, rejecting any private/internal destination. Redirect
-    // hops are re-validated by safeFetch below.
+    // resolves DNS names, rejecting any private/internal destination. An early
+    // check here gives a clear error before any request is built; safeFetch
+    // below re-validates every hop and pins each connection to the addresses it
+    // validated, so DNS cannot be rebound between the check and the connect.
     await assertPublicUrl(url);
 
     // Step 1: Make initial request
@@ -1203,8 +1285,19 @@ server.tool(
       );
     }
 
-    // Calculate human-readable amount
-    const amount = formatUnits(option.maxAmountRequired, option.requiredDecimals);
+    // Decimals come from the registry or the token contract, NEVER from the 402
+    // body. The endpoint controls requiredDecimals, so trusting it lets a
+    // hostile server inflate the cap AND misreport the amount shown to the
+    // agent. The declared value is only used to detect a mismatch and refuse.
+    const assetForDecimals = option.asset || option.extra?.token || '';
+    const trustedDecimals = assetForDecimals
+      ? await resolveTrustedDecimals(chainId, assetForDecimals)
+      : 18;
+    assertDeclaredDecimals(option.requiredDecimals, trustedDecimals);
+
+    // Human-readable amount, computed with trusted decimals so what the agent
+    // is told matches what will actually leave the wallet.
+    const amount = formatUnits(option.maxAmountRequired, trustedDecimals);
 
     // Step 4: Enforce a hard per-payment cap. ALWAYS applied — if the caller
     // omits max_payment we fall back to AGENTWALLET_MAX_AUTOPAY (default "1"),
@@ -1213,7 +1306,7 @@ server.tool(
     // maxAmountRequired and drain the wallet. The cap is never silently skipped.
     const capSource = max_payment ? 'max_payment' : 'AGENTWALLET_MAX_AUTOPAY';
     const effectiveMax = max_payment || process.env.AGENTWALLET_MAX_AUTOPAY || '1';
-    if (!isWithinCap(option.maxAmountRequired, option.requiredDecimals, effectiveMax)) {
+    if (!isWithinCap(option.maxAmountRequired, trustedDecimals, effectiveMax)) {
       return jsonResponse({
         status: 402,
         payment_required: true,
@@ -1248,7 +1341,7 @@ server.tool(
           to: option.payTo,
           value: option.maxAmountRequired,
           token_mint: tokenAddress,
-          token_decimals: option.requiredDecimals,
+          token_decimals: trustedDecimals,
           chain_id: chainId,
         })) as Record<string, unknown>;
       } else {

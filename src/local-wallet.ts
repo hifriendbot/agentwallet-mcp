@@ -27,6 +27,7 @@ import {
   type Hex,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
+import { lookupTrustedDecimals } from './x402-payment.js';
 
 /* ── Key loading ─────────────────────────────────────────────────── */
 
@@ -207,6 +208,53 @@ export interface LocalSendResult {
  * Sign and broadcast a transaction. viem fills nonce, gas and EIP-1559 fees
  * from the RPC unless they are supplied.
  */
+/**
+ * Bound ERC-20 movement, which the native cap does not see.
+ *
+ * A token transfer is `to = tokenContract, value = 0, data = transfer(...)`, so
+ * assertWithinNativeCap always passed it. In local mode there is no server-side
+ * limit behind this, and the README tells operators the local guard is the only
+ * one they have, so a wallet holding USDC was effectively uncapped. Covers
+ * transfer, transferFrom and approve, since an unbounded approval is a drain
+ * waiting to happen.
+ *
+ * Opt-in via AGENTWALLET_MAX_TX_TOKEN, expressed in human units of the token.
+ * When the token's decimals are not known locally we assume 6, the smallest in
+ * common use, which makes the raw ceiling the tightest one and fails closed
+ * rather than open.
+ */
+function assertWithinTokenCap(chainId: number, token: Address, data: Hex) {
+  const cap = (process.env.AGENTWALLET_MAX_TX_TOKEN || '').trim();
+  if (!cap) return;
+  if (!/^\d+(\.\d+)?$/.test(cap)) {
+    throw new Error(`AGENTWALLET_MAX_TX_TOKEN must be a decimal number, got "${cap}".`);
+  }
+
+  const hex = data.slice(2);
+  const selector = hex.slice(0, 8).toLowerCase();
+  // transfer(address,uint256) | approve(address,uint256) | transferFrom(address,address,uint256)
+  const layouts: Record<string, number> = { a9059cbb: 1, '095ea7b3': 1, '23b872dd': 2 };
+  const argIndex = layouts[selector];
+  if (argIndex === undefined) return; // not a value-moving ERC-20 call
+
+  const word = hex.slice(8 + argIndex * 64, 8 + (argIndex + 1) * 64);
+  if (word.length !== 64) return; // malformed; leave it to the node to reject
+  const amount = BigInt('0x' + word);
+
+  const decimals = lookupTrustedDecimals(chainId, token) ?? 6;
+  const [whole, frac = ''] = cap.split('.');
+  const capRaw = BigInt(whole + frac.padEnd(decimals, '0').slice(0, decimals));
+
+  if (amount > capRaw) {
+    const what = selector === '095ea7b3' ? 'approval' : 'token transfer';
+    throw new Error(
+      `Blocked by local guard: ${what} of ${amount} base units exceeds ` +
+      `AGENTWALLET_MAX_TX_TOKEN (${cap}, evaluated at ${decimals} decimals). ` +
+      `Raise the cap deliberately if this is intended.`
+    );
+  }
+}
+
 export async function localSend(
   chainId: number,
   to: Address,
@@ -214,6 +262,7 @@ export async function localSend(
   data?: Hex
 ): Promise<LocalSendResult> {
   assertWithinNativeCap(valueWei);
+  if (data && data.length >= 10) assertWithinTokenCap(chainId, to, data);
   const { wallet } = clients(chainId);
   const hash = await wallet.sendTransaction({
     to,
