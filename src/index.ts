@@ -41,6 +41,16 @@ import {
   localSplTransfer,
   resolveSolanaRpc,
 } from './local-solana.js';
+import {
+  searchTasks,
+  getTask,
+  listSubmissions,
+  marketStats,
+  createTask,
+  baseUnitsToUsdc,
+  TASKMARKET_PAYMENT_POLICY,
+  type TaskMarketX402Accept,
+} from './taskmarket.js';
 
 /** True when either chain family is running non-custodially. */
 function anyLocalMode(): boolean {
@@ -1655,6 +1665,169 @@ server.tool(
   async () => {
     const data = await api('/x402/revenue');
     return jsonResponse(data);
+  },
+);
+
+// ─── TaskMarket integration ────────────────────────────────────
+//
+// TaskMarket (https://taskmarket.dev) is an onchain agent work marketplace on
+// Base: requesters escrow USDC, workers submit deliverables, and the requester
+// accepts a winner. These tools let an agent discover work it can delegate
+// there, inspect a task's submissions, and — only after explicit confirmation
+// and under a hard spending cap — create and fund a task of its own. Task
+// creation is an x402-paid endpoint, so payment reuses this server's wallet
+// and payment-cap machinery instead of introducing a second money path.
+//
+// Safety model:
+// - Reads never spend and never require a wallet.
+// - taskmarket_create_task refuses unless confirm=true AND the reward is at or
+//   under the caller's max_reward_usdc (or AGENTWALLET_MAX_TASKMARKET_REWARD).
+// - The x402 challenge is pinned to TaskMarket's own escrow on Base; any
+//   mismatch is refused before any payment (see taskmarket.ts).
+
+/** Pay a validated TaskMarket create challenge from the AgentWallet wallet. */
+async function payTaskMarketCreate(accept: TaskMarketX402Accept, walletId: number): Promise<{ txHash: string }> {
+  const chainId = resolveChainId(accept.network || '') ?? 8453;
+  const tokenAddress = accept.asset || '';
+  if (!tokenAddress) {
+    throw new Error('TaskMarket create challenge has no asset address; refusing to pay.');
+  }
+  const trustedDecimals = await resolveTrustedDecimals(chainId, tokenAddress);
+  const amount = accept.maxAmountRequired || accept.amount || '';
+  if (!/^\d+$/.test(amount)) {
+    throw new Error(`TaskMarket create challenge has a non-integer amount "${amount}"; refusing to pay.`);
+  }
+
+  const calldata = '0xa9059cbb' + padAddress(accept.payTo || '') + encodeUint256(amount);
+  const result = (await api(`/wallets/${walletId}/send`, 'POST', {
+    to: tokenAddress,
+    value: '0',
+    data: calldata,
+    chain_id: chainId,
+  }, { 'X-AGW-SKIP-X402': 'true' })) as { tx_hash?: string; signature?: string };
+
+  const txHash = result.tx_hash || result.signature || '';
+  if (!txHash) throw new Error('TaskMarket create payment returned no transaction hash.');
+  return { txHash };
+}
+
+// ─── Tool: taskmarket_search_tasks ─────────────────────────────
+
+server.tool(
+  'taskmarket_search_tasks',
+  'Browse open TaskMarket agent-work marketplace tasks (Base, USDC escrow). ' +
+    'Use this when the agent decides a request is better delegated to a worker ' +
+    'market than solved by inference. Read-only: no wallet or payment needed. ' +
+    'Returns task id, status, mode, reward in USDC, submission count, deadline, and description.',
+  {
+    status: z.string().default('open').describe('Filter by status (open, claimed, completed, etc.)'),
+    mode: z.string().optional().describe('Filter by task mode (bounty, claim, pitch, benchmark, auction)'),
+    limit: z.number().int().min(1).max(100).default(20).describe('Max results (1-100)'),
+    sort: z.string().default('newest').describe('Sort order (newest, reward_desc, reward_asc, deadline_asc)'),
+    min_reward: z.string().optional().describe('Minimum reward in USDC base units (e.g. "1000000" = 1 USDC)'),
+    max_reward: z.string().optional().describe('Maximum reward in USDC base units'),
+  },
+  async ({ status, mode, limit, sort, min_reward, max_reward }) => {
+    const data = (await searchTasks({ status, mode, limit, sort, min_reward, max_reward })) as {
+      tasks?: Array<Record<string, unknown>>;
+      hasMore?: boolean;
+    };
+    const tasks = (data.tasks || []).map((t) => ({
+      id: t.id,
+      status: t.status,
+      mode: t.mode,
+      reward_usdc: baseUnitsToUsdc(t.reward as string | undefined),
+      submission_count: t.submissionCount,
+      deadline: t.expiryTime,
+      description: String(t.description || '').slice(0, 300),
+    }));
+    return jsonResponse({ tasks, count: tasks.length, has_more: data.hasMore });
+  },
+);
+
+// ─── Tool: taskmarket_get_task ──────────────────────────────────
+
+server.tool(
+  'taskmarket_get_task',
+  'Get full details for one TaskMarket task by id, including reward, deadline, ' +
+    'status, mode, and pending actions (what the requester or worker may do next). ' +
+    'Read-only: no wallet or payment needed.',
+  {
+    task_id: z.string().describe('TaskMarket task id (0x-prefixed 64-hex)'),
+  },
+  async ({ task_id }) => {
+    const data = await getTask(task_id);
+    return jsonResponse(data);
+  },
+);
+
+// ─── Tool: taskmarket_list_submissions ─────────────────────────
+
+server.tool(
+  'taskmarket_list_submissions',
+  'List worker submissions for a TaskMarket task. Use this to track submissions ' +
+    'before deciding whether to accept or reject. Read-only: no wallet or payment needed.',
+  {
+    task_id: z.string().describe('TaskMarket task id (0x-prefixed 64-hex)'),
+  },
+  async ({ task_id }) => {
+    const data = await listSubmissions(task_id);
+    return jsonResponse(data);
+  },
+);
+
+// ─── Tool: taskmarket_market_stats ──────────────────────────────
+
+server.tool(
+  'taskmarket_market_stats',
+  'Get TaskMarket marketplace stats: registered workers, active workers and ' +
+    'agents over the last 7 days, and open task count. Read-only: no wallet or payment needed.',
+  {},
+  async () => {
+    const data = await marketStats();
+    return jsonResponse(data);
+  },
+);
+
+// ─── Tool: taskmarket_create_task ───────────────────────────────
+
+server.tool(
+  'taskmarket_create_task',
+  'Create and fund a TaskMarket task, escrowing USDC on Base for a worker market. ' +
+    'This moves real money and is NEVER automatic: it requires confirm=true and a ' +
+    'reward at or under max_reward_usdc (default AGENTWALLET_MAX_TASKMARKET_REWARD, ' +
+    'fallback 1 USDC). The x402 payment is made from wallet_id and the challenge is ' +
+    'pinned to TaskMarket\'s escrow. Returns the task id, URL, and payment tx hash.',
+  {
+    description: z.string().min(1).max(10000).describe('Task brief for workers (what to do, deliverable, deadline)'),
+    reward_usdc: z.string().describe('Reward in USDC, human-readable (e.g. "2.00")'),
+    duration_hours: z.number().positive().describe('Submission window in hours'),
+    tags: z.array(z.string()).min(1).max(10).describe('Tags for discoverability (1-10)'),
+    mode: z.string().default('bounty').describe('Task mode (bounty, claim, pitch, benchmark, auction)'),
+    confirm: z.boolean().default(false).describe('Must be true to proceed. No task is created or paid for otherwise.'),
+    max_reward_usdc: z.string().optional().describe('Hard spending cap in USDC (defaults to AGENTWALLET_MAX_TASKMARKET_REWARD, then 1)'),
+    wallet_id: z.number().int().describe('AgentWallet wallet id that pays the USDC escrow'),
+  },
+  async ({ description, reward_usdc, duration_hours, tags, mode, confirm, max_reward_usdc, wallet_id }) => {
+    const cap = max_reward_usdc || process.env.AGENTWALLET_MAX_TASKMARKET_REWARD || '1';
+    const result = await createTask({
+      description,
+      reward_usdc,
+      duration_hours,
+      tags,
+      mode,
+      confirm,
+      max_reward_usdc: cap,
+      payer: (accept) => payTaskMarketCreate(accept, wallet_id),
+    });
+    return jsonResponse({
+      ...result,
+      policy: {
+        network: TASKMARKET_PAYMENT_POLICY.network,
+        asset: TASKMARKET_PAYMENT_POLICY.asset,
+        pay_to: TASKMARKET_PAYMENT_POLICY.payTo,
+      },
+    });
   },
 );
 
