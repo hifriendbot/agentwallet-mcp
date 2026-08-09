@@ -73,7 +73,7 @@ Local signing uses [viem](https://viem.sh) for EVM and `@solana/web3.js` for Sol
 
 ## Features
 
-- **31 MCP tools**: create wallets, send transactions, approve tokens, wrap ETH, transfer SPL tokens, pay and accept x402 payments, verify custody mode, and more
+- **36 MCP tools**: create wallets, send transactions, approve tokens, wrap ETH, transfer SPL tokens, pay and accept x402 payments, delegate work to the TaskMarket worker marketplace, verify custody mode, and more
 - **EVM + Solana**: Ethereum, Base, Polygon, BSC, Arbitrum, Optimism, Avalanche, Zora, PulseChain, Solana, and any other EVM-compatible chain
 - **SOL + SPL tokens**: native SOL transfers and SPL token transfers (USDC, USDT, etc.) with automatic account creation
 - **Built-in guards**: daily spending limits, gas price protection, emergency pause, rate limiting, replay protection, and on-chain verification, all active by default
@@ -188,6 +188,11 @@ Add to your settings:
 | `pause_wallet` | Emergency pause a wallet |
 | `unpause_wallet` | Resume a paused wallet |
 | `delete_wallet` | Delete a wallet |
+| `taskmarket_search_tasks` | Browse open TaskMarket agent-work marketplace tasks (read-only) |
+| `taskmarket_get_task` | Get full details for one TaskMarket task (read-only) |
+| `taskmarket_list_submissions` | List worker submissions for a TaskMarket task (read-only) |
+| `taskmarket_market_stats` | Get TaskMarket marketplace stats (read-only) |
+| `taskmarket_create_task` | Create and fund a TaskMarket task (gated: confirm + reward cap required) |
 
 ## Supported Chains
 
@@ -216,6 +221,36 @@ Pair with [guessmarket-mcp](https://www.npmjs.com/package/guessmarket-mcp) to le
 5. Claim winnings
 
 All on-chain. All through MCP. No frontend needed.
+
+## Use Case: TaskMarket Work Marketplace
+
+[TaskMarket](https://taskmarket.dev) is an onchain agent work marketplace on Base: requesters escrow USDC, workers submit deliverables, and the requester accepts a winner. AgentWallet exposes TaskMarket to your agent so it can delegate work it should not attempt by inference alone:
+
+1. **Discover** — `taskmarket_search_tasks` browses open tasks (reward in USDC, mode, deadline, submission count). Read-only, no wallet needed.
+2. **Inspect** — `taskmarket_get_task` returns full task details including the `pendingActions` the agent may take next; `taskmarket_list_submissions` tracks what workers delivered.
+3. **Delegate** — `taskmarket_create_task` creates and funds a task, escrowing USDC on Base.
+
+Task creation is an **x402-paid endpoint** (`POST /api/tasks` returns HTTP 402 with a payment challenge). Instead of introducing a second money path, `taskmarket_create_task` reuses this server's existing wallet and payment-cap machinery — the same flow `pay_x402` uses — so one wallet, one cap, one audit trail covers both.
+
+### Spending safety (never bypassed)
+
+`taskmarket_create_task` moves real money and is **never automatic**:
+
+- Requires `confirm=true`. Without it the tool refuses before any network call.
+- Requires `max_reward_usdc` (defaults to `AGENTWALLET_MAX_TASKMARKET_REWARD`, fallback `1` USDC). A reward above the cap is refused.
+- The 402 challenge is **pinned** to TaskMarket's own escrow policy (Base network, Base USDC contract, TaskMarket payee, exact reward match). A tampered or third-party challenge is refused before any payment; the pinned policy is always reported in the tool result.
+
+```
+taskmarket_create_task(
+  description="Research and summarize the Base ecosystem grants program, cite sources.",
+  reward_usdc="2.00",
+  duration_hours=72,
+  tags=["research"],
+  confirm=true,
+  max_reward_usdc="2.00",
+  wallet_id=1
+)
+```
 
 ## x402 Payments
 
