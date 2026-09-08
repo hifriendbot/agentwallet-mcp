@@ -21,8 +21,14 @@
  * still used for the Host header and for TLS SNI and certificate validation,
  * so pinning is invisible to legitimate endpoints.
  *
- * Reported privately by ARC Security Research, 2026-07-31 (spelling bypasses)
- * and by an anonymous researcher, 2026-08-02 (the DNS rebinding race).
+ * Redirects are followed by hand, and a redirect to a different origin drops
+ * every caller-supplied header except a short content-negotiation list. A
+ * bearer token meant for api.example.com must not be replayed to whatever
+ * host api.example.com chooses to redirect to.
+ *
+ * Reported privately by ARC Security Research, 2026-07-31 (spelling bypasses),
+ * by an anonymous researcher, 2026-08-02 (the DNS rebinding race), and by
+ * Arthur Kijkrittaya, 2026-09-08 (credentials surviving cross-origin redirects).
  */
 
 import { isIP, type LookupFunction } from 'node:net';
@@ -229,11 +235,79 @@ export function createPinnedLookup(addresses: ValidatedAddress[]) {
 const NULL_BODY_STATUS = new Set([101, 103, 204, 205, 304]);
 
 /**
+ * The only request headers that may travel to a different origin on a
+ * redirect. Everything else the caller supplied (Authorization, Cookie,
+ * X-PAYMENT, API keys under any custom name) is bound to the origin the caller
+ * addressed and is dropped. An allow list is used rather than a deny list so a
+ * secret under an unanticipated header name cannot slip through.
+ */
+const CROSS_ORIGIN_SAFE_HEADERS = new Set([
+  'accept',
+  'accept-language',
+  'accept-encoding',
+  'user-agent',
+  'content-type',
+]);
+
+/** Headers that describe a request body and are wrong once the body is gone. */
+const ENTITY_HEADERS = new Set(['content-type', 'content-length', 'content-encoding', 'transfer-encoding']);
+
+/** True when two URLs share scheme, host and port (the web origin). */
+export function sameOrigin(a: string, b: string): boolean {
+  const ua = new URL(a);
+  const ub = new URL(b);
+  return ua.protocol === ub.protocol && ua.host === ub.host;
+}
+
+function headersToRecord(headers: HeadersInit | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!headers) return out;
+  if (typeof (headers as Headers).forEach === 'function' && !Array.isArray(headers)) {
+    (headers as Headers).forEach((v, k) => { out[k] = v; });
+    return out;
+  }
+  if (Array.isArray(headers)) {
+    for (const [k, v] of headers) out[k] = v;
+    return out;
+  }
+  for (const [k, v] of Object.entries(headers as Record<string, string>)) out[k] = v;
+  return out;
+}
+
+/**
+ * Decide which request headers follow a redirect from `from` to `to`.
+ *
+ * Same origin: everything is kept, as a browser would. Different origin: only
+ * CROSS_ORIGIN_SAFE_HEADERS survive. When the redirect also turned the request
+ * into a body-less GET (`bodyDropped`), the entity headers go too, on either
+ * kind of hop.
+ */
+export function headersForRedirect(
+  headers: HeadersInit | undefined,
+  from: string,
+  to: string,
+  bodyDropped: boolean,
+): Record<string, string> {
+  const crossOrigin = !sameOrigin(from, to);
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headersToRecord(headers))) {
+    const name = k.toLowerCase();
+    if (bodyDropped && ENTITY_HEADERS.has(name)) continue;
+    if (crossOrigin && !CROSS_ORIGIN_SAFE_HEADERS.has(name)) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+/**
  * fetch() that validates the target, and every redirect hop, against
  * resolvePublicUrl, and connects only to the addresses that validation
  * returned. Redirects are followed manually because the automatic follower
  * would happily land on a private address after a public first hop, and
  * because each hop needs its own resolve-then-pin cycle.
+ *
+ * Headers are re-derived on every redirect (see headersForRedirect): a hop to
+ * another origin carries no credential the caller attached for the first one.
  *
  * The body is buffered so the pinned connection can be torn down before the
  * response is handed back.
@@ -281,8 +355,12 @@ export async function safeFetch(url: string, options: RequestInit = {}, maxHops 
     if (!isRedirect) return out;
 
     const next = new URL(out.headers.get('location') as string, current).toString();
-    // A redirected request must not replay the body or method blindly.
-    if (status === 303 || ((status === 301 || status === 302) && opts.method && opts.method !== 'GET')) {
+    // A redirected request must not replay the body or method blindly, and it
+    // must not replay the caller's credentials to a different origin at all.
+    const bodyDropped = status === 303
+      || ((status === 301 || status === 302) && !!opts.method && opts.method !== 'GET');
+    opts = { ...opts, headers: headersForRedirect(opts.headers, current, next, bodyDropped) };
+    if (bodyDropped) {
       opts = { ...opts, method: 'GET', body: undefined };
     }
     current = next;

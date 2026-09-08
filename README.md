@@ -328,6 +328,14 @@ resolve public for the check and private for the connection. The hostname is
 still used for the `Host` header and for TLS SNI and certificate validation, so
 pinning is invisible to legitimate endpoints.
 
+Credentials stay with the origin they were given to. If an endpoint redirects
+`pay_x402` to a different origin, the caller-supplied `Authorization`, `Cookie`
+and `X-PAYMENT` headers, and every other custom header, are dropped before the
+next hop; only content-negotiation headers (`Accept`, `Accept-Language`,
+`Accept-Encoding`, `User-Agent`, `Content-Type`) are carried. A redirect that
+turns a POST into a GET also sheds the body headers. Same-origin redirects keep
+everything, as a browser would.
+
 Report security issues privately to security@hifriendbot.com.
 
 ## License

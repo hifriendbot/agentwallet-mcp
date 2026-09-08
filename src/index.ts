@@ -546,7 +546,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.10.4',
+    version: '1.10.7',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. Private keys are encrypted server-side and never exposed — agents sign and broadcast transactions without ever touching raw keys.
@@ -1191,7 +1191,11 @@ server.tool(
     url: z.string().url().describe('The URL to access (will handle 402 payment if required)'),
     wallet_id: z.number().int().describe('Wallet ID to pay from'),
     method: z.string().default('GET').describe('HTTP method (GET, POST, PUT, DELETE)'),
-    headers: z.string().optional().describe('Optional JSON string of additional request headers'),
+    headers: z.string().optional().describe(
+      'Optional JSON string of additional request headers. Credentials placed here ' +
+        '(Authorization, Cookie, API keys) are sent only to the origin in `url`; if the ' +
+        'endpoint redirects to a different origin they are dropped, not forwarded.',
+    ),
     body: z.string().optional().describe('Optional request body for POST/PUT requests'),
     max_payment: z.string().optional().describe(
       'Maximum payment in human-readable format (e.g. "1.00" for 1 USDC). ' +

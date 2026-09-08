@@ -150,18 +150,46 @@ function assertWithinSolCap(lamports: bigint) {
  * AGENTWALLET_MAX_TX_TOKEN on the EVM side and uses the same variable so an
  * operator sets one token cap, not one per chain family.
  *
- * Decimals for the cap come from the trusted table when the mint is known.
- * The caller-supplied value is not used for the ceiling: an inflated one would
- * inflate the cap exactly like the x402 bypass. When the mint is unknown we
- * assume 6, the tightest common value, so it fails closed.
+ * Decimals for the cap come from the trusted table when the mint is known, then
+ * from the mint account itself, and finally 0. The caller-supplied value is
+ * never used for the ceiling: an inflated one would inflate the cap exactly
+ * like the x402 bypass.
+ *
+ * 0 is the only safe fallback. Assuming 6 for an unknown mint is what AW-001
+ * exploited: for a mint with d decimals, a ceiling evaluated at 6 is 10**(6-d)
+ * times too permissive, and SPL mints with 0 to 5 decimals are common.
  */
-function assertWithinSplCap(mint: string, rawAmount: bigint) {
+const splDecimalsCache = new Map<string, number>();
+
+async function resolveMintDecimals(mint: string, chainId: number): Promise<number> {
+  const known = lookupTrustedDecimals(900, mint);
+  if (typeof known === 'number') return known;
+
+  const cached = splDecimalsCache.get(mint);
+  if (typeof cached === 'number') return cached;
+
+  try {
+    const conn = connection(chainId);
+    const info = await conn.getParsedAccountInfo(new PublicKey(mint));
+    const data: any = info?.value?.data;
+    const d = Number(data?.parsed?.info?.decimals);
+    if (Number.isInteger(d) && d >= 0 && d <= 36) {
+      splDecimalsCache.set(mint, d);
+      return d;
+    }
+  } catch {
+    // Unreachable RPC or non-standard mint: fall through to the safe floor.
+  }
+  return 0;
+}
+
+async function assertWithinSplCap(mint: string, rawAmount: bigint, chainId = 900) {
   const cap = (process.env.AGENTWALLET_MAX_TX_TOKEN || '').trim();
   if (!cap) return;
   if (!/^\d+(\.\d+)?$/.test(cap)) {
     throw new Error(`AGENTWALLET_MAX_TX_TOKEN must be a decimal number, got "${cap}".`);
   }
-  const decimals = lookupTrustedDecimals(900, mint) ?? 6;
+  const decimals = await resolveMintDecimals(mint, chainId);
   const [whole, frac = ''] = cap.split('.');
   const capRaw = BigInt(whole + frac.padEnd(decimals, '0').slice(0, decimals));
   if (rawAmount > capRaw) {
@@ -328,7 +356,7 @@ export async function localSplTransfer(
 ): Promise<LocalSolResult> {
   // Checked before any RPC round trip: a blocked transfer should cost nothing
   // and should not announce itself to the RPC provider first.
-  assertWithinSplCap(mintStr, BigInt(rawAmount));
+  await assertWithinSplCap(mintStr, BigInt(rawAmount), chainId);
 
   const conn = connection(chainId);
   const payer = getSolanaKeypair();

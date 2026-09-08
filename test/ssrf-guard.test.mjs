@@ -1,8 +1,11 @@
 /**
  * Regression tests for the pay_x402 SSRF guard.
  * Models the private disclosure from ARC Security Research (2026-07-31) plus
- * the additional bypass classes found while verifying it, and the anonymous
- * DNS rebinding report (2026-08-02) closed by connection pinning.
+ * the additional bypass classes found while verifying it, the anonymous
+ * DNS rebinding report (2026-08-02) closed by connection pinning, and the
+ * cross-origin redirect credential leak reported by Arthur Kijkrittaya
+ * (2026-09-08): safeFetch used to carry the caller's Authorization header to
+ * whatever origin the first endpoint redirected to.
  */
 import assert from 'node:assert';
 import { createServer } from 'node:http';
@@ -14,6 +17,8 @@ import {
   resolvePublicUrl,
   createPinnedLookup,
   safeFetch,
+  sameOrigin,
+  headersForRedirect,
 } from '../build/ssrf-guard.js';
 
 let pass = 0, fail = 0;
@@ -137,6 +142,90 @@ await ta('undici connects to the pinned address, not to the hostname', async () 
     await agent.destroy();
     await new Promise(r => server.close(r));
   }
+});
+
+console.log('\nssrf-guard: credentials do not follow a cross-origin redirect');
+const SECRETS = {
+  Authorization: 'Bearer SECRET',
+  Cookie: 'session=SECRET',
+  'Proxy-Authorization': 'Basic SECRET',
+  'X-PAYMENT': 'SECRETPROOF',
+  'X-Api-Key': 'SECRET',
+  Accept: 'application/json',
+  'Accept-Language': 'en',
+  'User-Agent': 'agentwallet-test',
+  'Content-Type': 'application/json',
+};
+const A = 'https://api.example.com/resource';
+t('origin compares scheme, host and port', () => {
+  assert.equal(sameOrigin(A, 'https://api.example.com/elsewhere?x=1'), true);
+  assert.equal(sameOrigin(A, 'https://evil.example/'), false);
+  assert.equal(sameOrigin(A, 'https://api.example.com:8443/resource'), false);
+  assert.equal(sameOrigin(A, 'https://API.EXAMPLE.COM/resource'), true);
+});
+t('cross-origin redirect strips Authorization, Cookie, X-PAYMENT and custom headers (the report)', () => {
+  const h = headersForRedirect(SECRETS, A, 'https://evil.example/collect', false);
+  for (const k of ['Authorization', 'Cookie', 'Proxy-Authorization', 'X-PAYMENT', 'X-Api-Key']) {
+    assert.equal(k in h, false, `${k} leaked across origins`);
+  }
+  assert.equal(JSON.stringify(h).includes('SECRET'), false, 'a secret value survived');
+});
+t('cross-origin redirect keeps only content negotiation headers', () => {
+  const h = headersForRedirect(SECRETS, A, 'https://evil.example/collect', false);
+  assert.deepEqual(Object.keys(h).sort(), ['Accept', 'Accept-Language', 'Content-Type', 'User-Agent']);
+});
+t('same host, different port is a different origin', () => {
+  const h = headersForRedirect(SECRETS, A, 'https://api.example.com:8443/resource', false);
+  assert.equal('Authorization' in h, false);
+});
+t('same-origin redirect keeps the credentials, as a browser would', () => {
+  const h = headersForRedirect(SECRETS, A, 'https://api.example.com/v2/resource', false);
+  assert.equal(h.Authorization, 'Bearer SECRET');
+  assert.equal(h['X-PAYMENT'], 'SECRETPROOF');
+  assert.equal(h['X-Api-Key'], 'SECRET');
+});
+t('a redirect that drops the body drops the body headers too, on either kind of hop', () => {
+  const same = headersForRedirect(SECRETS, A, 'https://api.example.com/next', true);
+  assert.equal('Content-Type' in same, false);
+  assert.equal(same.Authorization, 'Bearer SECRET');
+  const cross = headersForRedirect(SECRETS, A, 'https://evil.example/', true);
+  assert.equal('Content-Type' in cross, false);
+  assert.equal('Authorization' in cross, false);
+});
+t('header names are matched case-insensitively', () => {
+  const h = headersForRedirect({ AUTHORIZATION: 'Bearer SECRET', accept: 'text/plain' }, A, 'https://evil.example/', false);
+  assert.deepEqual(h, { accept: 'text/plain' });
+});
+t('accepts a Headers instance and an entries array as input', () => {
+  const fromHeaders = headersForRedirect(new Headers({ Authorization: 'Bearer SECRET', Accept: 'x' }), A, 'https://evil.example/', false);
+  assert.deepEqual(fromHeaders, { accept: 'x' });
+  const fromArray = headersForRedirect([['Authorization', 'Bearer SECRET'], ['Accept', 'y']], A, 'https://evil.example/', false);
+  assert.deepEqual(fromArray, { Accept: 'y' });
+});
+t('no headers at all is fine', () => {
+  assert.deepEqual(headersForRedirect(undefined, A, 'https://evil.example/', true), {});
+});
+
+// Live reproduction of the report through the real safeFetch: httpbin
+// redirects to a different origin that echoes the request headers back. Only
+// a synthetic marker is sent. Skipped, not failed, if either service is down.
+await ta('live: a cross-origin 302 does not carry the Authorization header (reporter\'s reproduction)', async () => {
+  const marker = 'SYNTHETIC_MARKER_NOT_A_SECRET';
+  const target = 'https://httpbin.org/redirect-to?url=' + encodeURIComponent('https://postman-echo.com/headers') + '&status_code=302';
+  let res;
+  try {
+    res = await safeFetch(target, {
+      headers: { Authorization: 'Bearer ' + marker, 'X-Audit-Marker': marker, Accept: 'application/json' },
+      signal: AbortSignal.timeout(20_000),
+    });
+  } catch (e) {
+    console.log(`       (skipped: ${e.message})`);
+    return;
+  }
+  if (res.status !== 200) { console.log(`       (skipped: echo service answered ${res.status})`); return; }
+  const text = await res.text();
+  assert.equal(text.includes(marker), false, 'marker reached the second origin');
+  assert.match(text, /postman-echo\.com/, 'expected the echo from the second origin');
 });
 
 console.log('\nssrf-guard: safeFetch still works against a real endpoint');

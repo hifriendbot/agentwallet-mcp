@@ -219,11 +219,49 @@ export interface LocalSendResult {
  * waiting to happen.
  *
  * Opt-in via AGENTWALLET_MAX_TX_TOKEN, expressed in human units of the token.
- * When the token's decimals are not known locally we assume 6, the smallest in
- * common use, which makes the raw ceiling the tightest one and fails closed
- * rather than open.
+ *
+ * Decimals decide the ceiling, so getting them wrong breaks the guard. They are
+ * resolved in this order: the trusted registry, then the token's own decimals()
+ * on chain (cached), and finally 0. Assuming 0 for an unresolvable token is the
+ * only value that cannot fail open: any real token has decimals >= 0, so a cap
+ * evaluated at 0 is never larger than the true one.
+ *
+ * Do not "assume 6 because it is the smallest in common use". It is not: GUSD
+ * and EURS use 2, and some tokens use 0. For a token with d decimals, a ceiling
+ * evaluated at 6 is 10**(6-d) times too permissive, which is how AW-001 let a
+ * 2-decimal token move 10,000x the configured cap.
  */
-function assertWithinTokenCap(chainId: number, token: Address, data: Hex) {
+const decimalsCache = new Map<string, number>();
+
+async function resolveTokenDecimals(chainId: number, token: Address): Promise<number> {
+  const known = lookupTrustedDecimals(chainId, token);
+  if (typeof known === 'number') return known;
+
+  const key = `${chainId}:${token.toLowerCase()}`;
+  const cached = decimalsCache.get(key);
+  if (typeof cached === 'number') return cached;
+
+  try {
+    const { pub } = clients(chainId);
+    const onChain = await pub.readContract({
+      address: token,
+      abi: ERC20_ABI,
+      functionName: 'decimals',
+    }) as number | bigint;
+    const d = Number(onChain);
+    // Reject nonsense rather than trusting it; an out-of-range value would
+    // widen the ceiling exactly like the old assumption did.
+    if (Number.isInteger(d) && d >= 0 && d <= 36) {
+      decimalsCache.set(key, d);
+      return d;
+    }
+  } catch {
+    // Unreachable RPC, non-standard token, anything at all: fall through to 0.
+  }
+  return 0;
+}
+
+async function assertWithinTokenCap(chainId: number, token: Address, data: Hex) {
   const cap = (process.env.AGENTWALLET_MAX_TX_TOKEN || '').trim();
   if (!cap) return;
   if (!/^\d+(\.\d+)?$/.test(cap)) {
@@ -241,7 +279,7 @@ function assertWithinTokenCap(chainId: number, token: Address, data: Hex) {
   if (word.length !== 64) return; // malformed; leave it to the node to reject
   const amount = BigInt('0x' + word);
 
-  const decimals = lookupTrustedDecimals(chainId, token) ?? 6;
+  const decimals = await resolveTokenDecimals(chainId, token);
   const [whole, frac = ''] = cap.split('.');
   const capRaw = BigInt(whole + frac.padEnd(decimals, '0').slice(0, decimals));
 
@@ -262,7 +300,7 @@ export async function localSend(
   data?: Hex
 ): Promise<LocalSendResult> {
   assertWithinNativeCap(valueWei);
-  if (data && data.length >= 10) assertWithinTokenCap(chainId, to, data);
+  if (data && data.length >= 10) await assertWithinTokenCap(chainId, to, data);
   const { wallet } = clients(chainId);
   const hash = await wallet.sendTransaction({
     to,
