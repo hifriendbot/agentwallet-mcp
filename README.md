@@ -76,7 +76,7 @@ Local signing uses [viem](https://viem.sh) for EVM and `@solana/web3.js` for Sol
 - **31 MCP tools**: create wallets, send transactions, approve tokens, wrap ETH, transfer SPL tokens, pay and accept x402 payments, verify custody mode, and more
 - **EVM + Solana**: Ethereum, Base, Polygon, BSC, Arbitrum, Optimism, Avalanche, Zora, PulseChain, Solana, and any other EVM-compatible chain
 - **SOL + SPL tokens**: native SOL transfers and SPL token transfers (USDC, USDT, etc.) with automatic account creation
-- **Built-in guards**: daily spending limits, gas price protection, emergency pause, rate limiting, replay protection, and on-chain verification, all active by default
+- **Built-in guards**: in hosted mode, daily spending limits, gas price protection, emergency pause and rate limiting are enforced server-side by default. In local mode your protection is the per-transaction caps you set (`AGENTWALLET_MAX_TX_NATIVE`, `AGENTWALLET_MAX_TX_TOKEN`, `AGENTWALLET_MAX_TX_SOL`, `AGENTWALLET_MAX_AUTOPAY`). x402 replay protection and on-chain verification apply either way
 - **x402 payments**: pay for x402-enabled APIs automatically, or accept x402 payments on your own endpoints (EVM and Solana)
 - **Self-custody option**: run local mode and the key never leaves your machine. In hosted mode, keys are encrypted at rest, decrypted only during signing, and zeroed from memory immediately after. Either way you can export and walk away.
 - **Permissionless**: No KYC. No KYT. No identity verification. No approval process. No compliance gatekeeping. Sign up, get an API key, and start transacting immediately.
@@ -274,7 +274,7 @@ On-chain verification ensures every payment is real. Replay protection prevents 
 | KYC Required | Yes | **No** |
 | KYT / Transaction Monitoring | Yes | **No** |
 | Can Block Your Wallet | Yes | **No** |
-| Built-in Guards | Yes (requires setup) | **Yes (active by default)** |
+| Built-in Guards | Yes (requires setup) | **Yes (hosted: active by default; local: env caps you set)** |
 | Free Operations / Month | 5,000 | **6,000** |
 | Cost Per Operation | $0.005 | **$0.00345** |
 | x402 Verification Cost | $0.001 | **$0.0005** |
@@ -295,17 +295,30 @@ You can also pre-purchase x402 verification credits with USDC using the `buy_ver
 
 ## Built-in Guards
 
-All guards are active by default, no configuration required.
+Which guards apply depends on who holds the key.
+
+**Hosted mode** (the server holds the key): every guard below is active by default, no configuration required.
 
 - **Encrypted at rest**: private keys encrypted before storage and never leave the server
 - **Memory zeroing**: keys wiped from memory immediately after every signing operation
-- **Daily spending limits**: set a per-wallet daily cap in USD, enforced automatically on every transaction
+- **Daily spending limits**: set a per-wallet daily cap in USD, enforced by the server on every transaction
 - **Gas price protection**: transactions blocked when gas prices spike above safe thresholds
 - **Emergency pause**: instantly freeze any wallet or all wallets with one click
 - **Rate limiting**: API requests capped per minute to prevent abuse and brute force attacks
+
+**Local mode** (you hold the key): there is no server in the signing path, so the server-side limits and pause above cannot see or stop a locally signed transaction, and nobody (including us) can freeze a local wallet. Your protection is the per-transaction caps enforced inside your own process before anything is signed. Set them before you fund the wallet; an unset cap means no limit.
+
+- `AGENTWALLET_MAX_TX_NATIVE`: ceiling per transaction in native units (ETH, MATIC, and so on)
+- `AGENTWALLET_MAX_TX_TOKEN`: ceiling per ERC-20 transfer, in human units of the token
+- `AGENTWALLET_MAX_TX_SOL`: ceiling per SOL or SPL transfer
+- `AGENTWALLET_MAX_AUTOPAY`: ceiling per x402 auto-payment (default `1`)
+
+**Either mode**, for x402 paywalls you run through the hosted API:
+
 - **Replay protection**: every x402 payment verified on-chain with unique transaction tracking
 - **On-chain verification**: x402 payments verified directly on the blockchain with finalized commitment
-- Bug bounty program: $50,$500 for responsible disclosure ([details](https://hifriendbot.com/wallet))
+
+Bug bounty program: $50 to $500 for responsible disclosure ([details](https://hifriendbot.com/wallet)).
 
 ## Links
 
