@@ -1,7 +1,7 @@
 {
   "name": "agentwallet-mcp",
   "mcpName": "io.github.hifriendbot/agentwallet",
-  "version": "1.10.7",
+  "version": "1.10.8",
   "description": "MCP server for AgentWallet: self-custody local signing on EVM and Solana, or hosted wallets. Sign, broadcast, pay x402 invoices, and accept x402 payments.",
   "type": "module",
   "main": "build/index.js",
