@@ -172,6 +172,21 @@ export function deriveX402Payment(
  * @param trustedDecimals   token decimals from a trusted source, NOT the 402 body
  * @param capHuman          cap in human-readable units of the asset (e.g. "1")
  */
+/**
+ * Chain IDs this server treats as Solana (mainnet, devnet, testnet).
+ */
+export const SOLANA_CHAIN_IDS: ReadonlySet<number> = new Set([900, 901, 902]);
+
+/**
+ * Decimals of a chain's NATIVE asset. EVM natives are 18 (wei); native SOL is
+ * 9 (lamports). The x402 cap and the human-readable amount must use this when
+ * a requirement names no token, otherwise a native-SOL requirement is measured
+ * against a cap inflated by 10**9 (AW-002, reported 2026-09-22).
+ */
+export function nativeDecimals(chainId: number): number {
+  return SOLANA_CHAIN_IDS.has(chainId) ? 9 : 18;
+}
+
 export function isWithinCap(
   rawAmountRequired: string,
   trustedDecimals: number,

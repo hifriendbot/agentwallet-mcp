@@ -12,6 +12,7 @@ import {
   isWithinCap,
   lookupTrustedDecimals,
   assertDeclaredDecimals,
+  nativeDecimals,
 } from '../build/x402-payment.js';
 
 let passed = 0;
@@ -148,6 +149,38 @@ ok('trusted registry returns real decimals for known assets', () => {
 
 ok('SPL mints resolve from the trusted table', () => {
   assert.strictEqual(lookupTrustedDecimals(101, 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'), 6);
+});
+
+// AW-002 (reported 2026-09-22): a native-SOL requirement with no asset field
+// was measured against a cap converted at 18 decimals, so 1,000 SOL passed a
+// 1 SOL cap. Native decimals must follow the chain family.
+ok('native decimals follow the chain family', () => {
+  assert.strictEqual(nativeDecimals(900), 9);   // Solana mainnet
+  assert.strictEqual(nativeDecimals(901), 9);   // devnet
+  assert.strictEqual(nativeDecimals(902), 9);   // testnet
+  assert.strictEqual(nativeDecimals(8453), 18); // Base
+  assert.strictEqual(nativeDecimals(1), 18);    // Ethereum
+});
+
+ok('1,000 SOL in lamports is rejected by a 1 SOL cap', () => {
+  const thousandSol = '1000000000000'; // 1e12 lamports
+  assert.strictEqual(isWithinCap(thousandSol, nativeDecimals(900), '1'), false);
+  assert.strictEqual(isWithinCap(thousandSol, 18, '1'), true); // the old, wrong measurement
+});
+
+ok('native SOL auto-pay derives with 9 decimals and refuses over the cap', () => {
+  const accept = { maxAmountRequired: '500000000', requiredDecimals: 9, network: 'solana' }; // 0.5 SOL
+  const r = deriveX402Payment(accept, '1', nativeDecimals(900));
+  assert.strictEqual(r.rawAmount, '500000000');
+  assert.strictEqual(r.decimals, 9);
+  assert.strictEqual(r.tokenAddress, '');
+  const big = { maxAmountRequired: '1000000000000', requiredDecimals: 9, network: 'solana' }; // 1,000 SOL
+  assert.throws(() => deriveX402Payment(big, '1', nativeDecimals(900)), /exceeds|cap/i);
+});
+
+ok('a native SOL requirement declaring 9 decimals is accepted, 18 is refused', () => {
+  assert.doesNotThrow(() => assertDeclaredDecimals(9, nativeDecimals(900)));
+  assert.throws(() => assertDeclaredDecimals(18, nativeDecimals(900)), /declared 18 decimals/);
 });
 
 console.log(`\nx402-payment: ${passed} passed`);

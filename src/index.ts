@@ -19,6 +19,8 @@ import {
   isWithinCap,
   lookupTrustedDecimals,
   assertDeclaredDecimals,
+  nativeDecimals,
+  SOLANA_CHAIN_IDS,
 } from './x402-payment.js';
 import {
   isLocalMode,
@@ -350,7 +352,7 @@ async function handleX402Payment(
   const assetForDecimals = accept.asset || accept.extra?.token || '';
   const trustedDecimals = assetForDecimals
     ? await resolveTrustedDecimals(chainId, assetForDecimals)
-    : 18; // native asset: value is already in wei-equivalent base units
+    : nativeDecimals(chainId); // native asset: 18 on EVM (wei), 9 on Solana (lamports)
   const { tokenAddress, rawAmount, decimals } = deriveX402Payment(accept, maxAutopay, trustedDecimals);
 
   // Send payment using our wallet (with X-AGW-SKIP-X402 to prevent recursion)
@@ -418,8 +420,6 @@ function jsonResponse(data: unknown) {
 }
 
 // ─── Solana Helpers ───────────────────────────────────────────────
-
-const SOLANA_CHAIN_IDS = new Set([900, 901, 902]);
 
 function isSolanaChain(chainId: number): boolean {
   return SOLANA_CHAIN_IDS.has(chainId);
@@ -546,7 +546,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.10.8',
+    version: '1.10.9',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. Private keys are encrypted server-side and never exposed — agents sign and broadcast transactions without ever touching raw keys.
@@ -1296,7 +1296,7 @@ server.tool(
     const assetForDecimals = option.asset || option.extra?.token || '';
     const trustedDecimals = assetForDecimals
       ? await resolveTrustedDecimals(chainId, assetForDecimals)
-      : 18;
+      : nativeDecimals(chainId); // 18 on EVM (wei), 9 on Solana (lamports)
     assertDeclaredDecimals(option.requiredDecimals, trustedDecimals);
 
     // Human-readable amount, computed with trusted decimals so what the agent
