@@ -596,7 +596,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.12.1',
+    version: '1.12.2',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. Private keys are encrypted server-side and never exposed — agents sign and broadcast transactions without ever touching raw keys.
@@ -1571,7 +1571,10 @@ server.tool(
     return jsonResponse({
       status: retryRes.status,
       payment_required: true,
-      payment_made: retryRes.status !== 402,
+      // Paid means the endpoint accepted the payment: a settlement receipt, or a success status after the payment header.
+      // A 4xx other than 402 (bad body, auth) means the request failed for another reason; the authorization was
+      // sent but the facilitator normally does not settle a failed request, so it is not reported as paid.
+      payment_made: Boolean(settlement?.success) || (retryRes.status >= 200 && retryRes.status < 300),
       retry_error: retryError,
       payment_method: isUpto ? 'permit2-upto-authorization' : (standardExact ? 'eip3009-authorization' : 'onchain-transfer'),
       approval_id: approvalUsed,
