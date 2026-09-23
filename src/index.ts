@@ -596,7 +596,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.12.0',
+    version: '1.12.1',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. Private keys are encrypted server-side and never exposed — agents sign and broadcast transactions without ever touching raw keys.
@@ -1448,8 +1448,8 @@ server.tool(
       };
       const wantApproval = request_approval ?? (process.env.AGENTWALLET_APPROVALS !== '0');
       if (approval_id) {
-        const a = (await api(`/approvals/${encodeURIComponent(approval_id)}`, 'GET', undefined, skip)) as { status?: string; value?: string; pay_to?: string; chain_id?: number; error?: string };
-        if (a?.status !== 'approved') {
+        const a = (await api(`/approvals/${encodeURIComponent(approval_id)}`, 'GET', undefined, skip)) as { status?: string; used?: number; value?: string; pay_to?: string; chain_id?: number; error?: string };
+        if (a?.status !== 'approved' || Number((a as { used?: number }).used) === 1) {
           return jsonResponse({ ...overCap, approval_id, approval_status: a?.status ?? null, error: `Approval ${approval_id} is ${a?.status ?? 'unknown'}, not approved.${a?.error ? ' ' + a.error : ''}` });
         }
         if (String(a.pay_to || '').toLowerCase() !== option.payTo.toLowerCase() || Number(a.chain_id) !== chainId || BigInt(String(a.value || '0')) < BigInt(rawAmount)) {
