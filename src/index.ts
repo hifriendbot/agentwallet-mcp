@@ -33,6 +33,12 @@ import {
   localSignMessage,
   resolveRpcUrl,
 } from './local-wallet.js';
+import { localSignAuthorization, localEthCall } from './local-wallet.js';
+import {
+  isLegacyAgentWalletAccept, requiredAmount, buildAuthorization, buildPaymentPayload, paymentHeaderFor,
+  parsePaymentRequired, parseSettlement, pickOption, knownTokenDomain,
+  type X402Requirement, type Eip3009Authorization,
+} from './x402-eip3009.js';
 import {
   isSolanaLocalMode,
   getSolanaAddress,
@@ -153,6 +159,31 @@ async function routeLocally(
     }
     const hasData = data && data !== '0x';
     return localSend(chainId, to as `0x${string}`, value, hasData ? (data as `0x${string}`) : undefined);
+  }
+
+  // POST /wallets/{id}/x402/authorize  (x402 "exact": EIP-3009 authorization, signed here, broadcast by nobody)
+  if (method === 'POST' && /^\/wallets\/[^/]*\/x402\/authorize$/.test(rawPath)) {
+    if (!isLocalMode()) refuseMissingLocalKey('evm');
+    const chainId = localChainId(body, qs);
+    return localSignAuthorization(
+      chainId,
+      String(body?.asset || '') as `0x${string}`,
+      { name: String(body?.name || ''), version: String(body?.version || '') },
+      {
+        from: getLocalAddress(),
+        to: String(body?.to || '') as `0x${string}`,
+        value: String(body?.value ?? '0'),
+        validAfter: String(body?.valid_after ?? '0'),
+        validBefore: String(body?.valid_before ?? '0'),
+        nonce: String(body?.nonce || '') as `0x${string}`,
+      },
+    );
+  }
+
+  // POST /eth-call  (read-only; answered from the local RPC so pure self-custody needs no hosted credentials)
+  if (method === 'POST' && rawPath === '/eth-call') {
+    if (!isLocalMode()) return NOT_HANDLED;
+    return localEthCall(localChainId(body, qs), String(body?.to || '') as `0x${string}`, String(body?.data || '0x') as `0x${string}`);
   }
 
   // GET /wallets/{id}/balance
@@ -546,7 +577,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.10.9',
+    version: '1.11.0',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. Private keys are encrypted server-side and never exposed — agents sign and broadcast transactions without ever touching raw keys.
@@ -1179,14 +1210,71 @@ server.tool(
   },
 );
 
+// ─── x402 "exact" helpers ────────────────────────────────────────
+
+/** The paying address: the local key in self-custody mode, else the hosted wallet record. */
+async function payerAddress(walletId: number): Promise<string> {
+  const w = (await api(`/wallets/${walletId}`, 'GET', undefined, { 'X-AGW-SKIP-X402': 'true' })) as { address?: string; wallet_address?: string };
+  const a = String(w?.address || w?.wallet_address || '');
+  if (!/^0x[0-9a-fA-F]{40}$/.test(a)) throw new Error(`x402: could not resolve the EVM address of wallet ${walletId} (got "${a}").`);
+  return a;
+}
+
+async function ethCallHex(chainId: number, to: string, data: string): Promise<string> {
+  const r = (await api('/eth-call', 'POST', { chain_id: chainId, to, data }, { 'X-AGW-SKIP-X402': 'true' })) as { result?: string };
+  return String(r?.result || '');
+}
+
+/**
+ * The token's EIP-712 domain. Order: what the 402 declared (extra.name/version,
+ * which is what the reference client requires), then a short list of USDC
+ * deployments we know, then the contract's own name()/version(). A wrong
+ * domain produces a signature that recovers to a stranger, so we refuse
+ * rather than guess.
+ */
+async function resolveTokenDomain(chainId: number, asset: string, extra?: X402Requirement['extra']): Promise<{ name: string; version: string }> {
+  if (extra?.name && extra?.version) return { name: String(extra.name), version: String(extra.version) };
+  const known = knownTokenDomain(chainId, asset);
+  if (known) return known;
+  let name = '', version = '';
+  try {
+    name = decodeAbiString(await ethCallHex(chainId, asset, '0x06fdde03'));    // name()
+    version = decodeAbiString(await ethCallHex(chainId, asset, '0x54fd4d50')); // version()
+  } catch { /* refused below */ }
+  if (!name || !version) {
+    throw new Error(
+      `x402: cannot determine the EIP-712 domain for token ${asset} on chain ${chainId}: the endpoint sent no ` +
+      `extra.name/extra.version and the contract did not answer name()/version(). Refused rather than signed with a guessed domain.`,
+    );
+  }
+  return { name, version };
+}
+
+/** Sign the authorization with whichever custody mode is active (local key, or the hosted signer). */
+async function signAuthorization(
+  walletId: number, chainId: number, asset: string, domain: { name: string; version: string }, auth: Eip3009Authorization,
+): Promise<string> {
+  const r = (await api(`/wallets/${walletId}/x402/authorize`, 'POST', {
+    chain_id: chainId, asset, name: domain.name, version: domain.version,
+    to: auth.to, value: auth.value, valid_after: auth.validAfter, valid_before: auth.validBefore, nonce: auth.nonce,
+  }, { 'X-AGW-SKIP-X402': 'true' })) as { signature?: string; error?: string };
+  const sig = String(r?.signature || '');
+  if (!/^0x[0-9a-fA-F]{130}$/.test(sig)) {
+    throw new Error(`x402: the wallet did not return a valid authorization signature${r?.error ? ` (${r.error})` : ''}.`);
+  }
+  return sig;
+}
+
 // ─── Tool: pay_x402 ─────────────────────────────────────────────
 
 server.tool(
   'pay_x402',
   'Handle an x402 payment flow. Fetches a URL, and if the server returns HTTP 402 Payment Required, ' +
-    'parses the payment requirements, executes the on-chain payment, and retries the request with ' +
-    'proof of payment. Returns the final response. Supports the x402 open payment standard ' +
-    '(https://x402.org). Set max_payment to prevent overspending.',
+    'parses the payment requirements (v1 body or v2 PAYMENT-REQUIRED header), signs an EIP-3009 ' +
+    'TransferWithAuthorization for the "exact" scheme (no gas, nothing broadcast by the payer), and retries ' +
+    'the request with the payment header. AgentWallet paywalls are paid by on-chain transfer instead. ' +
+    'The "upto" scheme is refused, never approximated. Returns the final response and the settlement ' +
+    'receipt. Supports the x402 open payment standard (https://x402.org). Set max_payment to cap spend.',
   {
     url: z.string().url().describe('The URL to access (will handle 402 payment if required)'),
     wallet_id: z.number().int().describe('Wallet ID to pay from'),
@@ -1252,77 +1340,66 @@ server.tool(
       });
     }
 
-    // Step 2: Parse x402 payment requirements from 402 response
-    let paymentInfo: { x402Version?: number; accepts?: Array<Record<string, unknown>> };
-    try {
-      paymentInfo = await initialRes.json() as typeof paymentInfo;
-    } catch {
-      throw new Error('402 response body is not valid JSON. This server may not support x402.');
-    }
-
-    if (!paymentInfo.accepts || paymentInfo.accepts.length === 0) {
-      throw new Error('402 response has no payment options in "accepts" array.');
-    }
-
-    // Step 3: Pick the best payment option
-    type PaymentOption = {
-      scheme: string; network: string; maxAmountRequired: string;
-      payTo: string; requiredDecimals: number; description?: string;
-      asset?: string; // standard x402 token-address field (preferred over extra.token)
-      extra?: { name?: string; token?: string };
-    };
-    const options = paymentInfo.accepts as PaymentOption[];
-
-    let option: PaymentOption;
-    if (prefer_chain) {
-      option = options.find(a => resolveChainId(a.network) === prefer_chain) || options[0];
-    } else {
-      option = options[0];
-    }
-
-    // Resolve the chain
-    const chainId = resolveChainId(option.network);
-    if (!chainId) {
+    // Step 2: Requirements come from the PAYMENT-REQUIRED header (v2) or the JSON body (v1).
+    const initialText = await initialRes.text();
+    let initialBody: unknown = null;
+    try { initialBody = JSON.parse(initialText); } catch { initialBody = null; }
+    const paymentInfo = parsePaymentRequired(n => initialRes.headers.get(n), initialBody);
+    if (!paymentInfo || !Array.isArray(paymentInfo.accepts) || paymentInfo.accepts.length === 0) {
       throw new Error(
-        `Unsupported x402 network: "${option.network}". ` +
-          `Supported: ${Object.keys(X402_NETWORKS).join(', ')}, or any CAIP-2 / numeric chain ID.`,
+        '402 response carried no x402 payment requirements (no PAYMENT-REQUIRED header and no "accepts" array in the body). ' +
+        'This server may not support x402.',
       );
     }
+    const x402Version = Number(paymentInfo.x402Version) || 1;
+    const accepts = paymentInfo.accepts as X402Requirement[];
 
-    // Decimals come from the registry or the token contract, NEVER from the 402
-    // body. The endpoint controls requiredDecimals, so trusting it lets a
-    // hostile server inflate the cap AND misreport the amount shown to the
-    // agent. The declared value is only used to detect a mismatch and refuse.
-    const assetForDecimals = option.asset || option.extra?.token || '';
-    const trustedDecimals = assetForDecimals
-      ? await resolveTrustedDecimals(chainId, assetForDecimals)
-      : nativeDecimals(chainId); // 18 on EVM (wei), 9 on Solana (lamports)
-    assertDeclaredDecimals(option.requiredDecimals, trustedDecimals);
-
-    // Human-readable amount, computed with trusted decimals so what the agent
-    // is told matches what will actually leave the wallet.
-    const amount = formatUnits(option.maxAmountRequired, trustedDecimals);
-
-    // Step 4: Enforce a hard per-payment cap. ALWAYS applied — if the caller
-    // omits max_payment we fall back to AGENTWALLET_MAX_AUTOPAY (default "1"),
-    // mirroring the internal auto-pay path (deriveX402Payment). Without this, an
-    // untrusted or compromised x402 endpoint could return an arbitrarily large
-    // maxAmountRequired and drain the wallet. The cap is never silently skipped.
-    const capSource = max_payment ? 'max_payment' : 'AGENTWALLET_MAX_AUTOPAY';
-    const effectiveMax = max_payment || process.env.AGENTWALLET_MAX_AUTOPAY || '1';
-    if (!isWithinCap(option.maxAmountRequired, trustedDecimals, effectiveMax)) {
+    // Step 3: Pick an option this client can sign. "exact" only; "upto" is refused, never approximated (issue #6).
+    const picked = pickOption(accepts, resolveChainId, prefer_chain);
+    if (!picked.option || !picked.chainId) {
       return jsonResponse({
         status: 402,
         payment_required: true,
         payment_made: false,
-        error: `Payment of ${amount} ${option.extra?.name || 'tokens'} exceeds the ` +
-          `${effectiveMax} cap (from ${capSource}).` +
+        error: picked.reason,
+        offered: accepts.map(a => ({ scheme: a.scheme, network: a.network, amount: requiredAmount(a), asset: a.asset ?? a.extra?.token ?? null })),
+      });
+    }
+    const option = picked.option;
+    const chainId = picked.chainId;
+    const rawAmount = requiredAmount(option);
+    if (!/^\d+$/.test(rawAmount)) {
+      throw new Error(`x402: invalid amount "${rawAmount}" in the payment requirements (expected integer base units).`);
+    }
+
+    // Decimals come from the registry or the token contract, NEVER from the 402
+    // body. The endpoint controls what it declares, so trusting it would let a
+    // hostile server inflate the cap and misreport the amount shown to the agent.
+    const tokenAddress = option.asset || option.extra?.token || '';
+    const trustedDecimals = tokenAddress
+      ? await resolveTrustedDecimals(chainId, tokenAddress)
+      : nativeDecimals(chainId); // 18 on EVM (wei), 9 on Solana (lamports)
+    if (typeof option.requiredDecimals === 'number') assertDeclaredDecimals(option.requiredDecimals, trustedDecimals);
+    const amount = formatUnits(rawAmount, trustedDecimals);
+    const tokenLabel = option.extra?.name || (tokenAddress ? 'tokens' : 'native');
+
+    // Step 4: Hard per-payment cap, ALWAYS applied. If the caller omits max_payment
+    // we fall back to AGENTWALLET_MAX_AUTOPAY (default "1"), so an untrusted 402
+    // endpoint can never authorize an unbounded payment. Never silently skipped.
+    const capSource = max_payment ? 'max_payment' : 'AGENTWALLET_MAX_AUTOPAY';
+    const effectiveMax = max_payment || process.env.AGENTWALLET_MAX_AUTOPAY || '1';
+    if (!isWithinCap(rawAmount, trustedDecimals, effectiveMax)) {
+      return jsonResponse({
+        status: 402,
+        payment_required: true,
+        payment_made: false,
+        error: `Payment of ${amount} ${tokenLabel} exceeds the ${effectiveMax} cap (from ${capSource}).` +
           (max_payment ? '' : ' No max_payment was provided, so the default cap was applied. ' +
             'Pass max_payment (or raise AGENTWALLET_MAX_AUTOPAY) to allow a larger payment.'),
         required_amount: amount,
         max_allowed: effectiveMax,
         cap_source: capSource,
-        token: option.extra?.name || 'native',
+        token: tokenLabel,
         network: option.network,
         chain_id: chainId,
         pay_to: option.payTo,
@@ -1330,64 +1407,45 @@ server.tool(
       });
     }
 
-    // Standard x402 puts the token address in `asset`; AgentWallet's own server
-    // currently emits it under extra.token. Prefer the standard field, fall back.
-    const tokenAddress = option.asset || option.extra?.token || '';
+    // Step 5: Pay. Standard x402 "exact" on EVM is an EIP-3009 authorization the
+    // facilitator settles; the payer broadcasts nothing and pays no gas. AgentWallet's
+    // own paywalls (verified by receipt), native-asset requests and Solana still use
+    // a broadcast transfer proved by hash.
+    const standardExact = !isSolanaChain(chainId) && Boolean(tokenAddress) && !isLegacyAgentWalletAccept(option);
+    let headerName = 'X-PAYMENT';
+    let paymentHeader = '';
+    let txHash: string | null = null;
+    let authorization: Eip3009Authorization | null = null;
+    let payer: string | null = null;
 
-    // Step 5: Execute payment
-    let txResult: Record<string, unknown>;
-
-    if (isSolanaChain(chainId)) {
-      // Solana payment
-      if (tokenAddress) {
-        // SPL token payment (e.g. USDC on Solana)
-        txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', {
-          to: option.payTo,
-          value: option.maxAmountRequired,
-          token_mint: tokenAddress,
-          token_decimals: trustedDecimals,
-          chain_id: chainId,
-        })) as Record<string, unknown>;
-      } else {
-        // Native SOL payment
-        txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', {
-          to: option.payTo,
-          value: option.maxAmountRequired,
-          chain_id: chainId,
-        })) as Record<string, unknown>;
-      }
-    } else if (tokenAddress) {
-      // EVM ERC-20 token payment (e.g. USDC)
-      const calldata = '0xa9059cbb' + padAddress(option.payTo) + encodeUint256(option.maxAmountRequired);
-      txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', {
-        to: tokenAddress,
-        value: '0',
-        data: calldata,
-        chain_id: chainId,
-      })) as Record<string, unknown>;
+    if (standardExact) {
+      payer = await payerAddress(wallet_id);
+      const domain = await resolveTokenDomain(chainId, tokenAddress, option.extra);
+      authorization = buildAuthorization(payer, option);
+      const signature = await signAuthorization(wallet_id, chainId, tokenAddress, domain, authorization);
+      const payload = buildPaymentPayload(x402Version, option, authorization, signature, paymentInfo.resource, paymentInfo.extensions);
+      const h = paymentHeaderFor(x402Version, payload);
+      headerName = h.name;
+      paymentHeader = h.value;
     } else {
-      // EVM native token payment (ETH, etc.)
-      txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', {
-        to: option.payTo,
-        value: option.maxAmountRequired,
-        data: '',
-        chain_id: chainId,
-      })) as Record<string, unknown>;
+      let txResult: Record<string, unknown>;
+      if (isSolanaChain(chainId)) {
+        txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', tokenAddress
+          ? { to: option.payTo, value: rawAmount, token_mint: tokenAddress, token_decimals: trustedDecimals, chain_id: chainId }
+          : { to: option.payTo, value: rawAmount, chain_id: chainId })) as Record<string, unknown>;
+      } else if (tokenAddress) {
+        const calldata = '0xa9059cbb' + padAddress(option.payTo) + encodeUint256(rawAmount);
+        txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: tokenAddress, value: '0', data: calldata, chain_id: chainId })) as Record<string, unknown>;
+      } else {
+        txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: option.payTo, value: rawAmount, data: '', chain_id: chainId })) as Record<string, unknown>;
+      }
+      txHash = String(txResult.tx_hash || txResult.signature || '');
+      if (!txHash) throw new Error('x402: the payment transaction returned no hash.');
+      paymentHeader = Buffer.from(JSON.stringify({ x402Version, scheme: option.scheme, network: option.network, payload: { txHash } })).toString('base64');
     }
 
-    // Solana returns 'signature', EVM returns 'tx_hash'
-    const txHash = (txResult.tx_hash || txResult.signature) as string;
-
-    // Step 6: Build x402 payment proof and retry
-    const paymentProof = {
-      x402Version: paymentInfo.x402Version || 1,
-      scheme: option.scheme,
-      network: option.network,
-      payload: { txHash },
-    };
-    const paymentHeader = Buffer.from(JSON.stringify(paymentProof)).toString('base64');
-
-    const retryHeaders = { ...reqHeaders, 'X-PAYMENT': paymentHeader };
+    // Step 6: Retry with the payment header and read the settlement receipt.
+    const retryHeaders = { ...reqHeaders, [headerName]: paymentHeader };
     const retryOptions: RequestInit = {
       method,
       headers: retryHeaders,
@@ -1401,18 +1459,32 @@ server.tool(
     const retryText = await retryRes.text();
     let retryParsed: unknown;
     try { retryParsed = JSON.parse(retryText); } catch { retryParsed = retryText; }
+    const settlement = parseSettlement(n => retryRes.headers.get(n));
+    // A second 402 means the facilitator declined (unfunded payer, expired window, bad domain...). v2 servers
+    // put the reason in a fresh PAYMENT-REQUIRED header, v1 servers in the body; surface it instead of {}.
+    let retryError: string | null = null;
+    if (retryRes.status === 402) {
+      const again = parsePaymentRequired(n => retryRes.headers.get(n), retryParsed);
+      retryError = String(again?.error || (retryParsed as { error?: string } | null)?.error || 'Payment was not accepted (no reason given).');
+    }
 
     return jsonResponse({
       status: retryRes.status,
       payment_required: true,
-      payment_made: true,
+      payment_made: retryRes.status !== 402,
+      retry_error: retryError,
+      payment_method: standardExact ? 'eip3009-authorization' : 'onchain-transfer',
+      x402_version: x402Version,
       amount,
-      token: option.extra?.name || 'native',
-      token_address: option.asset || option.extra?.token || null,
+      token: tokenLabel,
+      token_address: tokenAddress || null,
       network: option.network,
       chain_id: chainId,
       pay_to: option.payTo,
-      tx_hash: txHash,
+      payer,
+      tx_hash: txHash ?? settlement?.transaction ?? null,
+      settlement,
+      authorization: authorization ? { nonce: authorization.nonce, valid_before: authorization.validBefore } : null,
       description: option.description,
       response: retryParsed,
     });

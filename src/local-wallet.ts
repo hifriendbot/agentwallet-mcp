@@ -28,6 +28,7 @@ import {
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { lookupTrustedDecimals } from './x402-payment.js';
+import { typedDataFor, type Eip3009Authorization } from './x402-eip3009.js';
 
 /* ── Key loading ─────────────────────────────────────────────────── */
 
@@ -370,4 +371,37 @@ export function localWalletRecord() {
     custody: 'self',
     note: 'Signed in-process. The private key is never sent to AgentWallet servers.',
   };
+}
+
+/* ── x402 "exact": EIP-3009 authorization signed in-process ──────── */
+
+/**
+ * Sign a TransferWithAuthorization for an x402 payment. Nothing is broadcast;
+ * the resource server's facilitator settles it on-chain. The amount is put
+ * through the same AGENTWALLET_MAX_TX_TOKEN guard as a transfer, because that
+ * is exactly what the authorization lets someone else execute.
+ */
+export async function localSignAuthorization(
+  chainId: number,
+  asset: Address,
+  domain: { name: string; version: string },
+  auth: Eip3009Authorization,
+): Promise<{ signature: `0x${string}`; from: Address; mode: 'local' }> {
+  if (!/^0x[a-fA-F0-9]{40}$/.test(asset)) throw new Error(`Local mode needs an EVM token address for x402, got "${asset}".`);
+  if (!/^0x[a-fA-F0-9]{40}$/.test(auth.to)) throw new Error(`Local mode needs an EVM payTo address for x402, got "${auth.to}".`);
+  if (!/^\d+$/.test(auth.value)) throw new Error(`x402 authorization value must be integer base units, got "${auth.value}".`);
+  const calldata = ('0xa9059cbb'
+    + auth.to.slice(2).toLowerCase().padStart(64, '0')
+    + BigInt(auth.value).toString(16).padStart(64, '0')) as Hex;
+  await assertWithinTokenCap(chainId, asset, calldata);
+  const from = getLocalAddress();
+  const signature = await getLocalAccount().signTypedData(typedDataFor(chainId, asset, domain.name, domain.version, { ...auth, from }));
+  return { signature, from, mode: 'local' };
+}
+
+/** Read-only eth_call against the local RPC, same shape as the hosted /eth-call route. */
+export async function localEthCall(chainId: number, to: Address, data: Hex): Promise<{ result: string }> {
+  const client = createPublicClient({ transport: http(resolveRpcUrl(chainId)) });
+  const r = await client.call({ to, data });
+  return { result: r.data ?? '0x' };
 }

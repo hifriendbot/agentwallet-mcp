@@ -219,15 +219,15 @@ All on-chain. All through MCP. No frontend needed.
 
 ## x402 Payments
 
-AgentWallet natively supports the [x402 open payment standard](https://x402.org). When your Ai agent encounters an API that returns HTTP 402 Payment Required, the `pay_x402` tool handles the entire flow automatically:
+AgentWallet speaks the [x402 open payment standard](https://x402.org) the way the spec defines it. When your Ai agent hits an API that answers HTTP 402, `pay_x402` does the whole flow:
 
-1. Fetches the URL and detects the 402 response
-2. Parses the payment requirements (amount, token, chain)
-3. Executes the on-chain payment from your wallet
-4. Retries the request with proof of payment
-5. Returns the final response
+1. Fetches the URL and reads the payment requirements, from the v2 `PAYMENT-REQUIRED` header or the v1 JSON body.
+2. Picks an `exact` option (you can steer it with `prefer_chain`).
+3. Signs an **EIP-3009 `TransferWithAuthorization`** for exactly that amount. Nothing is broadcast and no gas is paid by the payer; the endpoint's facilitator settles it on-chain.
+4. Retries the request with the payment header (`PAYMENT-SIGNATURE` for v2, `X-PAYMENT` for v1).
+5. Returns the response, the settlement receipt (`PAYMENT-RESPONSE` / `X-PAYMENT-RESPONSE`) and, if the endpoint declined, its stated reason in `retry_error`.
 
-**Set `max_payment` to control spending:**
+Verified against Coinbase's public facilitator (`isValid: true` for v1 and v2 payloads) and live x402 servers on Base. Works in both custody modes: the local key signs in-process; hosted wallets sign through `POST /wallets/{id}/x402/authorize`, a narrow endpoint that only ever signs this one struct and runs the same pause and token-cap checks as a transfer.
 
 ```
 pay_x402(
@@ -237,9 +237,11 @@ pay_x402(
 )
 ```
 
-`max_payment` is enforced as a hard per-payment cap. If you omit it, `pay_x402` falls back to `AGENTWALLET_MAX_AUTOPAY` (default `1`), the same cap the auto-pay path uses, so a malicious or compromised 402 endpoint can never authorize an unbounded payment. Set `max_payment` explicitly (or raise `AGENTWALLET_MAX_AUTOPAY`) to allow a larger single payment.
+`max_payment` is a hard per-payment cap. If you omit it, `pay_x402` falls back to `AGENTWALLET_MAX_AUTOPAY` (default `1`), so a malicious or compromised 402 endpoint can never authorize an unbounded payment. In local mode `AGENTWALLET_MAX_TX_TOKEN` applies to authorizations too, because an authorization is a transfer somebody else executes.
 
-Supports ERC-20 tokens, SPL tokens, and native tokens on EVM and Solana. Compatible with x402 V1 and V2 (CAIP-2 chain identifiers), and reads the token address from the standard x402 `asset` field (falling back to `extra.token`).
+**Schemes.** `exact` is fully supported on every EVM chain AgentWallet knows. `upto` (a Permit2 maximum the seller settles below) is refused with a clear message rather than approximated with an upfront transfer; Permit2 support is next. Native-asset and Solana requests, and AgentWallet's own paywalls, are paid by an on-chain transfer proved by transaction hash, which is what those servers verify.
+
+**Token domains.** The EIP-712 domain comes from the endpoint's `extra.name` / `extra.version`, then a short registry of USDC deployments, then the token contract's own `name()` / `version()`. If none of those answer, the payment is refused rather than signed with a guessed domain.
 
 ## x402 Acceptance
 
