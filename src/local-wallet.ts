@@ -29,6 +29,7 @@ import {
 import { privateKeyToAccount } from 'viem/accounts';
 import { lookupTrustedDecimals } from './x402-payment.js';
 import { typedDataFor, type Eip3009Authorization } from './x402-eip3009.js';
+import { uptoTypedData, type UptoPermit2Authorization } from './x402-permit2.js';
 
 /* ── Key loading ─────────────────────────────────────────────────── */
 
@@ -404,4 +405,16 @@ export async function localEthCall(chainId: number, to: Address, data: Hex): Pro
   const client = createPublicClient({ transport: http(resolveRpcUrl(chainId)) });
   const r = await client.call({ to, data });
   return { result: r.data ?? '0x' };
+}
+
+/** x402 "upto": sign a Permit2 max-authorization in-process. The maximum goes through the token cap like a transfer would. */
+export async function localSignPermit2Upto(chainId: number, auth: UptoPermit2Authorization): Promise<{ signature: `0x${string}`; from: Address; mode: 'local' }> {
+  const token = auth.permitted.token;
+  if (!/^0x[a-fA-F0-9]{40}$/.test(token)) throw new Error(`Local mode needs an EVM token address for x402 upto, got "${token}".`);
+  if (!/^\d+$/.test(auth.permitted.amount)) throw new Error(`x402 upto amount must be integer base units, got "${auth.permitted.amount}".`);
+  const calldata = ('0xa9059cbb' + auth.witness.to.slice(2).toLowerCase().padStart(64, '0') + BigInt(auth.permitted.amount).toString(16).padStart(64, '0')) as Hex;
+  await assertWithinTokenCap(chainId, token, calldata);
+  const from = getLocalAddress();
+  const signature = await getLocalAccount().signTypedData(uptoTypedData(chainId, { ...auth, from }));
+  return { signature, from, mode: 'local' };
 }

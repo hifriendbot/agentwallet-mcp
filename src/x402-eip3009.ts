@@ -19,6 +19,7 @@
  *       response header PAYMENT-RESPONSE
  */
 import { randomBytes } from 'node:crypto';
+import { isUptoPayable } from './x402-permit2.js';
 
 export const TRANSFER_WITH_AUTHORIZATION_TYPES = {
   TransferWithAuthorization: [
@@ -179,7 +180,17 @@ export function buildPaymentPayload(
   resource?: X402PaymentRequired['resource'],
   extensions?: Record<string, unknown>,
 ): Record<string, unknown> {
-  const payload = { signature, authorization: auth };
+  return buildPaymentPayloadRaw(x402Version, req, { signature, authorization: auth }, resource, extensions);
+}
+
+/** Same envelope for any scheme payload (EIP-3009 authorization, Permit2 authorization, tx hash). */
+export function buildPaymentPayloadRaw(
+  x402Version: number,
+  req: X402Requirement,
+  payload: Record<string, unknown>,
+  resource?: X402PaymentRequired['resource'],
+  extensions?: Record<string, unknown>,
+): Record<string, unknown> {
   if (x402Version >= 2) {
     const out: Record<string, unknown> = { x402Version, accepted: req, payload };
     if (resource) out.resource = resource;
@@ -242,23 +253,27 @@ export function parseSettlement(getHeader: (name: string) => string | null | und
 }
 
 /**
- * Choose which accepts[] entry to pay. `exact` is the only scheme this client
- * can sign today; `upto` needs Permit2 (a max authorization the seller settles
- * below) and is refused rather than approximated with a full upfront transfer,
- * which is what issue #6 caught. Returns the reason when nothing is payable.
+ * Choose which accepts[] entry to pay. `exact` (EIP-3009, gasless for the
+ * payer) is preferred. `upto` is accepted when it carries the facilitator
+ * address the Permit2 witness must be bound to; an upto option without it is
+ * refused rather than approximated with an upfront transfer (issue #6).
+ * Returns the reason when nothing is payable.
  */
 export function pickOption(
   accepts: X402Requirement[],
   resolveChainId: (network: string) => number | null,
   preferChain?: number,
 ): { option: X402Requirement | null; chainId: number | null; reason?: string } {
-  const payable = accepts.filter(a => a.scheme === 'exact' && resolveChainId(a.network) !== null);
+  const onChain = accepts.filter(a => resolveChainId(a.network) !== null);
+  const exact = onChain.filter(a => a.scheme === 'exact');
+  const upto = onChain.filter(a => isUptoPayable(a));
+  const payable = [...exact, ...upto];
   if (payable.length === 0) {
     const schemes = Array.from(new Set(accepts.map(a => a.scheme))).join(', ') || 'none';
     const reason = accepts.some(a => a.scheme === 'upto')
-      ? 'This endpoint only offers the x402 "upto" scheme (Permit2 max-authorization settled by usage). ' +
-        'AgentWallet does not sign upto authorizations yet and will not approximate one with an upfront transfer. ' +
-        'Ask the endpoint for an "exact" option, or wait for Permit2 support.'
+      ? 'This endpoint offers the x402 "upto" scheme without an extra.facilitatorAddress (or without an asset), so the ' +
+        'Permit2 authorization cannot be bound to a facilitator. AgentWallet will not approximate it with an upfront transfer. ' +
+        'Ask the endpoint operator to publish facilitatorAddress, or an "exact" option.'
       : `No payable option: schemes offered were ${schemes}.`;
     return { option: null, chainId: null, reason };
   }

@@ -172,7 +172,10 @@ Add to your settings:
 | `get_allowance` | Check ERC-20 token allowance |
 | `wrap_eth` | Wrap native tokens to WETH/WAVAX/etc. |
 | `unwrap_eth` | Unwrap WETH back to native tokens |
-| `pay_x402` | Pay x402 invoices automatically (fetch, pay, retry) |
+| `pay_x402` | Pay x402 invoices (exact via EIP-3009, upto via Permit2), with approvals above the cap |
+| `check_approval` | Status of a human approval created by an over-cap `pay_x402` |
+| `approve_permit2` | One-time token approval to Permit2 for `upto` endpoints |
+| `check_token_risk` | Honeypot, tax, owner-power and holder-concentration flags for a token |
 | `create_paywall` | Create an x402 paywall to charge for a resource |
 | `list_paywalls` | List all your x402 paywalls |
 | `get_paywall` | Get paywall details by ID |
@@ -239,7 +242,20 @@ pay_x402(
 
 `max_payment` is a hard per-payment cap. If you omit it, `pay_x402` falls back to `AGENTWALLET_MAX_AUTOPAY` (default `1`), so a malicious or compromised 402 endpoint can never authorize an unbounded payment. In local mode `AGENTWALLET_MAX_TX_TOKEN` applies to authorizations too, because an authorization is a transfer somebody else executes.
 
-**Schemes.** `exact` is fully supported on every EVM chain AgentWallet knows. `upto` (a Permit2 maximum the seller settles below) is refused with a clear message rather than approximated with an upfront transfer; Permit2 support is next. Native-asset and Solana requests, and AgentWallet's own paywalls, are paid by an on-chain transfer proved by transaction hash, which is what those servers verify.
+**Schemes.** `exact` (EIP-3009, gasless for the payer) is preferred and works on every EVM chain AgentWallet knows. `upto` (a Permit2 maximum the seller settles at actual usage) is signed as a `PermitWitnessTransferFrom` bound to the endpoint's facilitator; it needs a one-time `approve_permit2` per token (or `AGENTWALLET_PERMIT2_AUTO_APPROVE=1`). An `upto` option without `extra.facilitatorAddress` is refused, never approximated with an upfront transfer. Native-asset and Solana requests, and AgentWallet's own paywalls, are paid by an on-chain transfer proved by transaction hash, which is what those servers verify.
+
+**Approvals above the cap.** On a hosted wallet, a payment above the cap does not have to fail. With `request_approval` (default on; `AGENTWALLET_APPROVALS=0` turns it off) the wallet owner gets an email with approve and deny links, `pay_x402` returns an `approval_id`, and the agent retries with it once `check_approval` says approved. An approval is bound to one wallet, chain, asset, recipient and maximum, expires in 24 hours, and is consumed by one signature. Local mode has no approval channel: the caps in your environment are the policy.
+
+**Asset risk.** `check_token_risk` (and every `approve_token` result) reports honeypot, tax, owner-power, verified-source, holder-concentration and liquidity flags from GoPlus Security, with an on-chain fallback. A warning for the caller to weigh, never a block.
+
+**Proof.** Real settlements are listed in [PAYMENTS.md](PAYMENTS.md); the first is a 0.02 USDC `exact` payment on Base with the facilitator paying the gas.
+
+## Pay any x402 API from Claude in three steps
+
+1. Add the server (one of the snippets under Quick Start). Self-custody: set `AGENTWALLET_PRIVATE_KEY` to a key that holds USDC on Base. Hosted: `AGENTWALLET_USER` and `AGENTWALLET_PASS` from hifriendbot.com/wallet.
+2. Ask: *"Use pay_x402 to POST https://api.ozdreamtools.de/api/holidays with body {"year":2026,"state":"BY"} and a max_payment of 0.05."*
+3. Read the result: `payment_made: true`, the amount, `payment_method`, and `settlement.transaction`, the on-chain hash. No ETH needed for `exact`: the endpoint's facilitator pays the gas.
+
 
 **Token domains.** The EIP-712 domain comes from the endpoint's `extra.name` / `extra.version`, then a short registry of USDC deployments, then the token contract's own `name()` / `version()`. If none of those answer, the payment is refused rather than signed with a guessed domain.
 

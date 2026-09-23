@@ -33,9 +33,14 @@ import {
   localSignMessage,
   resolveRpcUrl,
 } from './local-wallet.js';
-import { localSignAuthorization, localEthCall } from './local-wallet.js';
+import { localSignAuthorization, localEthCall, localSignPermit2Upto } from './local-wallet.js';
 import {
-  isLegacyAgentWalletAccept, requiredAmount, buildAuthorization, buildPaymentPayload, paymentHeaderFor,
+  buildUptoAuthorization, uptoPayload, permit2AllowanceCalldata, permit2ApproveCalldata, decodeUint, PERMIT2_ADDRESS,
+  type UptoPermit2Authorization,
+} from './x402-permit2.js';
+import { assessTokenRisk } from './token-risk.js';
+import {
+  isLegacyAgentWalletAccept, requiredAmount, buildAuthorization, buildPaymentPayload, buildPaymentPayloadRaw, paymentHeaderFor,
   parsePaymentRequired, parseSettlement, pickOption, knownTokenDomain,
   type X402Requirement, type Eip3009Authorization,
 } from './x402-eip3009.js';
@@ -178,6 +183,20 @@ async function routeLocally(
         nonce: String(body?.nonce || '') as `0x${string}`,
       },
     );
+  }
+
+  // POST /wallets/{id}/x402/permit2  (x402 "upto": Permit2 max-authorization, signed here)
+  if (method === 'POST' && /^\/wallets\/[^/]*\/x402\/permit2$/.test(rawPath)) {
+    if (!isLocalMode()) refuseMissingLocalKey('evm');
+    const chainId = localChainId(body, qs);
+    return localSignPermit2Upto(chainId, {
+      from: getLocalAddress(),
+      permitted: { token: String(body?.asset || '') as `0x${string}`, amount: String(body?.amount ?? '0') },
+      spender: String(body?.spender || '') as `0x${string}`,
+      nonce: String(body?.nonce ?? '0'),
+      deadline: String(body?.deadline ?? '0'),
+      witness: { to: String(body?.to || '') as `0x${string}`, facilitator: String(body?.facilitator || '') as `0x${string}`, validAfter: String(body?.valid_after ?? '0') },
+    });
   }
 
   // POST /eth-call  (read-only; answered from the local RPC so pure self-custody needs no hosted credentials)
@@ -577,7 +596,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.11.0',
+    version: '1.12.0',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. Private keys are encrypted server-side and never exposed — agents sign and broadcast transactions without ever touching raw keys.
@@ -999,6 +1018,13 @@ server.tool(
     }
     const calldata = '0x095ea7b3' + padAddress(spender) + encodeUint256(rawAmount);
 
+    // Asset risk rides along with the approval (issue #13). It never blocks; it is the
+    // caller's call. Skipped for Permit2, which only moves what a signature allows.
+    let risk: unknown = null;
+    if (spender.toLowerCase() !== PERMIT2_ADDRESS.toLowerCase()) {
+      try { risk = await assessTokenRisk(chain_id, token, (to, data) => ethCallHex(chain_id, to, data)); } catch { risk = null; }
+    }
+
     const result = await api(`/wallets/${wallet_id}/send`, 'POST', {
       to: token,
       value: '0',
@@ -1011,6 +1037,7 @@ server.tool(
       token,
       spender,
       amount: amount.toLowerCase() === 'max' ? 'unlimited' : amount,
+      risk,
     });
   },
 );
@@ -1252,16 +1279,29 @@ async function resolveTokenDomain(chainId: number, asset: string, extra?: X402Re
 
 /** Sign the authorization with whichever custody mode is active (local key, or the hosted signer). */
 async function signAuthorization(
-  walletId: number, chainId: number, asset: string, domain: { name: string; version: string }, auth: Eip3009Authorization,
+  walletId: number, chainId: number, asset: string, domain: { name: string; version: string }, auth: Eip3009Authorization, approvalId?: string | null,
 ): Promise<string> {
   const r = (await api(`/wallets/${walletId}/x402/authorize`, 'POST', {
     chain_id: chainId, asset, name: domain.name, version: domain.version,
     to: auth.to, value: auth.value, valid_after: auth.validAfter, valid_before: auth.validBefore, nonce: auth.nonce,
+    ...(approvalId ? { approval_id: approvalId } : {}),
   }, { 'X-AGW-SKIP-X402': 'true' })) as { signature?: string; error?: string };
   const sig = String(r?.signature || '');
   if (!/^0x[0-9a-fA-F]{130}$/.test(sig)) {
     throw new Error(`x402: the wallet did not return a valid authorization signature${r?.error ? ` (${r.error})` : ''}.`);
   }
+  return sig;
+}
+
+/** Sign a Permit2 upto authorization with whichever custody mode is active. */
+async function signPermit2(walletId: number, chainId: number, auth: UptoPermit2Authorization, approvalId?: string | null): Promise<string> {
+  const r = (await api(`/wallets/${walletId}/x402/permit2`, 'POST', {
+    chain_id: chainId, asset: auth.permitted.token, amount: auth.permitted.amount, spender: auth.spender, permit2: PERMIT2_ADDRESS,
+    nonce: auth.nonce, deadline: auth.deadline, to: auth.witness.to, facilitator: auth.witness.facilitator, valid_after: auth.witness.validAfter,
+    ...(approvalId ? { approval_id: approvalId } : {}),
+  }, { 'X-AGW-SKIP-X402': 'true' })) as { signature?: string; error?: string };
+  const sig = String(r?.signature || '');
+  if (!/^0x[0-9a-fA-F]{130}$/.test(sig)) throw new Error(`x402 upto: the wallet did not return a valid Permit2 signature${r?.error ? ` (${r.error})` : ''}.`);
   return sig;
 }
 
@@ -1296,8 +1336,15 @@ server.tool(
       'Preferred chain ID if the server accepts payment on multiple chains ' +
         '(e.g. 8453 for Base, 1 for Ethereum)',
     ),
+    request_approval: z.boolean().optional().describe(
+      'Hosted wallets only. When the payment exceeds the cap, email the wallet owner an approve/deny link ' +
+        'instead of refusing, and return an approval_id to retry with. Default true unless AGENTWALLET_APPROVALS=0.',
+    ),
+    approval_id: z.string().optional().describe(
+      'An approval id from an earlier over-cap attempt. Once the owner has approved it, pass it here to make that one payment.',
+    ),
   },
-  async ({ url, wallet_id, method, headers: headersJson, body: reqBody, max_payment, prefer_chain }) => {
+  async ({ url, wallet_id, method, headers: headersJson, body: reqBody, max_payment, prefer_chain, request_approval, approval_id }) => {
     // Build request headers
     const reqHeaders: Record<string, string> = { Accept: 'application/json' };
     if (headersJson) {
@@ -1354,7 +1401,7 @@ server.tool(
     const x402Version = Number(paymentInfo.x402Version) || 1;
     const accepts = paymentInfo.accepts as X402Requirement[];
 
-    // Step 3: Pick an option this client can sign. "exact" only; "upto" is refused, never approximated (issue #6).
+    // Step 3: Pick an option this client can sign: exact (EIP-3009) first, then a signable upto (Permit2).
     const picked = pickOption(accepts, resolveChainId, prefer_chain);
     if (!picked.option || !picked.chainId) {
       return jsonResponse({
@@ -1367,6 +1414,7 @@ server.tool(
     }
     const option = picked.option;
     const chainId = picked.chainId;
+    const isUpto = option.scheme === 'upto';
     const rawAmount = requiredAmount(option);
     if (!/^\d+$/.test(rawAmount)) {
       throw new Error(`x402: invalid amount "${rawAmount}" in the payment requirements (expected integer base units).`);
@@ -1382,47 +1430,99 @@ server.tool(
     if (typeof option.requiredDecimals === 'number') assertDeclaredDecimals(option.requiredDecimals, trustedDecimals);
     const amount = formatUnits(rawAmount, trustedDecimals);
     const tokenLabel = option.extra?.name || (tokenAddress ? 'tokens' : 'native');
+    const skip = { 'X-AGW-SKIP-X402': 'true' };
 
     // Step 4: Hard per-payment cap, ALWAYS applied. If the caller omits max_payment
-    // we fall back to AGENTWALLET_MAX_AUTOPAY (default "1"), so an untrusted 402
-    // endpoint can never authorize an unbounded payment. Never silently skipped.
+    // we fall back to AGENTWALLET_MAX_AUTOPAY (default "1"). Above the cap a hosted
+    // wallet can ask its owner instead of refusing: an approval is created, the
+    // owner gets approve/deny links by email, and the agent retries with the id.
+    // For upto the cap applies to the MAXIMUM the seller may settle.
     const capSource = max_payment ? 'max_payment' : 'AGENTWALLET_MAX_AUTOPAY';
     const effectiveMax = max_payment || process.env.AGENTWALLET_MAX_AUTOPAY || '1';
+    let approvalUsed: string | null = null;
     if (!isWithinCap(rawAmount, trustedDecimals, effectiveMax)) {
-      return jsonResponse({
-        status: 402,
-        payment_required: true,
-        payment_made: false,
-        error: `Payment of ${amount} ${tokenLabel} exceeds the ${effectiveMax} cap (from ${capSource}).` +
-          (max_payment ? '' : ' No max_payment was provided, so the default cap was applied. ' +
-            'Pass max_payment (or raise AGENTWALLET_MAX_AUTOPAY) to allow a larger payment.'),
-        required_amount: amount,
-        max_allowed: effectiveMax,
-        cap_source: capSource,
-        token: tokenLabel,
-        network: option.network,
-        chain_id: chainId,
-        pay_to: option.payTo,
-        description: option.description,
-      });
+      const overCap = {
+        status: 402, payment_required: true, payment_made: false,
+        required_amount: amount, max_allowed: effectiveMax, cap_source: capSource, token: tokenLabel,
+        network: option.network, chain_id: chainId, pay_to: option.payTo, description: option.description,
+      };
+      const wantApproval = request_approval ?? (process.env.AGENTWALLET_APPROVALS !== '0');
+      if (approval_id) {
+        const a = (await api(`/approvals/${encodeURIComponent(approval_id)}`, 'GET', undefined, skip)) as { status?: string; value?: string; pay_to?: string; chain_id?: number; error?: string };
+        if (a?.status !== 'approved') {
+          return jsonResponse({ ...overCap, approval_id, approval_status: a?.status ?? null, error: `Approval ${approval_id} is ${a?.status ?? 'unknown'}, not approved.${a?.error ? ' ' + a.error : ''}` });
+        }
+        if (String(a.pay_to || '').toLowerCase() !== option.payTo.toLowerCase() || Number(a.chain_id) !== chainId || BigInt(String(a.value || '0')) < BigInt(rawAmount)) {
+          return jsonResponse({ ...overCap, approval_id, error: 'Approval does not cover this payment (recipient, chain or amount differ).' });
+        }
+        approvalUsed = String(approval_id);
+      } else if (wantApproval && !anyLocalMode()) {
+        const created = (await api('/approvals', 'POST', {
+          wallet_id, chain_id: chainId, scheme: option.scheme, asset: tokenAddress, pay_to: option.payTo, value: rawAmount,
+          amount_human: amount, token_name: tokenLabel, url,
+        }, skip)) as { success?: boolean; id?: number; expires_at?: string; error?: string };
+        if (!created?.id) {
+          return jsonResponse({ ...overCap, error: `Payment of ${amount} ${tokenLabel} exceeds the ${effectiveMax} cap and the approval request failed: ${created?.error || 'unknown error'}.` });
+        }
+        return jsonResponse({
+          ...overCap, approval_pending: true, approval_id: String(created.id), expires_at: created.expires_at ?? null,
+          error: `Payment of ${amount} ${tokenLabel} exceeds the ${effectiveMax} cap (from ${capSource}). The wallet owner has been emailed approve/deny links ` +
+            `(approval ${created.id}, valid 24 hours). Check it with check_approval, then call pay_x402 again with approval_id "${created.id}".`,
+        });
+      } else {
+        return jsonResponse({
+          ...overCap,
+          error: `Payment of ${amount} ${tokenLabel} exceeds the ${effectiveMax} cap (from ${capSource}).` +
+            (max_payment ? '' : ' No max_payment was provided, so the default cap was applied.') +
+            (anyLocalMode() ? ' Local mode has no approval channel: raise max_payment, AGENTWALLET_MAX_AUTOPAY or AGENTWALLET_MAX_TX_TOKEN yourself.'
+                            : ' Pass request_approval=true to email the wallet owner for a one-time approval, or raise the cap.'),
+        });
+      }
     }
 
     // Step 5: Pay. Standard x402 "exact" on EVM is an EIP-3009 authorization the
-    // facilitator settles; the payer broadcasts nothing and pays no gas. AgentWallet's
+    // facilitator settles; "upto" is a Permit2 max-authorization settled at actual
+    // usage; the payer broadcasts nothing and pays no gas for either. AgentWallet's
     // own paywalls (verified by receipt), native-asset requests and Solana still use
     // a broadcast transfer proved by hash.
-    const standardExact = !isSolanaChain(chainId) && Boolean(tokenAddress) && !isLegacyAgentWalletAccept(option);
+    const standardExact = !isUpto && !isSolanaChain(chainId) && Boolean(tokenAddress) && !isLegacyAgentWalletAccept(option);
     let headerName = 'X-PAYMENT';
     let paymentHeader = '';
     let txHash: string | null = null;
     let authorization: Eip3009Authorization | null = null;
+    let uptoAuth: UptoPermit2Authorization | null = null;
     let payer: string | null = null;
+    let permit2ApprovalTx: string | null = null;
 
-    if (standardExact) {
+    if (isUpto) {
+      payer = await payerAddress(wallet_id);
+      const allowance = decodeUint(await ethCallHex(chainId, tokenAddress, permit2AllowanceCalldata(payer)));
+      if (allowance < BigInt(rawAmount)) {
+        if (process.env.AGENTWALLET_PERMIT2_AUTO_APPROVE === '1') {
+          const r = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: tokenAddress, value: '0', data: permit2ApproveCalldata(), chain_id: chainId }, skip)) as { tx_hash?: string };
+          permit2ApprovalTx = String(r?.tx_hash || '');
+          await new Promise(res => setTimeout(res, 4000));
+        } else {
+          return jsonResponse({
+            status: 402, payment_required: true, payment_made: false, permit2_approval_needed: true,
+            token: tokenLabel, token_address: tokenAddress, chain_id: chainId, payer, permit2: PERMIT2_ADDRESS,
+            error: `This endpoint uses the x402 "upto" scheme, which settles through Permit2. Wallet ${payer} has not approved ` +
+              `${tokenLabel} to Permit2 on chain ${chainId}. Call approve_permit2 once for this token (a normal transaction that needs gas), ` +
+              `or set AGENTWALLET_PERMIT2_AUTO_APPROVE=1, then call pay_x402 again.`,
+          });
+        }
+      }
+      uptoAuth = buildUptoAuthorization(payer, option);
+      const signature = await signPermit2(wallet_id, chainId, uptoAuth, approvalUsed);
+      const payload = buildPaymentPayloadRaw(x402Version, option, uptoPayload(uptoAuth, signature), paymentInfo.resource, paymentInfo.extensions);
+      const h = paymentHeaderFor(x402Version, payload);
+      headerName = h.name;
+      paymentHeader = h.value;
+    } else if (standardExact) {
       payer = await payerAddress(wallet_id);
       const domain = await resolveTokenDomain(chainId, tokenAddress, option.extra);
       authorization = buildAuthorization(payer, option);
-      const signature = await signAuthorization(wallet_id, chainId, tokenAddress, domain, authorization);
+      const signature = await signAuthorization(wallet_id, chainId, tokenAddress, domain, authorization, approvalUsed);
       const payload = buildPaymentPayload(x402Version, option, authorization, signature, paymentInfo.resource, paymentInfo.extensions);
       const h = paymentHeaderFor(x402Version, payload);
       headerName = h.name;
@@ -1473,7 +1573,9 @@ server.tool(
       payment_required: true,
       payment_made: retryRes.status !== 402,
       retry_error: retryError,
-      payment_method: standardExact ? 'eip3009-authorization' : 'onchain-transfer',
+      payment_method: isUpto ? 'permit2-upto-authorization' : (standardExact ? 'eip3009-authorization' : 'onchain-transfer'),
+      approval_id: approvalUsed,
+      permit2_approval_tx: permit2ApprovalTx,
       x402_version: x402Version,
       amount,
       token: tokenLabel,
@@ -1484,11 +1586,55 @@ server.tool(
       payer,
       tx_hash: txHash ?? settlement?.transaction ?? null,
       settlement,
-      authorization: authorization ? { nonce: authorization.nonce, valid_before: authorization.validBefore } : null,
+      authorization: authorization ? { nonce: authorization.nonce, valid_before: authorization.validBefore }
+        : (uptoAuth ? { scheme: 'upto', max_amount: amount, nonce: uptoAuth.nonce, deadline: uptoAuth.deadline, facilitator: uptoAuth.witness.facilitator } : null),
       description: option.description,
       response: retryParsed,
     });
   },
+);
+
+// ─── Tool: check_approval ───────────────────────────────────────
+
+server.tool(
+  'check_approval',
+  'Status of a payment approval created when pay_x402 exceeded the cap on a hosted wallet. ' +
+    'Returns pending, approved, denied or expired. Once approved, call pay_x402 again with approval_id.',
+  { approval_id: z.string().describe('Approval id returned by pay_x402') },
+  async ({ approval_id }) => jsonResponse(await api(`/approvals/${encodeURIComponent(approval_id)}`, 'GET', undefined, { 'X-AGW-SKIP-X402': 'true' })),
+);
+
+// ─── Tool: approve_permit2 ──────────────────────────────────────
+
+server.tool(
+  'approve_permit2',
+  'One-time ERC-20 approval of a token to the Permit2 contract, needed before paying x402 "upto" endpoints with that token. ' +
+    'A normal on-chain transaction (needs gas). Approves the maximum so it never has to be repeated; Permit2 itself only moves ' +
+    'what each signed authorization allows.',
+  {
+    wallet_id: z.number().int().describe('Wallet ID'),
+    token: z.string().regex(/^0x[a-fA-F0-9]{40}$/).describe('ERC-20 token address (e.g. USDC on Base)'),
+    chain_id: z.number().int().describe('Chain ID'),
+  },
+  async ({ wallet_id, token, chain_id }) => {
+    if (isSolanaChain(chain_id)) throw new Error('Permit2 is an EVM contract; there is nothing to approve on Solana.');
+    const result = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: token, value: '0', data: permit2ApproveCalldata(), chain_id })) as Record<string, unknown>;
+    return jsonResponse({ ...result, token, spender: PERMIT2_ADDRESS, amount: 'unlimited', note: 'Permit2 only transfers what a signed authorization allows; the allowance itself moves nothing.' });
+  },
+);
+
+// ─── Tool: check_token_risk ─────────────────────────────────────
+
+server.tool(
+  'check_token_risk',
+  'Assess an ERC-20 token before approving or swapping it: honeypot, taxes, owner powers, verified source, ' +
+    'holder concentration, DEX liquidity. Uses GoPlus Security (free, no key) with an on-chain fallback. ' +
+    'A warning for the caller to weigh, never a block.',
+  {
+    token: z.string().regex(/^0x[a-fA-F0-9]{40}$/).describe('ERC-20 token contract address'),
+    chain_id: z.number().int().describe('Chain ID'),
+  },
+  async ({ token, chain_id }) => jsonResponse({ token, chain_id, risk: await assessTokenRisk(chain_id, token, (to, data) => ethCallHex(chain_id, to, data)) }),
 );
 
 // ─── Tool: get_usage ─────────────────────────────────────────────
