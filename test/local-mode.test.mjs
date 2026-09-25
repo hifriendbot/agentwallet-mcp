@@ -11,11 +11,12 @@
 
 import { spawn } from 'node:child_process';
 import assert from 'node:assert/strict';
+import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { Keypair } from '@solana/web3.js';
 
 /* Well-known throwaway key from the go-ethereum docs. Never used for funds. */
-const TEST_KEY = '0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318';
-const TEST_ADDRESS = '0x2c7536E3605D9C16a7a3D7b1898e529396a65c23';
+const TEST_KEY = generatePrivateKey(); // fresh per run; a well-known key gets EIP-7702 delegated by sweeper bots (issue #9)
+const TEST_ADDRESS = privateKeyToAccount(TEST_KEY).address;
 const DEAD_API = 'http://127.0.0.1:1'; // nothing listens here, by design
 
 let passed = 0;

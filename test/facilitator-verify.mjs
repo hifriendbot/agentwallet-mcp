@@ -7,11 +7,11 @@
  *
  *   node test/facilitator-verify.mjs [facilitatorBase]   (default https://x402.org/facilitator)
  */
-import { privateKeyToAccount } from 'viem/accounts';
+import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts';
 import { buildAuthorization, typedDataFor, buildPaymentPayload } from '../build/x402-eip3009.js';
 
 const base = (process.argv[2] || 'https://x402.org/facilitator').replace(/\/$/, '');
-const account = privateKeyToAccount('0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318'); // unfunded throwaway
+const account = privateKeyToAccount(generatePrivateKey()); // fresh unfunded key per run, never a well-known one (issue #9)
 const USDC = '0x036CbD53842c5426634e7929541eC2318f3dCF7e'; // USDC on Base Sepolia, the network the public facilitator serves
 const CHAIN = 84532;
 

@@ -259,6 +259,8 @@ pay_x402(
 
 **Token domains.** The EIP-712 domain comes from the endpoint's `extra.name` / `extra.version`, then a short registry of USDC deployments, then the token contract's own `name()` / `version()`. If none of those answer, the payment is refused rather than signed with a guessed domain.
 
+**Delegated payers.** If the paying address is an EIP-7702 delegated account, `pay_x402` reports it in `payer_delegation` (the delegate and whether it answers ERC-1271). A delegate without ERC-1271 is declined by facilitators that check account code before recovering the signer, and the reason they return reads like a signature fault; the warning names the real cause. Pay from a plain EOA for reliable settlement.
+
 ## x402 Acceptance
 
 AgentWallet also lets you **accept** x402 payments. Create a paywall, point it at any resource, and get a public URL that charges agents automatically:

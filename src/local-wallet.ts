@@ -463,6 +463,13 @@ export async function localEthCall(chainId: number, to: Address, data: Hex): Pro
   return { result: r.data ?? '0x' };
 }
 
+/** Read-only eth_getCode against the local RPC, same shape as the hosted /eth-get-code route. */
+export async function localGetCode(chainId: number, address: Address): Promise<{ code: string }> {
+  const client = createPublicClient({ transport: http(resolveRpcUrl(chainId)) });
+  const code = await client.getCode({ address });
+  return { code: code ?? '0x' };
+}
+
 /** x402 "upto": sign a Permit2 max-authorization in-process. The maximum goes through the token cap like a transfer would. */
 export async function localSignPermit2Upto(chainId: number, auth: UptoPermit2Authorization): Promise<{ signature: `0x${string}`; from: Address; mode: 'local' }> {
   const token = auth.permitted.token;

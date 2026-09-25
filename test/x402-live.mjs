@@ -10,11 +10,14 @@
  * point). Not part of `npm test`; it touches the network.
  */
 import { spawn } from 'node:child_process';
+import { generatePrivateKey } from 'viem/accounts';
 
 const [url, method = 'GET', body = '', maxPayment = '1'] = process.argv.slice(2);
 if (!url) { console.error('usage: node test/x402-live.mjs <url> [method] [json-body] [max_payment]'); process.exit(2); }
 
-const TEST_KEY = '0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318'; // go-ethereum docs key, never funded
+// A fresh unfunded key per run. Never a well-known key: sweeper bots EIP-7702 delegate those on
+// mainnet, and a delegated payer is declined by facilitators with a misleading signature error (issue #9).
+const TEST_KEY = generatePrivateKey();
 
 const env = {
   ...process.env,

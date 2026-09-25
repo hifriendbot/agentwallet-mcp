@@ -6,6 +6,7 @@
  * facilitator will verify. Run with: npm test
  */
 import assert from 'node:assert';
+import { parseEip7702Delegation, erc1271ProbeCalldata, classifyErc1271Probe, ERC1271_MAGIC } from '../build/x402-eip3009.js';
 import { privateKeyToAccount } from 'viem/accounts';
 import { verifyTypedData } from 'viem';
 import {
@@ -167,6 +168,34 @@ ok('pickOption reports unknown schemes', () => {
   const r = pickOption([{ ...v2, scheme: 'lightning' }], resolveChainId);
   assert.strictEqual(r.option, null);
   assert.match(r.reason, /lightning/);
+});
+
+ok('parseEip7702Delegation recognises a delegation designator and nothing else (issue #9)', () => {
+  assert.strictEqual(parseEip7702Delegation('0xef01008a67b5020ee254ef48e3b6a04927f39baf7e408a'), '0x8a67b5020ee254ef48e3b6a04927f39baf7e408a');
+  assert.strictEqual(parseEip7702Delegation('0xEF01008A67B5020EE254EF48E3B6A04927F39BAF7E408A'), '0x8a67b5020ee254ef48e3b6a04927f39baf7e408a');
+  assert.strictEqual(parseEip7702Delegation('0x'), null);
+  assert.strictEqual(parseEip7702Delegation(''), null);
+  assert.strictEqual(parseEip7702Delegation(undefined), null);
+  assert.strictEqual(parseEip7702Delegation('0x6080604052'), null);
+  assert.strictEqual(parseEip7702Delegation('0xef01008a67b5020ee254ef48e3b6a04927f39baf7e408a00'), null);
+});
+
+ok('erc1271ProbeCalldata is a well-formed isValidSignature(bytes32,bytes) call', () => {
+  const c = erc1271ProbeCalldata();
+  assert.ok(c.startsWith(ERC1271_MAGIC));
+  assert.strictEqual((c.length - 2) / 2, 4 + 32 + 32 + 32 + 96);
+  assert.strictEqual(c.slice(10 + 64, 10 + 128), (64).toString(16).padStart(64, '0'));
+  assert.strictEqual(c.slice(10 + 128, 10 + 192), (65).toString(16).padStart(64, '0'));
+});
+
+ok('classifyErc1271Probe: empty data means no interface, a 4-byte word means it exists, anything else is unknown', () => {
+  assert.strictEqual(classifyErc1271Probe('0x'), 'no');
+  assert.strictEqual(classifyErc1271Probe(''), 'no');
+  assert.strictEqual(classifyErc1271Probe(undefined), 'no');
+  assert.strictEqual(classifyErc1271Probe('0x1626ba7e' + '0'.repeat(56)), 'yes');
+  assert.strictEqual(classifyErc1271Probe('0xffffffff' + '0'.repeat(56)), 'yes');
+  assert.strictEqual(classifyErc1271Probe('0x01'), 'unknown');
+  assert.strictEqual(classifyErc1271Probe('0x', true), 'unknown');
 });
 
 console.log(`\n${passed}/${passed} eip3009 tests passed`);

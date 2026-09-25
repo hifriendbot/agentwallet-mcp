@@ -33,7 +33,7 @@ import {
   localSignMessage,
   resolveRpcUrl,
 } from './local-wallet.js';
-import { localSignAuthorization, localEthCall, localSignPermit2Upto } from './local-wallet.js';
+import { localSignAuthorization, localEthCall, localGetCode, localSignPermit2Upto } from './local-wallet.js';
 import {
   buildUptoAuthorization, uptoPayload, permit2AllowanceCalldata, permit2ApproveCalldata, decodeUint, PERMIT2_ADDRESS,
   type UptoPermit2Authorization,
@@ -42,7 +42,8 @@ import { assessTokenRisk } from './token-risk.js';
 import {
   isLegacyAgentWalletAccept, requiredAmount, buildAuthorization, buildPaymentPayload, buildPaymentPayloadRaw, paymentHeaderFor,
   parsePaymentRequired, parseSettlement, pickOption, knownTokenDomain,
-  type X402Requirement, type Eip3009Authorization,
+  parseEip7702Delegation, erc1271ProbeCalldata, classifyErc1271Probe,
+  type X402Requirement, type Eip3009Authorization, type Erc1271Support,
 } from './x402-eip3009.js';
 import {
   isSolanaLocalMode,
@@ -203,6 +204,12 @@ async function routeLocally(
   if (method === 'POST' && rawPath === '/eth-call') {
     if (!isLocalMode()) return NOT_HANDLED;
     return localEthCall(localChainId(body, qs), String(body?.to || '') as `0x${string}`, String(body?.data || '0x') as `0x${string}`);
+  }
+
+  // POST /eth-get-code  (read-only; the payer's account code, checked for an EIP-7702 delegation before an x402 authorization)
+  if (method === 'POST' && rawPath === '/eth-get-code') {
+    if (!isLocalMode()) return NOT_HANDLED;
+    return localGetCode(localChainId(body, qs), String(body?.address || '') as `0x${string}`);
   }
 
   // GET /wallets/{id}/balance
@@ -596,7 +603,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.12.3',
+    version: '1.12.4',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. Private keys are encrypted server-side and never exposed — agents sign and broadcast transactions without ever touching raw keys.
@@ -1247,6 +1254,37 @@ async function payerAddress(walletId: number): Promise<string> {
   return a;
 }
 
+type PayerDelegation = { delegate: string; erc1271: Erc1271Support; warning: string };
+
+/**
+ * Best-effort look at the payer's account code. An EIP-7702 delegated EOA whose delegate
+ * does not implement ERC-1271 is declined by facilitators that check code before recovering
+ * the signer, with an error that reads like a signature fault (issue #9). Nothing is refused
+ * here: the authorization costs nothing to sign and other facilitators accept it. The result
+ * carries the warning so the agent can explain a signature-shaped rejection. A lookup failure
+ * (a hosted server without the route, RPC trouble) reports nothing rather than blocking the payment.
+ */
+async function payerDelegation(chainId: number, payer: string): Promise<PayerDelegation | null> {
+  try {
+    const r = (await api('/eth-get-code', 'POST', { chain_id: chainId, address: payer }, { 'X-AGW-SKIP-X402': 'true' })) as { code?: string };
+    const delegate = parseEip7702Delegation(r?.code);
+    if (!delegate) return null;
+    let erc1271: Erc1271Support = 'unknown';
+    try {
+      const probe = (await api('/eth-call', 'POST', { chain_id: chainId, to: payer, data: erc1271ProbeCalldata() }, { 'X-AGW-SKIP-X402': 'true' })) as { result?: string };
+      erc1271 = classifyErc1271Probe(probe?.result);
+    } catch { erc1271 = 'unknown'; }
+    const warning = erc1271 === 'no'
+      ? `Payer ${payer} is an EIP-7702 delegated account (delegate ${delegate}) and the delegate does not answer ERC-1271 isValidSignature. ` +
+        `Facilitators that check account code before recovering the signer decline this authorization with a signature error. ` +
+        `Pay from a plain EOA, or clear the delegation, for reliable x402 settlement.`
+      : `Payer ${payer} is an EIP-7702 delegated account (delegate ${delegate}); a facilitator may verify the authorization through ERC-1271 on the delegate.`;
+    return { delegate, erc1271, warning };
+  } catch {
+    return null;
+  }
+}
+
 async function ethCallHex(chainId: number, to: string, data: string): Promise<string> {
   const r = (await api('/eth-call', 'POST', { chain_id: chainId, to, data }, { 'X-AGW-SKIP-X402': 'true' })) as { result?: string };
   return String(r?.result || '');
@@ -1493,9 +1531,11 @@ server.tool(
     let uptoAuth: UptoPermit2Authorization | null = null;
     let payer: string | null = null;
     let permit2ApprovalTx: string | null = null;
+    let payerDelegationInfo: PayerDelegation | null = null;
 
     if (isUpto) {
       payer = await payerAddress(wallet_id);
+      payerDelegationInfo = await payerDelegation(chainId, payer);
       const allowance = decodeUint(await ethCallHex(chainId, tokenAddress, permit2AllowanceCalldata(payer)));
       if (allowance < BigInt(rawAmount)) {
         if (process.env.AGENTWALLET_PERMIT2_AUTO_APPROVE === '1') {
@@ -1520,6 +1560,7 @@ server.tool(
       paymentHeader = h.value;
     } else if (standardExact) {
       payer = await payerAddress(wallet_id);
+      payerDelegationInfo = await payerDelegation(chainId, payer);
       const domain = await resolveTokenDomain(chainId, tokenAddress, option.extra);
       authorization = buildAuthorization(payer, option);
       const signature = await signAuthorization(wallet_id, chainId, tokenAddress, domain, authorization, approvalUsed);
@@ -1566,6 +1607,7 @@ server.tool(
     if (retryRes.status === 402) {
       const again = parsePaymentRequired(n => retryRes.headers.get(n), retryParsed);
       retryError = String(again?.error || (retryParsed as { error?: string } | null)?.error || 'Payment was not accepted (no reason given).');
+      if (payerDelegationInfo && /signature/i.test(retryError)) retryError += ` Likely cause: ${payerDelegationInfo.warning}`;
     }
 
     return jsonResponse({
@@ -1587,6 +1629,7 @@ server.tool(
       chain_id: chainId,
       pay_to: option.payTo,
       payer,
+      payer_delegation: payerDelegationInfo,
       tx_hash: txHash ?? settlement?.transaction ?? null,
       settlement,
       authorization: authorization ? { nonce: authorization.nonce, valid_before: authorization.validBefore }

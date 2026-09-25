@@ -281,3 +281,44 @@ export function pickOption(
   if (preferChain) option = payable.find(a => resolveChainId(a.network) === preferChain) ?? option;
   return { option, chainId: resolveChainId(option.network) };
 }
+
+// ─── Payer account shape (EIP-7702) ──────────────────────────────
+
+/**
+ * An EIP-7702 delegated EOA has code 0xef0100 || delegate (23 bytes). A facilitator that
+ * checks account code before recovering the signer treats such a payer as a contract
+ * wallet and calls ERC-1271 isValidSignature on it; a delegate that does not implement
+ * it answers with empty data, and the payment is declined with a signature-shaped error
+ * that has nothing to do with the signature (issue #9: a well-known test key that
+ * sweeper bots had delegated on Base mainnet).
+ */
+export function parseEip7702Delegation(code: string | null | undefined): string | null {
+  const m = /^0xef0100([0-9a-f]{40})$/.exec(String(code || '').toLowerCase());
+  return m ? `0x${m[1]}` : null;
+}
+
+export const ERC1271_MAGIC = '0x1626ba7e';
+
+/** Calldata for isValidSignature(bytes32, bytes) with a placeholder hash and a 65-byte placeholder signature. */
+export function erc1271ProbeCalldata(): `0x${string}` {
+  const hash = '11'.repeat(32);
+  const offset = (64).toString(16).padStart(64, '0');
+  const length = (65).toString(16).padStart(64, '0');
+  const sig = 'aa'.repeat(65).padEnd(192, '0');
+  return `${ERC1271_MAGIC}${hash}${offset}${length}${sig}` as `0x${string}`;
+}
+
+export type Erc1271Support = 'yes' | 'no' | 'unknown';
+
+/**
+ * Classify an isValidSignature probe. Empty return data means the account has no such
+ * function (the failure shape from issue #9); a 4-byte word means the interface exists,
+ * whatever it thought of the placeholder signature; a revert or transport failure is unknown.
+ */
+export function classifyErc1271Probe(result: string | null | undefined, failed = false): Erc1271Support {
+  if (failed) return 'unknown';
+  const r = String(result || '').toLowerCase();
+  if (r === '' || r === '0x') return 'no';
+  if (/^0x[0-9a-f]{8}0{56}$/.test(r)) return 'yes';
+  return 'unknown';
+}

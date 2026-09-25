@@ -5,12 +5,12 @@
  * malformed-payload reason: that proves the typed data and envelope are right.
  * Not part of `npm test`; it touches the network.
  */
-import { privateKeyToAccount } from 'viem/accounts';
+import { privateKeyToAccount, generatePrivateKey } from 'viem/accounts';
 import { buildUptoAuthorization, uptoTypedData, uptoPayload } from '../build/x402-permit2.js';
 import { buildPaymentPayloadRaw } from '../build/x402-eip3009.js';
 
 const base = (process.argv[2] || 'https://x402.org/facilitator').replace(/\/$/, '');
-const account = privateKeyToAccount('0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318');
+const account = privateKeyToAccount(generatePrivateKey()); // fresh unfunded key per run (issue #9)
 const supported = await (await fetch(base + '/supported')).json();
 const kind = (supported.kinds || []).find(k => k.scheme === 'upto' && k.network === 'eip155:84532');
 if (!kind) { console.log('facilitator does not advertise upto on Base Sepolia'); process.exit(1); }
