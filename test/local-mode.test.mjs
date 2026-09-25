@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { Keypair } from '@solana/web3.js';
 
-/* Well-known throwaway key from the go-ethereum docs. Never used for funds. */
+/* A fresh throwaway key per run. Never used for funds, never a well-known key (issue #9). */
 const TEST_KEY = generatePrivateKey(); // fresh per run; a well-known key gets EIP-7702 delegated by sweeper bots (issue #9)
 const TEST_ADDRESS = privateKeyToAccount(TEST_KEY).address;
 const DEAD_API = 'http://127.0.0.1:1'; // nothing listens here, by design
