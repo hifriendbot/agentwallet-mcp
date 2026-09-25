@@ -22,7 +22,7 @@ We pay for real findings in USDC on Base, per the tiers published at https://hif
 
 **Self-custody is testable, not asserted.** `test/local-mode.test.mjs` runs every funds tool with the hosted API pointed at a closed port. If any path still reached a server, the test fails. Local keys are read once from the environment, never logged, never persisted, never included in an error message.
 
-**Caps fail closed.** Token amounts are evaluated at trusted decimals (registry, then the contract), never at decimals the paying endpoint declares. Unknown tokens are refused rather than guessed. `AGENTWALLET_MAX_TX_TOKEN` covers `transfer`, `transferFrom`, `approve`, EIP-3009 authorizations and Permit2 maximums, because all of them let someone else move funds.
+**Caps fail closed.** Token amounts are evaluated at trusted decimals (registry, then the contract), never at decimals the paying endpoint declares. Unknown tokens are refused rather than guessed. `AGENTWALLET_MAX_TX_TOKEN` covers `transfer`, `transferFrom`, `approve`, `increaseAllowance`, Permit2 `approve`, EIP-3009 authorizations and Permit2 maximums, because all of them let someone else move funds. Calldata the guard cannot price is refused when its target is a token contract or Permit2, rather than let through uncapped.
 
 **The server signs one struct off-chain.** `POST /wallets/{id}/x402/authorize` rebuilds an EIP-3009 authorization from validated fields and signs that; it never signs caller-supplied typed data. Same for the Permit2 route. Both run the pause and token-cap checks a transfer gets.
 

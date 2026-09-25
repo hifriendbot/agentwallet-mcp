@@ -81,9 +81,43 @@ const V4_BLOCKED = [
   '240.0.0.0/4',      // reserved, includes 255.255.255.255
 ];
 
+/** Expand an IPv6 literal (any spelling Node's isIP accepts) into eight 16-bit groups. */
+export function expandIPv6(hostRaw: string): number[] | null {
+  let h = hostRaw.toLowerCase();
+  // A trailing dotted IPv4 (::ffff:1.2.3.4, ::1.2.3.4, 64:ff9b::1.2.3.4) is the last two groups.
+  const dotted = h.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
+  if (dotted) {
+    const v4 = ipv4ToInt(dotted[2]);
+    if (v4 === null) return null;
+    h = dotted[1] + (v4 >>> 16).toString(16) + ':' + (v4 & 0xffff).toString(16);
+  }
+  const halves = h.split('::');
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const missing = 8 - head.length - tail.length;
+  if (halves.length === 2 ? missing < 1 : missing !== 0) return null;
+  const groups = [...head, ...Array<string>(halves.length === 2 ? missing : 0).fill('0'), ...tail];
+  const out: number[] = [];
+  for (const g of groups) {
+    if (!/^[0-9a-f]{1,4}$/.test(g)) return null;
+    out.push(parseInt(g, 16));
+  }
+  return out;
+}
+
+const embeddedV4 = (hi: number, lo: number) => [(hi >> 8) & 255, hi & 255, (lo >> 8) & 255, lo & 255].join('.');
+const zeroThrough = (g: number[], n: number) => g.slice(0, n).every(x => x === 0);
+
 /**
  * Reduce a host to the IP address it actually denotes.
- * Strips IPv6 brackets and unwraps IPv4-mapped and IPv4-compatible IPv6.
+ * Strips IPv6 brackets and unwraps every IPv6 form that embeds an IPv4
+ * address: IPv4-mapped (::ffff:a.b.c.d), IPv4-translated (::ffff:0:a.b.c.d)
+ * and the deprecated IPv4-compatible form (::a.b.c.d, also spelled
+ * ::7f00:1). The match is on the expanded groups, not on one spelling, so
+ * 0:0:0:0:0:0:7f00:1 and ::7F00:1 canonicalize the same way. The compatible
+ * form was reported as unclassified on 2026-09-25 (not reachable in practice,
+ * modern stacks refuse to route ::/96, but a guard should not depend on that).
  */
 export function canonicalizeHost(hostRaw: string): { ip: string | null; family: 0 | 4 | 6 } {
   let host = hostRaw.trim().toLowerCase();
@@ -95,15 +129,11 @@ export function canonicalizeHost(hostRaw: string): { ip: string | null; family: 
   if (fam === 0) return { ip: null, family: 0 };
   if (fam === 4) return { ip: host, family: 4 };
 
-  // IPv6: unwrap ::ffff:a.b.c.d and its hex spelling ::ffff:7f00:1
-  const mapped = host.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  if (mapped) return { ip: mapped[1], family: 4 };
-  const hexMapped = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
-  if (hexMapped) {
-    const hi = parseInt(hexMapped[1], 16);
-    const lo = parseInt(hexMapped[2], 16);
-    return { ip: [(hi >> 8) & 255, hi & 255, (lo >> 8) & 255, lo & 255].join('.'), family: 4 };
-  }
+  const g = expandIPv6(host);
+  if (!g) return { ip: host, family: 6 };
+  if (zeroThrough(g, 5) && g[5] === 0xffff) return { ip: embeddedV4(g[6], g[7]), family: 4 };            // ::ffff:a.b.c.d
+  if (zeroThrough(g, 4) && g[4] === 0xffff && g[5] === 0) return { ip: embeddedV4(g[6], g[7]), family: 4 }; // ::ffff:0:a.b.c.d
+  if (zeroThrough(g, 6) && !(g[6] === 0 && g[7] <= 1)) return { ip: embeddedV4(g[6], g[7]), family: 4 };  // ::a.b.c.d, but not :: or ::1
   return { ip: host, family: 6 };
 }
 
@@ -114,12 +144,15 @@ export function isPrivateAddress(ipRaw: string): boolean {
 
   if (family === 4) return V4_BLOCKED.some(c => inV4Range(ip, c));
 
-  const v6 = ip;
-  if (v6 === '::' || v6 === '::1') return true;                 // unspecified, loopback
-  if (/^f[cd][0-9a-f]{2}:/.test(v6)) return true;               // fc00::/7 unique-local
-  if (/^fe[89ab][0-9a-f]:/.test(v6)) return true;               // fe80::/10 link-local
-  if (/^ff[0-9a-f]{2}:/.test(v6)) return true;                  // ff00::/8 multicast
-  if (/^(64:ff9b|2002):/.test(v6)) return true;                 // NAT64 / 6to4 translation
+  const g = expandIPv6(ip);
+  if (!g) return true;                                              // isIP said IPv6 but it will not parse: refuse
+  if (zeroThrough(g, 7) && g[7] <= 1) return true;                  // :: unspecified, ::1 loopback
+  if ((g[0] & 0xfe00) === 0xfc00) return true;                      // fc00::/7 unique-local
+  if ((g[0] & 0xffc0) === 0xfe80) return true;                      // fe80::/10 link-local
+  if ((g[0] & 0xff00) === 0xff00) return true;                      // ff00::/8 multicast
+  if (g[0] === 0x64 && g[1] === 0xff9b) return true;                // 64:ff9b::/96 NAT64
+  if (g[0] === 0x2002) return true;                                 // 2002::/16 6to4
+  if (g[0] === 0x2001 && g[1] === 0xdb8) return true;               // 2001:db8::/32 documentation
   return false;
 }
 

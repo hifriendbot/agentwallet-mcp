@@ -235,7 +235,12 @@ export interface LocalSendResult {
  */
 const decimalsCache = new Map<string, number>();
 
-async function resolveTokenDecimals(chainId: number, token: Address): Promise<number> {
+/**
+ * Decimals for `token`: the trusted registry, then the contract's own
+ * decimals() (cached on success). Null when the address does not answer like
+ * an ERC-20 at all, which is how the guard tells a token from a router.
+ */
+async function probeTokenDecimals(chainId: number, token: Address): Promise<number | null> {
   const known = lookupTrustedDecimals(chainId, token);
   if (typeof known === 'number') return known;
 
@@ -258,12 +263,43 @@ async function resolveTokenDecimals(chainId: number, token: Address): Promise<nu
       return d;
     }
   } catch {
-    // Unreachable RPC, non-standard token, anything at all: fall through to 0.
+    // Unreachable RPC, non-standard token, not a token at all.
   }
-  return 0;
+  return null;
 }
 
-async function assertWithinTokenCap(chainId: number, token: Address, data: Hex) {
+async function resolveTokenDecimals(chainId: number, token: Address): Promise<number> {
+  return (await probeTokenDecimals(chainId, token)) ?? 0;
+}
+
+/** Canonical Permit2, the same address on every EVM chain it is deployed to. */
+const PERMIT2 = '0x000000000022d473030f116ddee9f6b43ac78ba3';
+
+/**
+ * Calls the token cap knows how to price: which calldata word holds the
+ * amount, and (for Permit2) which holds the token, since there `to` is
+ * Permit2 itself rather than the token.
+ */
+type CapLayout = { amountIndex: number; tokenIndex?: number; what: string };
+const CAP_LAYOUTS: Record<string, CapLayout> = {
+  a9059cbb: { amountIndex: 1, what: 'token transfer' },                        // transfer(address,uint256)
+  '23b872dd': { amountIndex: 2, what: 'token transfer' },                      // transferFrom(address,address,uint256)
+  '095ea7b3': { amountIndex: 1, what: 'approval' },                            // approve(address,uint256)
+  '39509351': { amountIndex: 1, what: 'allowance increase' },                  // increaseAllowance(address,uint256)
+  '87517c45': { amountIndex: 2, tokenIndex: 0, what: 'Permit2 approval' },     // Permit2.approve(address,address,uint160,uint48)
+};
+
+/**
+ * The selector table used to be an allowlist that returned early for anything
+ * it did not recognise, so `increaseAllowance`, a direct Permit2 `approve`, or
+ * any other function on a token contract went through uncapped while the guard
+ * reported nothing. Reported privately 2026-09-25. Now: priced calls are
+ * checked, and unpriced calldata aimed at a token contract or at Permit2 is
+ * refused, because any state change there can move funds. Calls to other
+ * contracts (routers, bridges) still pass: they can only pull what an approval
+ * already allowed, and approvals are what this guard bounds.
+ */
+async function assertWithinTokenCap(chainId: number, to: Address, data: Hex) {
   const cap = (process.env.AGENTWALLET_MAX_TX_TOKEN || '').trim();
   if (!cap) return;
   if (!/^\d+(\.\d+)?$/.test(cap)) {
@@ -272,23 +308,43 @@ async function assertWithinTokenCap(chainId: number, token: Address, data: Hex) 
 
   const hex = data.slice(2);
   const selector = hex.slice(0, 8).toLowerCase();
-  // transfer(address,uint256) | approve(address,uint256) | transferFrom(address,address,uint256)
-  const layouts: Record<string, number> = { a9059cbb: 1, '095ea7b3': 1, '23b872dd': 2 };
-  const argIndex = layouts[selector];
-  if (argIndex === undefined) return; // not a value-moving ERC-20 call
+  const isPermit2 = to.toLowerCase() === PERMIT2;
+  const layout = CAP_LAYOUTS[selector];
+  const priced = layout && (layout.tokenIndex === undefined || isPermit2);
 
-  const word = hex.slice(8 + argIndex * 64, 8 + (argIndex + 1) * 64);
+  if (!priced) {
+    if (process.env.AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS === '1') return;
+    const looksLikeToken = isPermit2 || (await probeTokenDecimals(chainId, to)) !== null;
+    if (looksLikeToken) {
+      throw new Error(
+        `Blocked by local guard: calldata selector 0x${selector} sent to ` +
+        `${isPermit2 ? 'Permit2' : 'a token contract'} is not one AGENTWALLET_MAX_TX_TOKEN can price, ` +
+        `so it is refused rather than let through uncapped. Use transfer, transferFrom, approve, ` +
+        `increaseAllowance or Permit2 approve, or set AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS=1 to allow it deliberately.`
+      );
+    }
+    return; // an ordinary contract call; it can only pull what an approval already allowed
+  }
+
+  const wordAt = (i: number) => hex.slice(8 + i * 64, 8 + (i + 1) * 64);
+  const word = wordAt(layout.amountIndex);
   if (word.length !== 64) return; // malformed; leave it to the node to reject
   const amount = BigInt('0x' + word);
+
+  let token = to;
+  if (layout.tokenIndex !== undefined) {
+    const tw = wordAt(layout.tokenIndex);
+    if (tw.length !== 64) return;
+    token = ('0x' + tw.slice(24)) as Address;
+  }
 
   const decimals = await resolveTokenDecimals(chainId, token);
   const [whole, frac = ''] = cap.split('.');
   const capRaw = BigInt(whole + frac.padEnd(decimals, '0').slice(0, decimals));
 
   if (amount > capRaw) {
-    const what = selector === '095ea7b3' ? 'approval' : 'token transfer';
     throw new Error(
-      `Blocked by local guard: ${what} of ${amount} base units exceeds ` +
+      `Blocked by local guard: ${layout.what} of ${amount} base units exceeds ` +
       `AGENTWALLET_MAX_TX_TOKEN (${cap}, evaluated at ${decimals} decimals). ` +
       `Raise the cap deliberately if this is intended.`
     );

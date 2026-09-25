@@ -62,7 +62,23 @@ for (const ip of ['8.8.8.8', '1.1.1.1', '172.32.0.1', '100.128.0.1', '2606:4700:
   t(`public: ${ip}`, () => assert.equal(isPrivateAddress(ip), false));
 }
 
+console.log('\nssrf-guard: IPv4-compatible and uncompressed spellings (2026-09-25 report)');
+t('unwraps ::7f00:1 (IPv4-compatible, hex)', () => assert.equal(canonicalizeHost('[::7f00:1]').ip, '127.0.0.1'));
+t('unwraps ::127.0.0.1 (IPv4-compatible, dotted)', () => assert.equal(canonicalizeHost('[::127.0.0.1]').ip, '127.0.0.1'));
+t('unwraps the uncompressed spelling 0:0:0:0:0:0:7f00:1', () => assert.equal(canonicalizeHost('[0:0:0:0:0:0:7f00:1]').ip, '127.0.0.1'));
+t('unwraps the uncompressed mapped spelling 0:0:0:0:0:ffff:7f00:1', () => assert.equal(canonicalizeHost('[0:0:0:0:0:ffff:7f00:1]').ip, '127.0.0.1'));
+t('unwraps ::ffff:0:127.0.0.1 (IPv4-translated)', () => assert.equal(canonicalizeHost('[::ffff:0:127.0.0.1]').ip, '127.0.0.1'));
+t('is case-insensitive: ::FFFF:7F00:1', () => assert.equal(canonicalizeHost('[::FFFF:7F00:1]').ip, '127.0.0.1'));
+t('leaves ::1 as IPv6 loopback, not 0.0.0.1', () => assert.equal(canonicalizeHost('[::1]').family, 6));
+for (const ip of ['::7f00:1', '::127.0.0.1', '0:0:0:0:0:0:7f00:1', '::ffff:0:7f00:1', '::a9fe:a9fe', '::2', '2001:db8::1', 'FD00::1']) {
+  t(`private: ${ip}`, () => assert.equal(isPrivateAddress(ip), true));
+}
+t('public: ::8.8.8.8 (compatible form of a public address)', () => assert.equal(isPrivateAddress('::8.8.8.8'), false));
+
 console.log('\nssrf-guard: assertPublicUrl');
+await ta('rejects the reported IPv4-compatible loopback', () => rejects('https://[::7f00:1]/'));
+await ta('rejects cloud metadata via IPv4-compatible IPv6', () => rejects('https://[::a9fe:a9fe]/latest/meta-data/'));
+await ta('rejects loopback in uncompressed IPv6 spelling', () => rejects('https://[0:0:0:0:0:0:7f00:1]/'));
 await ta('rejects the reported IPv4-mapped IPv6 loopback', () => rejects('https://[::ffff:127.0.0.1]:18443/'));
 await ta('rejects cloud metadata via IPv4-mapped IPv6', () => rejects('https://[::ffff:169.254.169.254]/latest/meta-data/'));
 await ta('rejects plain loopback', () => rejects('https://127.0.0.1/'));

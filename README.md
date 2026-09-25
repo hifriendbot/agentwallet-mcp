@@ -43,7 +43,7 @@ Use `AGENTWALLET_KEYFILE=/path/to/key` instead if you would rather keep the key 
 
 `AGENTWALLET_MAX_TX_NATIVE` is a per-transaction ceiling in native units (ETH, MATIC and so on). In hosted mode the server enforces limits; in local mode there is no server, so these guards are the only ones there are. Set them.
 
-`AGENTWALLET_MAX_TX_TOKEN` is the equivalent ceiling for ERC-20 movement, in human units of the token. **Set this one too if you hold stablecoins.** The native cap cannot see a token transfer: an ERC-20 send carries `value = 0` with the amount in the calldata, so `AGENTWALLET_MAX_TX_NATIVE` alone leaves a USDC balance uncapped. `AGENTWALLET_MAX_TX_TOKEN` covers `transfer`, `transferFrom` and `approve`, the last because an unbounded allowance is a drain waiting to happen. Decimals are resolved locally; unknown tokens are evaluated at 6 decimals, the tightest common value, so it fails closed rather than open.
+`AGENTWALLET_MAX_TX_TOKEN` is the equivalent ceiling for ERC-20 movement, in human units of the token. **Set this one too if you hold stablecoins.** The native cap cannot see a token transfer: an ERC-20 send carries `value = 0` with the amount in the calldata, so `AGENTWALLET_MAX_TX_NATIVE` alone leaves a USDC balance uncapped. `AGENTWALLET_MAX_TX_TOKEN` covers `transfer`, `transferFrom`, `approve`, `increaseAllowance` and Permit2 `approve`, the approvals because an unbounded allowance is a drain waiting to happen. Any other calldata sent to a token contract or to Permit2 is refused while the cap is set, because the guard cannot price it; set `AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS=1` to allow such calls deliberately. Calls to other contracts (routers, bridges) pass, since they can only pull what an approval already allowed. Decimals are resolved locally from the trusted registry, then the token's own `decimals()`; a token that resolves neither way is evaluated at 0 decimals, the only value that cannot fail open.
 
 ### Solana local signing
 
@@ -327,7 +327,8 @@ Which guards apply depends on who holds the key.
 **Local mode** (you hold the key): there is no server in the signing path, so the server-side limits and pause above cannot see or stop a locally signed transaction, and nobody (including us) can freeze a local wallet. Your protection is the per-transaction caps enforced inside your own process before anything is signed. Set them before you fund the wallet; an unset cap means no limit.
 
 - `AGENTWALLET_MAX_TX_NATIVE`: ceiling per transaction in native units (ETH, MATIC, and so on)
-- `AGENTWALLET_MAX_TX_TOKEN`: ceiling per ERC-20 transfer, in human units of the token
+- `AGENTWALLET_MAX_TX_TOKEN`: ceiling per ERC-20 transfer or approval, in human units of the token
+- `AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS`: set to `1` to let calldata the token cap cannot price reach a token contract or Permit2 (refused by default while the cap is set)
 - `AGENTWALLET_MAX_TX_SOL`: ceiling per SOL or SPL transfer
 - `AGENTWALLET_MAX_AUTOPAY`: ceiling per x402 auto-payment (default `1`)
 
