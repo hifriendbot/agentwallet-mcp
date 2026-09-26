@@ -23,6 +23,12 @@ import {
   encodeFunctionData,
   parseAbi,
   formatUnits,
+  BaseError,
+  ContractFunctionZeroDataError,
+  ContractFunctionRevertedError,
+  ExecutionRevertedError,
+  AbiDecodingDataSizeTooSmallError,
+  AbiDecodingDataSizeInvalidError,
   type Address,
   type Hex,
 } from 'viem';
@@ -236,11 +242,30 @@ export interface LocalSendResult {
 const decimalsCache = new Map<string, number>();
 
 /**
- * Decimals for `token`: the trusted registry, then the contract's own
- * decimals() (cached on success). Null when the address does not answer like
- * an ERC-20 at all, which is how the guard tells a token from a router.
+ * What a decimals() probe learned about an address. The four outcomes are
+ * kept apart on purpose: only `not-a-token` may ever reach an allow branch.
+ *
+ * - a number: the contract answered decimals() with a usable value
+ * - `unusable`: it answered, but with a value no real token has (outside
+ *   0..36) or data that does not decode; it IS a contract that implements
+ *   decimals(), so treat it as a token and price nothing on trust
+ * - `not-a-token`: the call reverted or returned no data, which is how a
+ *   router, bridge or plain account answers
+ * - `unreachable`: the RPC failed, so nothing is known either way
+ *
+ * Reported privately 2026-09-26: the previous shape collapsed `unusable` and
+ * `unreachable` into the same null as `not-a-token`, so a token whose
+ * decimals() returned 77 was classified as "not a token" and unpriced
+ * calldata to it went through the cap unrefused. Byte-identical contracts
+ * differing only in that immutable were blocked (18) and sent (77).
  */
-async function probeTokenDecimals(chainId: number, token: Address): Promise<number | null> {
+type DecimalsProbe = number | 'unusable' | 'not-a-token' | 'unreachable';
+
+/**
+ * Decimals for `token`: the trusted registry, then the contract's own
+ * decimals() (cached on success). See DecimalsProbe for the other outcomes.
+ */
+async function probeTokenDecimals(chainId: number, token: Address): Promise<DecimalsProbe> {
   const known = lookupTrustedDecimals(chainId, token);
   if (typeof known === 'number') return known;
 
@@ -248,28 +273,49 @@ async function probeTokenDecimals(chainId: number, token: Address): Promise<numb
   const cached = decimalsCache.get(key);
   if (typeof cached === 'number') return cached;
 
+  let onChain: number | bigint;
   try {
     const { pub } = clients(chainId);
-    const onChain = await pub.readContract({
+    onChain = await pub.readContract({
       address: token,
       abi: ERC20_ABI,
       functionName: 'decimals',
     }) as number | bigint;
-    const d = Number(onChain);
-    // Reject nonsense rather than trusting it; an out-of-range value would
-    // widen the ceiling exactly like the old assumption did.
-    if (Number.isInteger(d) && d >= 0 && d <= 36) {
-      decimalsCache.set(key, d);
-      return d;
-    }
-  } catch {
-    // Unreachable RPC, non-standard token, not a token at all.
+  } catch (err) {
+    // viem wraps every readContract failure in ContractFunctionExecutionError;
+    // the cause says whether the contract itself declined (revert, empty
+    // return: not an ERC-20) or the answer never arrived (RPC down, timeout,
+    // malformed response). Only the first is evidence of anything.
+    const declined = err instanceof BaseError && err.walk(
+      (e) => e instanceof ContractFunctionZeroDataError
+        || e instanceof ContractFunctionRevertedError
+        || e instanceof ExecutionRevertedError // nodes that report a revert as -32000 rather than 3
+    ) !== null;
+    if (declined) return 'not-a-token';
+    // A decode failure on non-empty data means the contract answered
+    // decimals() with something that is not a uint8: a token, just a broken one.
+    const decodeFailed = err instanceof BaseError && err.walk(
+      (e) => e instanceof AbiDecodingDataSizeTooSmallError || e instanceof AbiDecodingDataSizeInvalidError
+    ) !== null;
+    return decodeFailed ? 'unusable' : 'unreachable';
   }
-  return null;
+  const d = Number(onChain);
+  // Reject nonsense rather than trusting it; an out-of-range value would
+  // widen the ceiling exactly like the old assumption did.
+  if (Number.isInteger(d) && d >= 0 && d <= 36) {
+    decimalsCache.set(key, d);
+    return d;
+  }
+  return 'unusable';
 }
 
+/**
+ * Decimals to price a known transfer or approval at. Anything short of a
+ * usable answer is evaluated at 0, the only value that cannot fail open.
+ */
 async function resolveTokenDecimals(chainId: number, token: Address): Promise<number> {
-  return (await probeTokenDecimals(chainId, token)) ?? 0;
+  const probe = await probeTokenDecimals(chainId, token);
+  return typeof probe === 'number' ? probe : 0;
 }
 
 /** Canonical Permit2, the same address on every EVM chain it is deployed to. */
@@ -314,13 +360,19 @@ async function assertWithinTokenCap(chainId: number, to: Address, data: Hex) {
 
   if (!priced) {
     if (process.env.AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS === '1') return;
-    const looksLikeToken = isPermit2 || (await probeTokenDecimals(chainId, to)) !== null;
-    if (looksLikeToken) {
+    // Only a contract that demonstrably declines decimals() is let through.
+    // "Answered nonsense" and "could not ask" both refuse: the first is a
+    // token with a broken or hostile decimals(), the second is no evidence at
+    // all, and this guard does not allow on no evidence (2026-09-26 report).
+    const probe: DecimalsProbe = isPermit2 ? 'unusable' : await probeTokenDecimals(chainId, to);
+    if (probe !== 'not-a-token') {
+      const why = probe === 'unreachable'
+        ? `the RPC for chain ${chainId} could not be reached to classify the target, so the guard cannot tell a token from a router`
+        : `the target is ${isPermit2 ? 'Permit2' : 'a token contract'} and this calldata is not one AGENTWALLET_MAX_TX_TOKEN can price`;
       throw new Error(
-        `Blocked by local guard: calldata selector 0x${selector} sent to ` +
-        `${isPermit2 ? 'Permit2' : 'a token contract'} is not one AGENTWALLET_MAX_TX_TOKEN can price, ` +
-        `so it is refused rather than let through uncapped. Use transfer, transferFrom, approve, ` +
-        `increaseAllowance or Permit2 approve, or set AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS=1 to allow it deliberately.`
+        `Blocked by local guard: calldata selector 0x${selector} refused rather than let through uncapped: ${why}. ` +
+        `Use transfer, transferFrom, approve, increaseAllowance or Permit2 approve, ` +
+        `or set AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS=1 to allow it deliberately.`
       );
     }
     return; // an ordinary contract call; it can only pull what an approval already allowed
