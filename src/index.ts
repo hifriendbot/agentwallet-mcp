@@ -34,6 +34,7 @@ import {
   resolveRpcUrl,
 } from './local-wallet.js';
 import { localSignAuthorization, localEthCall, localGetCode, localSignPermit2Upto } from './local-wallet.js';
+import { WRAPPED_NATIVE } from './wrapped-native.js';
 import {
   buildUptoAuthorization, uptoPayload, permit2AllowanceCalldata, permit2ApproveCalldata, decodeUint, PERMIT2_ADDRESS,
   type UptoPermit2Authorization,
@@ -603,7 +604,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.12.5',
+    version: '1.12.6',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. Private keys are encrypted server-side and never exposed — agents sign and broadcast transactions without ever touching raw keys.
@@ -1093,17 +1094,6 @@ server.tool(
 
 // ─── WETH / Wrapped Native Token addresses ──────────────────────
 
-const WRAPPED_NATIVE: Record<number, { address: string; symbol: string }> = {
-  1:       { address: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', symbol: 'WETH' },
-  8453:    { address: '0x4200000000000000000000000000000000000006', symbol: 'WETH' },
-  42161:   { address: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1', symbol: 'WETH' },
-  10:      { address: '0x4200000000000000000000000000000000000006', symbol: 'WETH' },
-  137:     { address: '0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270', symbol: 'WPOL' },
-  56:      { address: '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c', symbol: 'WBNB' },
-  43114:   { address: '0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7', symbol: 'WAVAX' },
-  7777777: { address: '0x4200000000000000000000000000000000000006', symbol: 'WETH' },
-  369:     { address: '0xA1077a294dDE1B09bB078844df40758a5D0f9a27', symbol: 'WPLS' },
-};
 
 // ─── Tool: wrap_eth ─────────────────────────────────────────────
 

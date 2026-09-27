@@ -129,6 +129,34 @@ await notGuardBlocked(
   'allows unpriced calldata to a non-token contract (it can only pull what was approved)',
   '0x4200000000000000000000000000000000000016', '0x12345678' + '0'.repeat(128) // Base L2ToL1MessagePasser, no decimals()
 );
+// 2026-09-27 report: wrap_eth / unwrap_eth build WETH deposit() / withdraw(uint256)
+// calldata, neither of which the cap could price, so both tools were refused
+// whenever AGENTWALLET_MAX_TX_TOKEN was set and the only escape was
+// AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS=1, a global weakening of the guard.
+const WETH = '0x4200000000000000000000000000000000000006'; // Base WETH
+const DEPOSIT = '0xd0e30db0';
+const withdraw = (wei) => '0x2e1a7d4d' + wei.toString(16).padStart(64, '0');
+await notGuardBlocked('allows unwrap_eth of 0.5 WETH under a cap of 1', WETH, withdraw(500000000000000000n));
+await blockedRaw('blocks unwrap_eth of 2 WETH against a cap of 1', WETH, withdraw(2000000000000000000n), /unwrap .* exceeds/);
+{
+  let guardBlocked = false;
+  try { await localSend(8453, WETH, 500000000000000000n, DEPOSIT); }
+  catch (e) { guardBlocked = /AGENTWALLET_MAX_TX_TOKEN|Blocked by local guard/.test(e.message); }
+  assert.strictEqual(guardBlocked, false, 'wrap_eth of 0.5 ETH must pass a cap of 1');
+  passed++;
+  console.log('  ok - allows wrap_eth of 0.5 ETH under a cap of 1');
+}
+try {
+  await localSend(8453, WETH, 2000000000000000000n, DEPOSIT);
+  throw new Error('expected the guard to block a 2 ETH wrap');
+} catch (e) {
+  assert.match(e.message, /wrap of native .* exceeds/, `unexpected error "${e.message}"`);
+  passed++;
+  console.log('  ok - blocks wrap_eth of 2 ETH against a cap of 1 (priced by msg.value)');
+}
+await blockedRaw('still refuses withdraw(uint256) aimed at a token that is not the wrapped native', USDC, withdraw(1n), /not one AGENTWALLET_MAX_TX_TOKEN can price/);
+await blockedRaw('still refuses deposit() aimed at a token that is not the wrapped native', USDC, DEPOSIT, /not one AGENTWALLET_MAX_TX_TOKEN can price/);
+
 process.env.AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS = '1';
 await notGuardBlocked(
   'AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS=1 lets unpriced token calldata through deliberately',

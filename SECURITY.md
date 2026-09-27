@@ -18,6 +18,7 @@ We pay for real findings in USDC on Base, per the tiers published at https://hif
 | 2026-08-12 | Medium | `upto` scheme settled as a full upfront transfer (overcharge relative to usage) | 1.11.0 refuses `upto`; 1.12.0 signs it correctly through Permit2 |
 | 2026-08-19 | High (functional) | `exact` scheme sent a broadcast transfer instead of an EIP-3009 authorization; standard servers rejected every payment | 1.11.0: EIP-3009 `TransferWithAuthorization`, verified against Coinbase's facilitator and settled live on Base |
 | 2026-09-26 | Medium | Token cap let unpriced calldata through when the target's `decimals()` answered outside 0..36: the probe reported "absurd answer" and "no answer" with the same null, and only "no answer" was meant to pass | 1.12.5: the probe reports usable, unusable, not-a-token and unreachable separately; only a contract that demonstrably declines `decimals()` passes, an unreachable RPC refuses, regression test with a mock RPC |
+| 2026-09-27 | Low | With `AGENTWALLET_MAX_TX_TOKEN` set in local mode, `wrap_eth` and `unwrap_eth` were refused by the token cap (WETH `deposit()` / `withdraw(uint256)` are unpriced calldata to a token contract) and the only way to restore them was `AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS=1`, which weakens the guard for every call | 1.12.6: the cap prices `deposit()` by the native value sent and `withdraw(uint256)` at 18 decimals when the target is the chain's own wrapped-native contract; the same selectors on any other token stay refused; regression tests |
 
 ## What the code guarantees
 

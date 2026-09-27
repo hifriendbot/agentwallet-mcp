@@ -34,6 +34,7 @@ import {
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { lookupTrustedDecimals } from './x402-payment.js';
+import { wrappedNativeAddress } from './wrapped-native.js';
 import { typedDataFor, type Eip3009Authorization } from './x402-eip3009.js';
 import { uptoTypedData, type UptoPermit2Authorization } from './x402-permit2.js';
 
@@ -326,13 +327,18 @@ const PERMIT2 = '0x000000000022d473030f116ddee9f6b43ac78ba3';
  * amount, and (for Permit2) which holds the token, since there `to` is
  * Permit2 itself rather than the token.
  */
-type CapLayout = { amountIndex: number; tokenIndex?: number; what: string };
+type CapLayout = { amountIndex: number; tokenIndex?: number; what: string; wrappedNativeOnly?: boolean };
 const CAP_LAYOUTS: Record<string, CapLayout> = {
   a9059cbb: { amountIndex: 1, what: 'token transfer' },                        // transfer(address,uint256)
   '23b872dd': { amountIndex: 2, what: 'token transfer' },                      // transferFrom(address,address,uint256)
   '095ea7b3': { amountIndex: 1, what: 'approval' },                            // approve(address,uint256)
   '39509351': { amountIndex: 1, what: 'allowance increase' },                  // increaseAllowance(address,uint256)
   '87517c45': { amountIndex: 2, tokenIndex: 0, what: 'Permit2 approval' },     // Permit2.approve(address,address,uint160,uint48)
+  // WETH9 calls, priced only when `to` is the chain's own wrapped-native
+  // contract (wrappedNativeOnly). deposit() carries its amount as msg.value,
+  // not in calldata, hence amountIndex -1; withdraw(uint256) has it at word 0.
+  d0e30db0: { amountIndex: -1, what: 'wrap of native into the wrapped token', wrappedNativeOnly: true }, // deposit()
+  '2e1a7d4d': { amountIndex: 0, what: 'unwrap of the wrapped token', wrappedNativeOnly: true },         // withdraw(uint256)
 };
 
 /**
@@ -344,8 +350,15 @@ const CAP_LAYOUTS: Record<string, CapLayout> = {
  * refused, because any state change there can move funds. Calls to other
  * contracts (routers, bridges) still pass: they can only pull what an approval
  * already allowed, and approvals are what this guard bounds.
+ *
+ * Reported privately 2026-09-27: that refusal also caught our own wrap_eth and
+ * unwrap_eth, whose WETH deposit() / withdraw(uint256) calldata was unpriced,
+ * so both tools died the moment the cap was set and the only way back was
+ * AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS=1, which weakens the guard for every
+ * call. Now both are priced, but only on the chain's own wrapped-native
+ * contract; the same selectors on any other token stay refused.
  */
-async function assertWithinTokenCap(chainId: number, to: Address, data: Hex) {
+async function assertWithinTokenCap(chainId: number, to: Address, data: Hex, valueWei = 0n) {
   const cap = (process.env.AGENTWALLET_MAX_TX_TOKEN || '').trim();
   if (!cap) return;
   if (!/^\d+(\.\d+)?$/.test(cap)) {
@@ -356,7 +369,10 @@ async function assertWithinTokenCap(chainId: number, to: Address, data: Hex) {
   const selector = hex.slice(0, 8).toLowerCase();
   const isPermit2 = to.toLowerCase() === PERMIT2;
   const layout = CAP_LAYOUTS[selector];
-  const priced = layout && (layout.tokenIndex === undefined || isPermit2);
+  const isWrappedNative = to.toLowerCase() === wrappedNativeAddress(chainId);
+  const priced = layout
+    && (layout.tokenIndex === undefined || isPermit2)
+    && (!layout.wrappedNativeOnly || isWrappedNative);
 
   if (!priced) {
     if (process.env.AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS === '1') return;
@@ -371,7 +387,8 @@ async function assertWithinTokenCap(chainId: number, to: Address, data: Hex) {
         : `the target is ${isPermit2 ? 'Permit2' : 'a token contract'} and this calldata is not one AGENTWALLET_MAX_TX_TOKEN can price`;
       throw new Error(
         `Blocked by local guard: calldata selector 0x${selector} refused rather than let through uncapped: ${why}. ` +
-        `Use transfer, transferFrom, approve, increaseAllowance or Permit2 approve, ` +
+        `Use transfer, transferFrom, approve, increaseAllowance, Permit2 approve, ` +
+        `or deposit/withdraw on the chain's wrapped-native contract, ` +
         `or set AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS=1 to allow it deliberately.`
       );
     }
@@ -379,9 +396,14 @@ async function assertWithinTokenCap(chainId: number, to: Address, data: Hex) {
   }
 
   const wordAt = (i: number) => hex.slice(8 + i * 64, 8 + (i + 1) * 64);
-  const word = wordAt(layout.amountIndex);
-  if (word.length !== 64) return; // malformed; leave it to the node to reject
-  const amount = BigInt('0x' + word);
+  let amount: bigint;
+  if (layout.amountIndex < 0) {
+    amount = valueWei; // deposit(): what gets wrapped is the native value sent along
+  } else {
+    const word = wordAt(layout.amountIndex);
+    if (word.length !== 64) return; // malformed; leave it to the node to reject
+    amount = BigInt('0x' + word);
+  }
 
   let token = to;
   if (layout.tokenIndex !== undefined) {
@@ -390,7 +412,9 @@ async function assertWithinTokenCap(chainId: number, to: Address, data: Hex) {
     token = ('0x' + tw.slice(24)) as Address;
   }
 
-  const decimals = await resolveTokenDecimals(chainId, token);
+  // Every wrapped native in the table is a WETH9 clone with 18 decimals, the
+  // same figure wrap_eth and unwrap_eth encode with; no RPC needed to price it.
+  const decimals = layout.wrappedNativeOnly ? 18 : await resolveTokenDecimals(chainId, token);
   const [whole, frac = ''] = cap.split('.');
   const capRaw = BigInt(whole + frac.padEnd(decimals, '0').slice(0, decimals));
 
@@ -410,7 +434,7 @@ export async function localSend(
   data?: Hex
 ): Promise<LocalSendResult> {
   assertWithinNativeCap(valueWei);
-  if (data && data.length >= 10) await assertWithinTokenCap(chainId, to, data);
+  if (data && data.length >= 10) await assertWithinTokenCap(chainId, to, data, valueWei);
   const { wallet } = clients(chainId);
   const hash = await wallet.sendTransaction({
     to,
