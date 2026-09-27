@@ -47,7 +47,10 @@ function parseSolanaKey(raw: string): Keypair {
   const text = raw.trim();
 
   if (text.startsWith('[')) {
-    const arr = JSON.parse(text);
+    let arr: unknown;
+    // JSON.parse quotes the offending source in its message, which for a key
+    // array means key bytes; replace it with a fixed message.
+    try { arr = JSON.parse(text); } catch { throw new Error('Solana key JSON did not parse (expected a JSON array of 64 numbers).'); }
     if (!Array.isArray(arr) || arr.length < 64) {
       throw new Error('Solana key JSON must be an array of at least 64 bytes.');
     }
@@ -115,6 +118,8 @@ const DEFAULT_SOLANA_RPC: Record<number, string> = {
 };
 
 export function resolveSolanaRpc(chainId = 900): string {
+  const perChain = (process.env[`AGENTWALLET_SOLANA_RPC_${chainId}`] || '').trim();
+  if (perChain) return perChain;
   const explicit = (process.env.AGENTWALLET_SOLANA_RPC || '').trim();
   if (explicit) return explicit;
   const fallback = DEFAULT_SOLANA_RPC[chainId];
@@ -124,6 +129,34 @@ export function resolveSolanaRpc(chainId = 900): string {
 
 function connection(chainId = 900): Connection {
   return new Connection(resolveSolanaRpc(chainId), 'confirmed');
+}
+
+/** Genesis hashes of the public clusters, so a chain id can be checked against what the RPC actually serves. */
+const CLUSTER_GENESIS: Record<number, string> = {
+  900: '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d', // mainnet-beta
+  901: 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG', // devnet
+  902: '4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY', // testnet
+};
+const verifiedClusters = new Map<string, string>();
+
+/**
+ * One AGENTWALLET_SOLANA_RPC used to answer every chain id, so a chain_id 901
+ * "test" transfer ran on whatever cluster the URL pointed at and the result
+ * echoed 901. Now the RPC's genesis hash is checked once per URL.
+ */
+async function assertCluster(conn: Connection, chainId: number): Promise<void> {
+  const expected = CLUSTER_GENESIS[chainId];
+  if (!expected) return; // a private cluster the operator configured on purpose
+  const url = conn.rpcEndpoint;
+  let actual = verifiedClusters.get(url);
+  if (!actual) {
+    actual = await conn.getGenesisHash();
+    verifiedClusters.set(url, actual);
+  }
+  if (actual !== expected) {
+    const served = Object.entries(CLUSTER_GENESIS).find(([, h]) => h === actual)?.[0] ?? 'an unknown cluster';
+    throw new Error(`Solana RPC for chain ${chainId} serves ${served} (genesis ${actual.slice(0, 8)}...), not chain ${chainId}. Set AGENTWALLET_SOLANA_RPC_${chainId}.`);
+  }
 }
 
 /* ── Guards ──────────────────────────────────────────────────────── */
@@ -162,10 +195,11 @@ function assertWithinSolCap(lamports: bigint) {
 const splDecimalsCache = new Map<string, number>();
 
 async function resolveMintDecimals(mint: string, chainId: number): Promise<number> {
-  const known = lookupTrustedDecimals(900, mint);
+  const known = lookupTrustedDecimals(chainId, mint);
   if (typeof known === 'number') return known;
 
-  const cached = splDecimalsCache.get(mint);
+  const cacheKey = `${chainId}:${mint}`; // the same mint address can exist on two clusters with different decimals
+  const cached = splDecimalsCache.get(cacheKey);
   if (typeof cached === 'number') return cached;
 
   try {
@@ -174,7 +208,7 @@ async function resolveMintDecimals(mint: string, chainId: number): Promise<numbe
     const data: any = info?.value?.data;
     const d = Number(data?.parsed?.info?.decimals);
     if (Number.isInteger(d) && d >= 0 && d <= 36) {
-      splDecimalsCache.set(mint, d);
+      splDecimalsCache.set(cacheKey, d);
       return d;
     }
   } catch {
@@ -274,6 +308,8 @@ export async function localSolTransfer(to: string, lamports: string, chainId = 9
   }
 
   const conn = connection(chainId);
+  await assertCluster(conn, chainId);
+  await assertRecipientIsWallet(conn, new PublicKey(to));
   const payer = getSolanaKeypair();
   const tx = new Transaction().add(
     SystemProgram.transfer({
@@ -359,10 +395,15 @@ export async function localSplTransfer(
   await assertWithinSplCap(mintStr, BigInt(rawAmount), chainId);
 
   const conn = connection(chainId);
+  await assertCluster(conn, chainId);
   const payer = getSolanaKeypair();
   const mint = new PublicKey(mintStr);
   const recipient = new PublicKey(to);
+  await assertRecipientIsWallet(conn, recipient);
   const tokenProgram = await tokenProgramFor(conn, mint);
+  // The instruction's decimals byte is the mint's real value, not whatever the
+  // caller passed; TransferChecked would reject a wrong one on-chain anyway.
+  decimals = await resolveMintDecimals(mintStr, chainId);
 
   const sourceAta = associatedTokenAddress(payer.publicKey, mint, tokenProgram);
   const destAta = associatedTokenAddress(recipient, mint, tokenProgram);
@@ -370,6 +411,10 @@ export async function localSplTransfer(
   const tx = new Transaction();
   const destInfo = await conn.getAccountInfo(destAta);
   if (!destInfo) {
+    // Creating the recipient's token account costs the payer rent in SOL, an
+    // outflow the SOL cap must see (0.002 SOL a time adds up over many sends).
+    const rent = await conn.getMinimumBalanceForRentExemption(TOKEN_ACCOUNT_SIZE);
+    assertWithinSolCap(BigInt(rent));
     tx.add(createAtaIdempotentIx(payer.publicKey, destAta, recipient, mint, tokenProgram));
   }
   tx.add(
@@ -386,6 +431,22 @@ export async function localSplTransfer(
     mode: 'local',
     signed_locally: true,
   };
+}
+
+const TOKEN_ACCOUNT_SIZE = 165;
+
+/**
+ * A recipient must be something that can own a token account: a wallet or a
+ * program-derived wallet (Squads and friends), never a program and never a
+ * token account. SPL sent to ATA(ATA) or to a program id is gone for good.
+ */
+async function assertRecipientIsWallet(conn: Connection, recipient: PublicKey): Promise<void> {
+  const info = await conn.getAccountInfo(recipient);
+  if (!info) return; // never seen on chain: an ordinary fresh wallet
+  if (info.executable) throw new Error(`Refusing to send to ${recipient.toBase58()}: it is a program, not a wallet.`);
+  if ((info.owner.equals(TOKEN_PROGRAM) || info.owner.equals(TOKEN_2022_PROGRAM)) && info.data.length >= TOKEN_ACCOUNT_SIZE) {
+    throw new Error(`Refusing to send to ${recipient.toBase58()}: it is a token account, not a wallet. Pass the owner's wallet address instead.`);
+  }
 }
 
 export function solanaWalletRecord() {

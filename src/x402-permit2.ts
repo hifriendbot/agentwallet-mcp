@@ -9,6 +9,7 @@
  */
 import { randomBytes } from 'node:crypto';
 import type { X402Requirement } from './x402-eip3009.js';
+import { maxAuthWindowSeconds } from './x402-payment.js';
 
 export const PERMIT2_ADDRESS = '0x000000000022D473030F116dDEE9F6B43aC78BA3' as const;
 export const X402_UPTO_PERMIT2_PROXY = '0x4020A4f3b7b90ccA423B9fabCc0CE57C6C240002' as const;
@@ -68,7 +69,8 @@ export function buildUptoAuthorization(
   const amount = String(req.amount ?? req.maxAmountRequired ?? '');
   if (!/^\d+$/.test(amount)) throw new Error(`x402 upto: invalid amount "${amount}" (expected integer base units).`);
   if (!/^0x[0-9a-fA-F]{40}$/.test(req.payTo)) throw new Error(`x402 upto: payTo is not an EVM address: "${req.payTo}".`);
-  const timeout = Number.isFinite(req.maxTimeoutSeconds) && (req.maxTimeoutSeconds as number) > 0 ? Math.floor(req.maxTimeoutSeconds as number) : 300;
+  const requested = Number.isFinite(req.maxTimeoutSeconds) && (req.maxTimeoutSeconds as number) > 0 ? Math.floor(req.maxTimeoutSeconds as number) : 300;
+  const timeout = Math.min(requested, maxAuthWindowSeconds()); // see buildAuthorization
   return {
     from: from as `0x${string}`,
     permitted: { token: req.asset as `0x${string}`, amount },

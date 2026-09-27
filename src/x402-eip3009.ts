@@ -20,6 +20,7 @@
  */
 import { randomBytes } from 'node:crypto';
 import { isUptoPayable } from './x402-permit2.js';
+import { maxAuthWindowSeconds } from './x402-payment.js';
 
 export const TRANSFER_WITH_AUTHORIZATION_TYPES = {
   TransferWithAuthorization: [
@@ -111,8 +112,12 @@ export function buildAuthorization(
   const value = requiredAmount(req);
   if (!/^\d+$/.test(value)) throw new Error(`x402: invalid required amount "${value}" (expected integer base units).`);
   if (!/^0x[0-9a-fA-F]{40}$/.test(req.payTo)) throw new Error(`x402: payTo is not an EVM address: "${req.payTo}".`);
-  const timeout = Number.isFinite(req.maxTimeoutSeconds) && (req.maxTimeoutSeconds as number) > 0
+  // The server's window is honoured up to maxAuthWindowSeconds (default one
+  // hour): an authorization is a signed claim on funds, and a hostile server
+  // asking for years would otherwise hold one until the wallet is refilled.
+  const requested = Number.isFinite(req.maxTimeoutSeconds) && (req.maxTimeoutSeconds as number) > 0
     ? Math.floor(req.maxTimeoutSeconds as number) : DEFAULT_TIMEOUT_SECONDS;
+  const timeout = Math.min(requested, maxAuthWindowSeconds());
   return {
     from: from as `0x${string}`,
     to: req.payTo as `0x${string}`,

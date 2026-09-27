@@ -15,7 +15,7 @@
  * on the custodial path and say so explicitly rather than silently downgrading.
  */
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import {
   createPublicClient,
   createWalletClient,
@@ -33,7 +33,7 @@ import {
   type Hex,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import { lookupTrustedDecimals } from './x402-payment.js';
+import { lookupTrustedDecimals, maxAuthWindowSeconds } from './x402-payment.js';
 import { wrappedNativeAddress } from './wrapped-native.js';
 import { typedDataFor, type Eip3009Authorization } from './x402-eip3009.js';
 import { uptoTypedData, type UptoPermit2Authorization } from './x402-permit2.js';
@@ -54,6 +54,10 @@ function loadKeyMaterial(): string | null {
   const file = (process.env.AGENTWALLET_KEYFILE || '').trim();
   if (file) {
     try {
+      if (process.platform !== 'win32') {
+        const mode = statSync(file).mode & 0o777;
+        if (mode & 0o077) console.error(`AgentWallet MCP: warning, AGENTWALLET_KEYFILE ${file} is readable by other users (mode ${mode.toString(8)}); chmod 600 it.`);
+      }
       return readFileSync(file, 'utf8').trim();
     } catch (e) {
       keyLoadError = `Could not read AGENTWALLET_KEYFILE at ${file}: ${(e as Error).message}`;
@@ -129,6 +133,24 @@ export function resolveRpcUrl(chainId: number): string {
     `No RPC endpoint for chain ${chainId} in local mode. ` +
     `Set AGENTWALLET_RPC_${chainId} to an endpoint you trust.`
   );
+}
+
+/**
+ * Chain ids each RPC URL has been seen to serve, so an operator pointing
+ * AGENTWALLET_RPC_URL at one node for every chain, or mistyping a per-chain
+ * URL, cannot have cap pricing (decimals, token-or-router) answered by a
+ * different chain than the one the transaction or authorization is bound to.
+ */
+const verifiedRpcChains = new Map<string, number>();
+
+export async function assertRpcServesChain(chainId: number): Promise<void> {
+  const url = resolveRpcUrl(chainId);
+  const seen = verifiedRpcChains.get(url);
+  if (seen === chainId) return;
+  if (seen !== undefined) throw new Error(`RPC for chain ${chainId} (${new URL(url).origin}) serves chain ${seen}. Set AGENTWALLET_RPC_${chainId} to a node on chain ${chainId}.`);
+  const actual = await createPublicClient({ transport: http(url) }).getChainId();
+  if (actual !== chainId) throw new Error(`RPC for chain ${chainId} (${new URL(url).origin}) answers eth_chainId = ${actual}. Refusing to sign for chain ${chainId} against it; set AGENTWALLET_RPC_${chainId}.`);
+  verifiedRpcChains.set(url, actual);
 }
 
 function clients(chainId: number) {
@@ -401,14 +423,17 @@ async function assertWithinTokenCap(chainId: number, to: Address, data: Hex, val
     amount = valueWei; // deposit(): what gets wrapped is the native value sent along
   } else {
     const word = wordAt(layout.amountIndex);
-    if (word.length !== 64) return; // malformed; leave it to the node to reject
+    // A short word is not "malformed, the node will reject it": pre-0.5 Solidity
+    // (mainnet WETH9 among others) zero-pads truncated calldata and reads an
+    // amount 256x larger per missing byte. Refuse, never assume.
+    if (word.length !== 64) throw new Error(`Blocked by local guard: calldata for ${layout.what} is truncated (amount word has ${word.length / 2} bytes, expected 32).`);
     amount = BigInt('0x' + word);
   }
 
   let token = to;
   if (layout.tokenIndex !== undefined) {
     const tw = wordAt(layout.tokenIndex);
-    if (tw.length !== 64) return;
+    if (tw.length !== 64) throw new Error(`Blocked by local guard: calldata for ${layout.what} is truncated (token word has ${tw.length / 2} bytes, expected 32).`);
     token = ('0x' + tw.slice(24)) as Address;
   }
 
@@ -434,7 +459,11 @@ export async function localSend(
   data?: Hex
 ): Promise<LocalSendResult> {
   assertWithinNativeCap(valueWei);
-  if (data && data.length >= 10) await assertWithinTokenCap(chainId, to, data, valueWei);
+  if (data && data !== '0x') {
+    if (!/^0x([0-9a-fA-F]{2})*$/.test(data)) throw new Error(`Local mode refuses calldata that is not even-length 0x hex (got ${data.length} chars).`);
+    await assertWithinTokenCap(chainId, to, data, valueWei);
+  }
+  await assertRpcServesChain(chainId);
   const { wallet } = clients(chainId);
   const hash = await wallet.sendTransaction({
     to,
@@ -508,6 +537,13 @@ export function localWalletRecord() {
 
 /* ── x402 "exact": EIP-3009 authorization signed in-process ──────── */
 
+/** The builders clamp the window; this re-checks it here, where the signature is made, so no caller can hand in a longer one. */
+function assertWindow(untilSeconds: string, what: string): void {
+  if (!/^\d+$/.test(untilSeconds)) throw new Error(`x402 authorization ${what} must be an integer timestamp, got "${untilSeconds}".`);
+  const limit = BigInt(Math.floor(Date.now() / 1000) + maxAuthWindowSeconds() + 60);
+  if (BigInt(untilSeconds) > limit) throw new Error(`x402 authorization ${what} is more than ${maxAuthWindowSeconds()} seconds in the future; refusing to sign a long-lived claim on funds (AGENTWALLET_X402_MAX_TIMEOUT).`);
+}
+
 /**
  * Sign a TransferWithAuthorization for an x402 payment. Nothing is broadcast;
  * the resource server's facilitator settles it on-chain. The amount is put
@@ -523,9 +559,11 @@ export async function localSignAuthorization(
   if (!/^0x[a-fA-F0-9]{40}$/.test(asset)) throw new Error(`Local mode needs an EVM token address for x402, got "${asset}".`);
   if (!/^0x[a-fA-F0-9]{40}$/.test(auth.to)) throw new Error(`Local mode needs an EVM payTo address for x402, got "${auth.to}".`);
   if (!/^\d+$/.test(auth.value)) throw new Error(`x402 authorization value must be integer base units, got "${auth.value}".`);
+  assertWindow(auth.validBefore, 'validBefore');
   const calldata = ('0xa9059cbb'
     + auth.to.slice(2).toLowerCase().padStart(64, '0')
     + BigInt(auth.value).toString(16).padStart(64, '0')) as Hex;
+  await assertRpcServesChain(chainId);
   await assertWithinTokenCap(chainId, asset, calldata);
   const from = getLocalAddress();
   const signature = await getLocalAccount().signTypedData(typedDataFor(chainId, asset, domain.name, domain.version, { ...auth, from }));
@@ -551,7 +589,9 @@ export async function localSignPermit2Upto(chainId: number, auth: UptoPermit2Aut
   const token = auth.permitted.token;
   if (!/^0x[a-fA-F0-9]{40}$/.test(token)) throw new Error(`Local mode needs an EVM token address for x402 upto, got "${token}".`);
   if (!/^\d+$/.test(auth.permitted.amount)) throw new Error(`x402 upto amount must be integer base units, got "${auth.permitted.amount}".`);
+  assertWindow(auth.deadline, 'deadline');
   const calldata = ('0xa9059cbb' + auth.witness.to.slice(2).toLowerCase().padStart(64, '0') + BigInt(auth.permitted.amount).toString(16).padStart(64, '0')) as Hex;
+  await assertRpcServesChain(chainId);
   await assertWithinTokenCap(chainId, token, calldata);
   const from = getLocalAddress();
   const signature = await getLocalAccount().signTypedData(uptoTypedData(chainId, { ...auth, from }));

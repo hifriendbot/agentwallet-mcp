@@ -14,7 +14,7 @@ Permissionless wallet infrastructure for AI agents. Create wallets, sign transac
 | Set up | One env var, no account needed | API key |
 | Chains | EVM + Solana | EVM + Solana |
 | Can anyone freeze it | No | Yes, that is what pause is for |
-| Spend guards | `AGENTWALLET_MAX_TX_NATIVE`, `AGENTWALLET_MAX_TX_SOL`, `AGENTWALLET_MAX_AUTOPAY` | Server-side limits, pause, rate limits |
+| Spend guards | `AGENTWALLET_MAX_TX_NATIVE`, `AGENTWALLET_MAX_TX_TOKEN`, `AGENTWALLET_MAX_TX_SOL`, `AGENTWALLET_MAX_AUTOPAY` | Server-side limits, pause, rate limits |
 | Paywalls, usage, billing | Needs an API key too | Included |
 
 Run `wallet_mode` at any time and the server will tell you which one you are in, and which address it controls.
@@ -51,7 +51,8 @@ Use `AGENTWALLET_KEYFILE=/path/to/key` instead if you would rather keep the key 
 "env": {
   "AGENTWALLET_SOLANA_KEY": "[12,34...]",
   "AGENTWALLET_SOLANA_RPC": "https://your-own-rpc",
-  "AGENTWALLET_MAX_TX_SOL": "1"
+  "AGENTWALLET_MAX_TX_SOL": "1",
+  "AGENTWALLET_MAX_TX_TOKEN": "25"
 }
 ```
 
@@ -73,7 +74,7 @@ Local signing uses [viem](https://viem.sh) for EVM and `@solana/web3.js` for Sol
 
 ## Features
 
-- **31 MCP tools**: create wallets, send transactions, approve tokens, wrap ETH, transfer SPL tokens, pay and accept x402 payments, verify custody mode, and more
+- **34 MCP tools**: create wallets, send transactions, approve tokens, wrap ETH, transfer SPL tokens, pay and accept x402 payments, verify custody mode, and more
 - **EVM + Solana**: Ethereum, Base, Polygon, BSC, Arbitrum, Optimism, Avalanche, Zora, PulseChain, Solana, and any other EVM-compatible chain
 - **SOL + SPL tokens**: native SOL transfers and SPL token transfers (USDC, USDT, etc.) with automatic account creation
 - **Built-in guards**: in hosted mode, daily spending limits, gas price protection, emergency pause and rate limiting are enforced server-side by default. In local mode your protection is the per-transaction caps you set (`AGENTWALLET_MAX_TX_NATIVE`, `AGENTWALLET_MAX_TX_TOKEN`, `AGENTWALLET_MAX_TX_SOL`, `AGENTWALLET_MAX_AUTOPAY`). x402 replay protection and on-chain verification apply either way
@@ -119,7 +120,7 @@ Add to your config:
 
 > `AGENTWALLET_WALLET_ID` is optional. Set it to enable x402 auto-pay: when you exceed the free tier without a credit card, the MCP server automatically pays for operations with USDC from this wallet.
 >
-> **Auto-pay safety cap.** `AGENTWALLET_MAX_AUTOPAY` (optional, default `1`) is the maximum amount, in human-readable units of the asset, that x402 auto-pay will authorize for a single payment. Any 402 requirement above this cap is rejected instead of paid, so a malformed or tampered payment requirement cannot drain the wallet. Raise it only if you genuinely need larger automatic payments (for example `"5"` to allow up to 5 USDC per call).
+> **Auto-pay safety cap.** `AGENTWALLET_MAX_AUTOPAY` (optional, default `1`) is the most one x402 payment may authorize, in stablecoin units: `1` means one dollar. It prices registry stablecoins only (USDC, USDT, USDbC, DAI on the supported chains, USDC and USDT on Solana). A requirement in the chain's native asset or in any other token is refused, because "1" measured in ETH is a few thousand dollars; list such assets in `AGENTWALLET_AUTOPAY_ASSETS` (comma-separated addresses or mints, or the word `native`) to allow them, and the cap then applies in that asset's own units. Any requirement above the cap is rejected instead of paid, so a malformed or tampered payment requirement cannot drain the wallet. The cap is the operator's ceiling: a `max_payment` argument can lower it for one call but never raise it. Raise the variable itself if you genuinely need larger automatic payments (for example `"5"` for up to 5 USDC per call).
 
 ### Claude Code
 
@@ -240,7 +241,7 @@ pay_x402(
 )
 ```
 
-`max_payment` is a hard per-payment cap. If you omit it, `pay_x402` falls back to `AGENTWALLET_MAX_AUTOPAY` (default `1`), so a malicious or compromised 402 endpoint can never authorize an unbounded payment. In local mode `AGENTWALLET_MAX_TX_TOKEN` applies to authorizations too, because an authorization is a transfer somebody else executes.
+`max_payment` lowers the cap for one call. It cannot raise it: `AGENTWALLET_MAX_AUTOPAY` (default `1`) is the operator's ceiling, and a `max_payment` above it is ignored and reported back as `max_payment_ignored`, so neither a malicious 402 endpoint nor a prompt-injected agent can authorize more than the operator allowed. Hosted wallets can go above the ceiling only through an emailed owner approval (below); local mode raises the variable. In local mode `AGENTWALLET_MAX_TX_TOKEN` applies to authorizations too, because an authorization is a transfer somebody else executes. Authorizations are valid for at most `AGENTWALLET_X402_MAX_TIMEOUT` seconds (default 3600) however long the endpoint asks for, and a repeat `pay_x402` call for the same endpoint, amount and recipient inside that window re-sends the earlier signature instead of signing a second one (its nonce is single-use, so a server that withheld the resource after settling cannot be paid twice; pass `fresh_authorization=true` to force a new one). The label shown for the asset comes from the registry or the chain, never from the 402 body.
 
 **Schemes.** `exact` (EIP-3009, gasless for the payer) is preferred and works on every EVM chain AgentWallet knows. `upto` (a Permit2 maximum the seller settles at actual usage) is signed as a `PermitWitnessTransferFrom` bound to the endpoint's facilitator; it needs a one-time `approve_permit2` per token (or `AGENTWALLET_PERMIT2_AUTO_APPROVE=1`). An `upto` option without `extra.facilitatorAddress` is refused, never approximated with an upfront transfer. Native-asset and Solana requests, and AgentWallet's own paywalls, are paid by an on-chain transfer proved by transaction hash, which is what those servers verify.
 
@@ -248,7 +249,7 @@ pay_x402(
 
 **Asset risk.** `check_token_risk` (and every `approve_token` result) reports honeypot, tax, owner-power, verified-source, holder-concentration and liquidity flags from GoPlus Security, with an on-chain fallback. A warning for the caller to weigh, never a block.
 
-**Proof.** Real settlements are listed in [PAYMENTS.md](PAYMENTS.md); the first is a 0.02 USDC `exact` payment on Base with the facilitator paying the gas.
+**Proof.** Real settlements are listed in [PAYMENTS.md](https://github.com/hifriendbot/agentwallet-mcp/blob/main/PAYMENTS.md); the first is a 0.02 USDC `exact` payment on Base with the facilitator paying the gas.
 
 ## Pay any x402 API from Claude in three steps
 
@@ -302,7 +303,7 @@ On-chain verification ensures every payment is real. Replay protection prevents 
 | x402 Acceptance (Paywalls) | No | **Yes** |
 | Pay for API Fees with Crypto | No (credit card only) | **Yes (USDC via x402)** |
 | Supported Chains | 8 EVM + Solana | **Any EVM + Solana** |
-| Token Tools | Yes | **ERC-20 + SPL (29 tools)** |
+| Token Tools | Yes | **ERC-20 + SPL (34 tools)** |
 | MCP Server | Yes | **Yes** |
 
 ## Pay with Crypto, No Credit Card Required
@@ -331,8 +332,12 @@ Which guards apply depends on who holds the key.
 - `AGENTWALLET_MAX_TX_NATIVE`: ceiling per transaction in native units (ETH, MATIC, and so on)
 - `AGENTWALLET_MAX_TX_TOKEN`: ceiling per ERC-20 transfer or approval, in human units of the token
 - `AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS`: set to `1` to let calldata the token cap cannot price reach a token contract or Permit2 (refused by default while the cap is set)
-- `AGENTWALLET_MAX_TX_SOL`: ceiling per SOL or SPL transfer
-- `AGENTWALLET_MAX_AUTOPAY`: ceiling per x402 auto-payment (default `1`)
+- `AGENTWALLET_MAX_TX_SOL`: ceiling per native SOL transfer (also charged for the rent of a recipient token account an SPL send has to create). It does not cover SPL token amounts: `AGENTWALLET_MAX_TX_TOKEN` does, on Solana as on EVM
+- `AGENTWALLET_MAX_AUTOPAY`: ceiling per x402 auto-payment in stablecoin units (default `1`); `AGENTWALLET_AUTOPAY_ASSETS` opts native or non-stable assets in; `AGENTWALLET_X402_MAX_TIMEOUT` bounds how long a signed authorization stays valid (default 3600 seconds)
+- `AGENTWALLET_SOLANA_RPC_<chainId>` (or `AGENTWALLET_SOLANA_RPC` for all clusters): the RPC's genesis hash is checked against the chain id before anything is sent, and an EVM RPC's `eth_chainId` likewise, so one URL cannot silently serve a different network than the one requested
+- `AGENTWALLET_TOKEN_RISK=0`: skip the GoPlus lookup `approve_token` performs (a third-party call that reveals which token you are about to approve)
+
+All cap variables are validated at startup; a typo stops the server rather than reading as "no limit". `wallet_mode` reports every guard, including the token cap and whether unknown token calls are allowed. Node.js 22.19 or newer is required.
 
 **Either mode**, for x402 paywalls you run through the hosted API:
 
@@ -345,7 +350,7 @@ Bug bounty program: $50 to $500 for responsible disclosure ([details](https://hi
 
 - **Website:** [hifriendbot.com/wallet](https://hifriendbot.com/wallet)
 - **npm:** [agentwallet-mcp](https://www.npmjs.com/package/agentwallet-mcp)
-- **Security:** [security@hifriendbot.com](mailto:security@hifriendbot.com)
+- **Security:** [security@hifriendbot.com](mailto:security@hifriendbot.com), policy and disclosure history in [SECURITY.md](https://github.com/hifriendbot/agentwallet-mcp/blob/main/SECURITY.md)
 
 
 ## Security

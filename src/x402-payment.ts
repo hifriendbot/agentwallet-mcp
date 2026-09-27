@@ -60,6 +60,120 @@ export const TRUSTED_DECIMALS: Record<number, Record<string, number>> = {
   },
 };
 
+/**
+ * What the registry knows about each asset beyond its decimals: a display
+ * symbol and whether one unit is one US dollar. The symbol is what the agent
+ * is shown; it is NEVER taken from the 402 body, because a hostile endpoint
+ * would happily label 5 ETH as "5 USDC". The stable flag decides whether
+ * AGENTWALLET_MAX_AUTOPAY (denominated in dollars) can price the asset at all.
+ */
+export const KNOWN_ASSETS: ReadonlyArray<{ chainId: number; address: string; symbol: string; stable: boolean }> = [
+  { chainId: 1, address: '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48', symbol: 'USDC', stable: true },
+  { chainId: 1, address: '0xdac17f958d2ee523a2206206994597c13d831ec7', symbol: 'USDT', stable: true },
+  { chainId: 1, address: '0x6b175474e89094c44da98b954eedeac495271d0f', symbol: 'DAI', stable: true },
+  { chainId: 8453, address: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', symbol: 'USDC', stable: true },
+  { chainId: 8453, address: '0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca', symbol: 'USDbC', stable: true },
+  { chainId: 8453, address: '0x4200000000000000000000000000000000000006', symbol: 'WETH', stable: false },
+  { chainId: 137, address: '0x3c499c542cef5e3811e1192ce70d8cc03d5c3359', symbol: 'USDC', stable: true },
+  { chainId: 137, address: '0xc2132d05d31c914a87c6611c10748aeb04b58e8f', symbol: 'USDT', stable: true },
+  { chainId: 42161, address: '0xaf88d065e77c8cc2239327c5edb3a432268e5831', symbol: 'USDC', stable: true },
+  { chainId: 10, address: '0x0b2c639c533813f4aa9d7837caf62653d097ff85', symbol: 'USDC', stable: true },
+  { chainId: 900, address: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', symbol: 'USDC', stable: true },
+  { chainId: 900, address: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', symbol: 'USDT', stable: true },
+];
+
+const NATIVE_SYMBOL: Record<number, string> = {
+  1: 'ETH', 8453: 'ETH', 42161: 'ETH', 10: 'ETH', 7777777: 'ETH',
+  137: 'POL', 56: 'BNB', 43114: 'AVAX', 369: 'PLS',
+  900: 'SOL', 901: 'SOL', 902: 'SOL',
+};
+
+function assetKey(chainId: number, asset: string): string {
+  // EVM addresses are case-insensitive hex; SPL mints are case-sensitive base58.
+  return `${chainId}:${asset.startsWith('0x') ? asset.toLowerCase() : asset}`;
+}
+const KNOWN_BY_KEY = new Map(KNOWN_ASSETS.map(a => [assetKey(a.chainId, a.address), a]));
+
+/** Symbol of the chain's native asset, or "native" for a chain this build does not know. */
+export function nativeSymbol(chainId: number): string {
+  return NATIVE_SYMBOL[chainId] ?? 'native';
+}
+
+/** True when one unit of the asset is one US dollar according to the registry. */
+export function isStableAsset(chainId: number, asset: string): boolean {
+  return Boolean(asset) && KNOWN_BY_KEY.get(assetKey(chainId, asset))?.stable === true;
+}
+
+/**
+ * What to call an asset when talking to the agent. Registry symbol, else the
+ * chain's native symbol when there is no asset, else the bare address. Never
+ * anything the 402 body said.
+ */
+export function assetLabel(chainId: number, asset: string): string {
+  if (!asset) return nativeSymbol(chainId);
+  return KNOWN_BY_KEY.get(assetKey(chainId, asset))?.symbol ?? asset;
+}
+
+/**
+ * Whether an x402 requirement's asset may be paid automatically at all.
+ *
+ * AGENTWALLET_MAX_AUTOPAY is "1" by default and every operator reads it as one
+ * dollar. Measured against native ETH that same "1" is a few thousand dollars,
+ * so a requirement with no asset (native) or a non-stable token is refused
+ * unless the operator lists it in AGENTWALLET_AUTOPAY_ASSETS, a comma-separated
+ * list of token addresses / mints, or the word "native". Listed assets are
+ * then capped in their own units, which the operator has opted into knowingly.
+ */
+export function autopayAssetAllowed(chainId: number, asset: string): { allowed: boolean; via: 'stablecoin' | 'allowlist' | 'none'; reason?: string } {
+  if (isStableAsset(chainId, asset)) return { allowed: true, via: 'stablecoin' };
+  const list = (process.env.AGENTWALLET_AUTOPAY_ASSETS || '').split(',').map(s => s.trim()).filter(Boolean);
+  const wanted = asset ? (asset.startsWith('0x') ? asset.toLowerCase() : asset) : 'native';
+  if (list.some(e => (e.startsWith('0x') ? e.toLowerCase() : e) === wanted)) return { allowed: true, via: 'allowlist' };
+  const label = assetLabel(chainId, asset);
+  return {
+    allowed: false, via: 'none',
+    reason: `x402 blocked: this endpoint wants payment in ${label}${asset ? ` (${asset})` : ''} on chain ${chainId}, which is not a stablecoin ` +
+      `AGENTWALLET_MAX_AUTOPAY can price. To allow it, add ${asset ? `"${asset}"` : '"native"'} to AGENTWALLET_AUTOPAY_ASSETS; ` +
+      `the cap then applies in ${label} units, not dollars.`,
+  };
+}
+
+/** The operator's per-payment ceiling, as configured. Validated so a typo never reads as "unlimited". */
+export function autopayEnvCap(): string {
+  const raw = (process.env.AGENTWALLET_MAX_AUTOPAY || '').trim() || '1';
+  if (!/^\d+(\.\d+)?$/.test(raw)) throw new Error(`AGENTWALLET_MAX_AUTOPAY must be a decimal number, got "${raw}".`);
+  return raw;
+}
+
+/**
+ * The cap that applies to one payment. A tool argument may LOWER the
+ * operator's AGENTWALLET_MAX_AUTOPAY, never raise it: the agent is the party
+ * this cap exists to bound, so an agent-chosen number above the ceiling is
+ * ignored and the caller is told so. Raising the ceiling is an operator
+ * action (the env var) or, for hosted wallets, an emailed owner approval.
+ */
+export function effectiveAutopayCap(maxPayment?: string): { cap: string; source: 'max_payment' | 'AGENTWALLET_MAX_AUTOPAY'; clamped: boolean } {
+  const ceiling = autopayEnvCap();
+  const arg = (maxPayment || '').trim();
+  if (!arg) return { cap: ceiling, source: 'AGENTWALLET_MAX_AUTOPAY', clamped: false };
+  if (!/^\d+(\.\d+)?$/.test(arg)) throw new Error(`max_payment must be a decimal number, got "${arg}".`);
+  // Compare at a fixed high precision so "1.50" and "1.5" agree.
+  const asUnits = (v: string) => BigInt(toBaseUnits(v, 36));
+  if (asUnits(arg) <= asUnits(ceiling)) return { cap: arg, source: 'max_payment', clamped: false };
+  return { cap: ceiling, source: 'AGENTWALLET_MAX_AUTOPAY', clamped: true };
+}
+
+/**
+ * Longest an x402 authorization signed here may stay valid. The endpoint's
+ * maxTimeoutSeconds is honoured up to this; a hostile server asking for a
+ * ten-year window gets an hour. Facilitators settle within seconds, so this
+ * costs nothing legitimate. Override with AGENTWALLET_X402_MAX_TIMEOUT.
+ */
+export function maxAuthWindowSeconds(): number {
+  const v = Number((process.env.AGENTWALLET_X402_MAX_TIMEOUT || '').trim());
+  return Number.isFinite(v) && v > 0 ? Math.floor(v) : 3600;
+}
+
 /** Solana SPL mints, keyed by mint address (case-sensitive base58). */
 export const TRUSTED_SPL_DECIMALS: Record<string, number> = {
   EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: 6, // USDC

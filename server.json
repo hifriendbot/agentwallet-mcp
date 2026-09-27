@@ -6,22 +6,71 @@
     "url": "https://github.com/hifriendbot/agentwallet-mcp",
     "source": "github"
   },
-  "version": "1.12.6",
+  "version": "1.13.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "agentwallet-mcp",
-      "version": "1.12.6",
+      "version": "1.13.0",
       "transport": {
         "type": "stdio"
       },
       "environmentVariables": [
         {
-          "description": "Your AgentWallet API key from hifriendbot.com/wallet/",
-          "isRequired": true,
+          "name": "AGENTWALLET_USER",
+          "description": "Hosted mode: your hifriendbot.com username",
+          "isRequired": false,
           "format": "string",
-          "isSecret": true,
-          "name": "AGENTWALLET_API_KEY"
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_PASS",
+          "description": "Hosted mode: an AgentWallet application password from hifriendbot.com/wallet/",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "AGENTWALLET_PRIVATE_KEY",
+          "description": "Local (self-custody) mode: 0x-prefixed EVM private key; signing then happens in this process",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "AGENTWALLET_SOLANA_KEY",
+          "description": "Local mode for Solana: secret key as a JSON array, base58 or base64",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "AGENTWALLET_MAX_AUTOPAY",
+          "description": "Per-payment x402 ceiling in stablecoin units (default 1); the agent cannot raise it",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_MAX_TX_NATIVE",
+          "description": "Local mode: per-transaction ceiling in native units",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_MAX_TX_TOKEN",
+          "description": "Local mode: per-transaction ceiling for ERC-20 and SPL transfers and approvals, in token units",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_MAX_TX_SOL",
+          "description": "Local mode: per-transaction ceiling in SOL",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
         }
       ]
     }

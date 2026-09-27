@@ -13,7 +13,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { assertPublicUrl, safeFetch } from './ssrf-guard.js';
+import { assertPublicUrl, safeFetch, FINAL_URL_HEADER } from './ssrf-guard.js';
 import {
   deriveX402Payment,
   isWithinCap,
@@ -21,6 +21,11 @@ import {
   assertDeclaredDecimals,
   nativeDecimals,
   SOLANA_CHAIN_IDS,
+  assetLabel,
+  autopayAssetAllowed,
+  autopayEnvCap,
+  effectiveAutopayCap,
+  maxAuthWindowSeconds,
 } from './x402-payment.js';
 import {
   isLocalMode,
@@ -69,6 +74,12 @@ const API_USER = process.env.AGENTWALLET_USER || '';
 const API_PASS = process.env.AGENTWALLET_PASS || '';  // WordPress application password
 const X402_WALLET_ID = process.env.AGENTWALLET_WALLET_ID || '';  // Wallet ID for x402 auto-pay
 const DASHBOARD_URL = process.env.AGENTWALLET_DASHBOARD_URL || 'https://hifriendbot.com/wallet/';
+
+// Basic credentials and 402 auto-pay decisions ride on this URL, so it must be
+// https, or loopback for a local test server. Anything else is refused at start.
+if (/^http:/i.test(API_BASE) && !/^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(\/|$)/i.test(API_BASE)) {
+  throw new Error(`AGENTWALLET_API_URL must be https (got ${API_BASE}); plain http is allowed only for localhost.`);
+}
 
 // ─── API Helper ─────────────────────────────────────────────────
 
@@ -311,7 +322,7 @@ async function api(path: string, method = 'GET', body?: Record<string, unknown>,
   const data = await res.json();
 
   // Handle 402 Payment Required — auto-pay if a wallet or a local key is configured
-  if (res.status === 402 && (X402_WALLET_ID || anyLocalMode()) && !extraHeaders?.['X-PAYMENT']) {
+  if (res.status === 402 && (X402_WALLET_ID || anyLocalMode()) && !extraHeaders?.['X-PAYMENT'] && !extraHeaders?.['X-AGW-SKIP-X402']) {
     return handleX402Payment(data as X402Response, path, method, body);
   }
 
@@ -393,11 +404,15 @@ async function handleX402Payment(
   }
 
   const accept = accepts[0]; // Use first option
-  const payTo = accept.payTo;
+  const payTo = String(accept.payTo || '');
 
   // Determine chain_id from network string (CAIP-2, plain name, or raw ID)
   const network = accept.network || '';
-  const chainId = resolveChainId(network) ?? 8453;
+  const chainId = resolveChainId(network);
+  if (chainId === null) throw new Error(`x402 auto-pay: unknown network "${network}" in the payment requirements; refusing to guess a chain.`);
+  if (isSolanaChain(chainId) ? !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(payTo) : !/^0x[0-9a-fA-F]{40}$/.test(payTo)) {
+    throw new Error(`x402 auto-pay: payTo "${payTo}" is not a valid address for chain ${chainId}.`);
+  }
 
   // x402 maxAmountRequired is ALREADY in base/atomic units (e.g. "10000" =
   // 0.01 USDC at 6 decimals) and must be used directly. The previous code ran
@@ -406,8 +421,10 @@ async function handleX402Payment(
   // the pay_x402 tool) and enforces a hard ceiling so a malformed or malicious
   // 402 response cannot drain the wallet. AGENTWALLET_MAX_AUTOPAY is in
   // human-readable units of the asset; default 1.
-  const maxAutopay = process.env.AGENTWALLET_MAX_AUTOPAY || '1';
+  const maxAutopay = autopayEnvCap();
   const assetForDecimals = accept.asset || accept.extra?.token || '';
+  const policy = autopayAssetAllowed(chainId, assetForDecimals);
+  if (!policy.allowed) throw new Error(policy.reason as string);
   const trustedDecimals = assetForDecimals
     ? await resolveTrustedDecimals(chainId, assetForDecimals)
     : nativeDecimals(chainId); // native asset: 18 on EVM (wei), 9 on Solana (lamports)
@@ -494,6 +511,70 @@ function isValidAddress(address: string): boolean {
   return false;
 }
 
+// ─── Guard helpers ──────────────────────────────────────────────
+
+/** Request headers the caller may not set on pay_x402: Host would rename the TLS peer, the rest belong to the client. */
+const FORBIDDEN_REQUEST_HEADERS = new Set(['host', 'content-length', 'transfer-encoding', 'connection', 'upgrade', 'expect', 'te', 'trailer', 'keep-alive']);
+
+/** Authorizations signed in this process, keyed by endpoint and requirement, kept until they expire. */
+const signedPayments = new Map<string, {
+  headerName: string; paymentHeader: string; txHash: string | null;
+  authorization: Eip3009Authorization | null; uptoAuth: UptoPermit2Authorization | null; payer: string | null; until: number;
+}>();
+
+function looksLikeTxHash(v: unknown): v is string {
+  return typeof v === 'string' && (/^0x[0-9a-fA-F]{64}$/.test(v) || /^[1-9A-HJ-NP-Za-km-z]{86,88}$/.test(v));
+}
+
+function assertPayTo(chainId: number, payTo: unknown): void {
+  const p = String(payTo ?? '');
+  const ok = isSolanaChain(chainId) ? /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(p) : /^0x[0-9a-fA-F]{40}$/.test(p);
+  if (!ok) throw new Error(`x402: payTo "${p}" is not a valid address for chain ${chainId}.`);
+}
+
+/** A URL with credentials in its path or query (Alchemy/Infura style keys) reduced to its origin for display. */
+function redactUrl(u: string): string {
+  try {
+    const p = new URL(u);
+    return p.pathname !== '/' || p.search ? `${p.origin}/…` : p.origin;
+  } catch { return u; }
+}
+
+/**
+ * Decimals to scale a human amount by. Always the token's own value (registry,
+ * then decimals() on chain); a caller-supplied value must agree or the call
+ * is refused, because "18" for USDC scales the amount by a trillion.
+ */
+async function verifiedDecimals(chainId: number, token: string, given?: number): Promise<number> {
+  let trusted: number | null = null;
+  if (isSolanaChain(chainId)) {
+    trusted = lookupTrustedDecimals(chainId, token);
+    if (trusted === null) {
+      if (given === undefined) throw new Error(`Decimals for mint ${token} are not in the registry; pass decimals explicitly.`);
+      return given; // the token program verifies it on-chain (TransferChecked)
+    }
+  } else {
+    trusted = await resolveTrustedDecimals(chainId, token);
+  }
+  if (given !== undefined && given !== trusted) {
+    throw new Error(`decimals ${given} was passed but ${token} has ${trusted} decimals; refusing to scale the amount by the wrong factor.`);
+  }
+  return trusted;
+}
+
+/** Cap variables are read at send time; a typo must fail at startup, not after funding. */
+function validateGuardEnv(): void {
+  for (const name of ['AGENTWALLET_MAX_TX_NATIVE', 'AGENTWALLET_MAX_TX_TOKEN', 'AGENTWALLET_MAX_TX_SOL', 'AGENTWALLET_MAX_AUTOPAY']) {
+    const v = (process.env[name] || '').trim();
+    if (v && !/^\d+(\.\d+)?$/.test(v)) throw new Error(`${name} must be a decimal number, got "${v}".`);
+  }
+  for (const e of (process.env.AGENTWALLET_AUTOPAY_ASSETS || '').split(',').map(s => s.trim()).filter(Boolean)) {
+    if (e !== 'native' && !/^0x[0-9a-fA-F]{40}$/.test(e) && !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(e)) {
+      throw new Error(`AGENTWALLET_AUTOPAY_ASSETS entry "${e}" is not "native", an EVM address or an SPL mint.`);
+    }
+  }
+}
+
 // ─── EVM Helpers ──────────────────────────────────────────────────
 
 /**
@@ -505,8 +586,10 @@ function parseUnits(amount: string, decimals: number): string {
     throw new Error(`Invalid amount "${amount}". Must be a positive number (e.g. "0.1" or "100").`);
   }
   const [whole, frac = ''] = amount.split('.');
-  const fracPadded = frac.slice(0, decimals).padEnd(decimals, '0');
-  const raw = BigInt(whole + fracPadded);
+  // More fractional digits than the token has cannot be sent; truncating would
+  // move a different amount than the one echoed back to the caller.
+  if (frac.length > decimals) throw new Error(`Amount "${amount}" has ${frac.length} decimal places but the token has ${decimals}.`);
+  const raw = BigInt(whole + frac.padEnd(decimals, '0'));
   return raw.toString();
 }
 
@@ -526,6 +609,9 @@ function formatUnits(raw: string, decimals: number): string {
  * Pad an address to 32 bytes (64 hex chars) for ABI encoding.
  */
 function padAddress(address: string): string {
+  // An over-long "address" would shift every later calldata word (the amount
+  // among them) and the EVM would decode whatever landed in the first 32 bytes.
+  if (!/^0x[0-9a-fA-F]{40}$/.test(address)) throw new Error(`Not an EVM address: "${address}".`);
   return address.slice(2).toLowerCase().padStart(64, '0');
 }
 
@@ -533,8 +619,9 @@ function padAddress(address: string): string {
  * Encode a uint256 as 32 bytes hex (64 chars).
  */
 function encodeUint256(value: string): string {
-  const hex = BigInt(value).toString(16);
-  return hex.padStart(64, '0');
+  const v = BigInt(value);
+  if (v < 0n || v > (1n << 256n) - 1n) throw new Error(`Amount ${value} does not fit in uint256.`);
+  return v.toString(16).padStart(64, '0');
 }
 
 // ─── Server ──────────────────────────────────────────────────────
@@ -604,10 +691,12 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.12.6',
+    version: '1.13.0',
   },
   {
-    instructions: `AgentWallet gives AI agents their own blockchain wallets. Private keys are encrypted server-side and never exposed — agents sign and broadcast transactions without ever touching raw keys.
+    instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()
+      ? 'This server runs in LOCAL (self-custody) mode: the operator supplied the key, signing happens in this process, and the only spend guards are the AGENTWALLET_MAX_TX_* environment caps. There is no server-side pause, daily limit or approval email; pause_wallet, unpause_wallet and delete_wallet are refused.'
+      : 'Private keys are encrypted server-side and never exposed: agents sign and broadcast transactions without ever touching raw keys.'}
 
 ## Getting Started
 1. Call list_wallets to see existing wallets, or create_wallet to make a new one.
@@ -616,7 +705,7 @@ const server = new McpServer(
 
 ## Supported Chains
 - **EVM chains:** Ethereum (1), Base (8453), Arbitrum (42161), Optimism (10), Polygon (137), Avalanche (43114), BSC (56), Zora (7777777), PulseChain (369)
-- **Solana:** Mainnet (900), Devnet (901)
+- **Solana:** Mainnet (900), Devnet (901), Testnet (902)
 - Call get_chains for the full list with native tokens and stablecoin contract addresses.
 
 ## EVM vs Solana
@@ -661,10 +750,10 @@ Create paywalls to charge other agents for accessing your resources:
 4. get_x402_revenue for aggregate stats across all paywalls.
 
 ## Wallet Security
-- Use pause_wallet to immediately freeze a wallet if compromised. No transactions can be signed while paused.
+- ${anyLocalMode() ? 'pause_wallet does not exist in local mode: revoke the key (rotate it and move the funds) if the process is compromised.' : 'Use pause_wallet to immediately freeze a wallet if compromised. No transactions can be signed while paused.'}
 - Use unpause_wallet to resume operations.
 - Use delete_wallet to permanently disable a wallet.
-- Wallets have server-enforced spending limits.
+- ${anyLocalMode() ? 'Spend limits are the AGENTWALLET_MAX_TX_NATIVE / _TOKEN / _SOL / _AUTOPAY caps the operator set; run wallet_mode to see them. Unset means no limit.' : 'Wallets have server-enforced spending limits.'}
 
 ## Tool Selection Guide
 | Goal | Tool |
@@ -690,7 +779,7 @@ Create paywalls to charge other agents for accessing your resources:
 server.tool(
   'create_wallet',
   'Create a new EVM or Solana wallet. Returns the wallet ID and address. ' +
-    'Private key is encrypted server-side and never exposed.',
+    (anyLocalMode() ? 'In local mode this reports the key already configured; no wallet is created remotely.' : 'Private key is encrypted server-side and never exposed.'),
   {
     label: z.string().default('').describe('Friendly name for the wallet'),
     chain_id: z.number().int().default(8453).describe('Default chain ID (1=Ethereum, 8453=Base, 42161=Arbitrum, 10=Optimism, 137=Polygon, 43114=Avalanche, 56=BSC, 7777777=Zora, 369=PulseChain, 900=Solana, 901=Solana Devnet)'),
@@ -757,13 +846,13 @@ server.tool(
     wallet_id: z.number().int().describe('Wallet ID'),
     to: AddressSchema.describe('Destination address (0x-prefixed for EVM, Base58 for Solana)'),
     chain_id: z.number().int().optional().describe('Chain ID (defaults to wallet\'s default)'),
-    value: z.string().default('0').describe('Value in wei/lamports (decimal string)'),
-    data: z.string().default('').describe('Hex-encoded calldata (0x-prefixed) for EVM contract calls'),
+    value: z.string().regex(/^\d+$/, 'decimal integer string').default('0').describe('Value in wei/lamports (decimal integer string; no hex, no decimals)'),
+    data: z.string().regex(/^(0x([0-9a-fA-F]{2})*)?$/, '0x-prefixed even-length hex').default('').describe('Hex-encoded calldata (0x-prefixed) for EVM contract calls'),
     gas_limit: z.string().optional().describe('Gas limit — EVM only (auto-estimated if omitted)'),
     max_fee: z.string().optional().describe('Max fee per gas in wei — EVM only (auto if omitted)'),
     priority_fee: z.string().optional().describe('Max priority fee per gas in wei — EVM only (auto if omitted)'),
     token_mint: z.string().optional().describe('SPL token mint address — Solana only (for SPL token transfers)'),
-    token_decimals: z.number().int().optional().describe('SPL token decimals — Solana only (6 for USDC)'),
+    token_decimals: z.number().int().min(0).max(36).optional().describe('SPL token decimals, Solana only (6 for USDC)'),
   },
   async ({ wallet_id, to, chain_id, value, data, gas_limit, max_fee, priority_fee, token_mint, token_decimals }) => {
     // Validate address format
@@ -773,6 +862,9 @@ server.tool(
 
     const body: Record<string, unknown> = { to, value };
     if (chain_id) body.chain_id = chain_id;
+    // Without a chain id the SPL fields were silently dropped and the server
+    // fell back to a native transfer of the same number, to the same address.
+    if (token_mint && !chain_id) throw new Error('token_mint needs an explicit Solana chain_id (900 mainnet, 901 devnet).');
 
     if (isSolanaChain(chain_id ?? 0)) {
       // Solana-specific params
@@ -797,18 +889,18 @@ server.tool(
   'send_transaction',
   'Sign and broadcast a transaction. ' +
     'Returns the transaction hash (EVM) or signature (Solana) on success. ' +
-    'The transaction is signed server-side and broadcast via RPC.',
+    (anyLocalMode() ? 'Signed in this process with the local key and broadcast via the configured RPC.' : 'The transaction is signed server-side and broadcast via RPC.'),
   {
     wallet_id: z.number().int().describe('Wallet ID'),
     to: AddressSchema.describe('Destination address (0x-prefixed for EVM, Base58 for Solana)'),
     chain_id: z.number().int().optional().describe('Chain ID (defaults to wallet\'s default)'),
-    value: z.string().default('0').describe('Value in wei/lamports (decimal string)'),
-    data: z.string().default('').describe('Hex-encoded calldata (0x-prefixed) for EVM contract calls'),
+    value: z.string().regex(/^\d+$/, 'decimal integer string').default('0').describe('Value in wei/lamports (decimal integer string; no hex, no decimals)'),
+    data: z.string().regex(/^(0x([0-9a-fA-F]{2})*)?$/, '0x-prefixed even-length hex').default('').describe('Hex-encoded calldata (0x-prefixed) for EVM contract calls'),
     gas_limit: z.string().optional().describe('Gas limit — EVM only (auto-estimated if omitted)'),
     max_fee: z.string().optional().describe('Max fee per gas in wei — EVM only (auto if omitted)'),
     priority_fee: z.string().optional().describe('Max priority fee per gas in wei — EVM only (auto if omitted)'),
     token_mint: z.string().optional().describe('SPL token mint address — Solana only (for SPL token transfers)'),
-    token_decimals: z.number().int().optional().describe('SPL token decimals — Solana only (6 for USDC)'),
+    token_decimals: z.number().int().min(0).max(36).optional().describe('SPL token decimals, Solana only (6 for USDC)'),
   },
   async ({ wallet_id, to, chain_id, value, data, gas_limit, max_fee, priority_fee, token_mint, token_decimals }) => {
     // Validate address format
@@ -818,6 +910,9 @@ server.tool(
 
     const body: Record<string, unknown> = { to, value };
     if (chain_id) body.chain_id = chain_id;
+    // Without a chain id the SPL fields were silently dropped and the server
+    // fell back to a native transfer of the same number, to the same address.
+    if (token_mint && !chain_id) throw new Error('token_mint needs an explicit Solana chain_id (900 mainnet, 901 devnet).');
 
     if (isSolanaChain(chain_id ?? 0)) {
       // Solana-specific params
@@ -889,7 +984,7 @@ server.tool(
     wallet_id: z.number().int().describe('Wallet ID to check'),
     token: z.string().describe('Token address (0x-prefixed ERC-20 contract for EVM, Base58 mint for Solana)'),
     chain_id: z.number().int().describe('Chain ID to check on'),
-    decimals: z.number().int().default(18).describe('Token decimals (6 for USDC, 18 for most tokens)'),
+    decimals: z.number().int().min(0).max(36).optional().describe('Token decimals. Taken from the response or the token contract when omitted'),
   },
   async ({ wallet_id, token, chain_id, decimals }) => {
     // Validate token address format
@@ -898,24 +993,34 @@ server.tool(
     }
 
     const params = `?chain_id=${chain_id}&token=${token}`;
-    const data = await api(`/wallets/${wallet_id}/token-balance${params}`) as { balance_raw?: string; balance_formatted?: string; decimals?: number };
+    const data = await api(`/wallets/${wallet_id}/token-balance${params}`) as { balance_raw?: string; balance_formatted?: string; balance?: string; decimals?: number };
 
     // Solana API returns balance_formatted + decimals directly
     if (isSolanaChain(chain_id) && data.balance_formatted !== undefined) {
       return jsonResponse({
         ...data,
         balance: data.balance_formatted,
-        decimals: data.decimals ?? decimals,
+        decimals: data.decimals ?? decimals ?? null,
       });
     }
 
-    // EVM: format from raw
-    const balanceFormatted = formatUnits(data.balance_raw || '0', decimals);
+    // The response's own decimals (local mode reads them from the contract) win
+    // over the caller's guess; a guess of 18 used to reformat a 1 USDC balance
+    // as 0.000000000001. When nothing supplies them, resolve them ourselves.
+    let trusted: number | null = typeof data.decimals === 'number' ? data.decimals : null;
+    if (trusted === null) {
+      if (typeof decimals === 'number') trusted = decimals;
+      else if (!isSolanaChain(chain_id)) trusted = await resolveTrustedDecimals(chain_id, token);
+    }
+    if (trusted === null) throw new Error('Could not determine the token decimals; pass decimals explicitly.');
+    const warning = typeof decimals === 'number' && typeof data.decimals === 'number' && decimals !== data.decimals
+      ? `decimals ${decimals} was passed but the token reports ${data.decimals}; the token's value was used.` : undefined;
 
     return jsonResponse({
       ...data,
-      balance: balanceFormatted,
-      decimals,
+      balance: data.balance ?? formatUnits(data.balance_raw || '0', trusted),
+      decimals: trusted,
+      ...(warning ? { warning } : {}),
     });
   },
 );
@@ -933,9 +1038,9 @@ server.tool(
     to: AddressSchema.describe('Recipient address (0x-prefixed for EVM, Base58 for Solana)'),
     amount: z.string().describe('Amount in human-readable format (e.g. "100" for 100 USDC)'),
     chain_id: z.number().int().describe('Chain ID'),
-    decimals: z.number().int().default(18).describe('Token decimals (6 for USDC, 18 for most tokens)'),
+    decimals: z.number().int().min(0).max(36).optional().describe('Token decimals. Resolved from the registry or the token contract when omitted; if given, it must match'),
   },
-  async ({ wallet_id, token, to, amount, chain_id, decimals }) => {
+  async ({ wallet_id, token, to, amount, chain_id, decimals: givenDecimals }) => {
     // Validate addresses
     if (!isValidAddress(token)) {
       throw new Error(`Invalid token address "${token}". Use 0x-prefixed hex for EVM or Base58 for Solana.`);
@@ -944,6 +1049,7 @@ server.tool(
       throw new Error(`Invalid recipient address "${to}". Use 0x-prefixed hex for EVM or Base58 for Solana.`);
     }
 
+    const decimals = await verifiedDecimals(chain_id, token, givenDecimals);
     const rawAmount = parseUnits(amount, decimals);
     let result: unknown;
 
@@ -1011,9 +1117,9 @@ server.tool(
     spender: z.string().regex(/^0x[a-fA-F0-9]{40}$/).describe('Contract address to approve as spender'),
     amount: z.string().describe('Amount to approve in human-readable format (e.g. "1000"), or "max" for unlimited'),
     chain_id: z.number().int().describe('Chain ID'),
-    decimals: z.number().int().default(18).describe('Token decimals (6 for USDC, 18 for most tokens)'),
+    decimals: z.number().int().min(0).max(36).optional().describe('Token decimals. Resolved from the registry or the token contract when omitted; if given, it must match'),
   },
-  async ({ wallet_id, token, spender, amount, chain_id, decimals }) => {
+  async ({ wallet_id, token, spender, amount, chain_id, decimals: givenDecimals }) => {
     if (isSolanaChain(chain_id)) {
       throw new Error('approve_token is not supported on Solana. Solana SPL tokens do not use ERC-20 style approvals.');
     }
@@ -1022,14 +1128,14 @@ server.tool(
     if (amount.toLowerCase() === 'max') {
       rawAmount = (BigInt(2) ** BigInt(256) - BigInt(1)).toString();
     } else {
-      rawAmount = parseUnits(amount, decimals);
+      rawAmount = parseUnits(amount, await verifiedDecimals(chain_id, token, givenDecimals));
     }
     const calldata = '0x095ea7b3' + padAddress(spender) + encodeUint256(rawAmount);
 
     // Asset risk rides along with the approval (issue #13). It never blocks; it is the
     // caller's call. Skipped for Permit2, which only moves what a signature allows.
     let risk: unknown = null;
-    if (spender.toLowerCase() !== PERMIT2_ADDRESS.toLowerCase()) {
+    if (spender.toLowerCase() !== PERMIT2_ADDRESS.toLowerCase() && process.env.AGENTWALLET_TOKEN_RISK !== '0') {
       try { risk = await assessTokenRisk(chain_id, token, (to, data) => ethCallHex(chain_id, to, data)); } catch { risk = null; }
     }
 
@@ -1062,9 +1168,9 @@ server.tool(
     token: z.string().regex(/^0x[a-fA-F0-9]{40}$/).describe('ERC-20 token contract address'),
     spender: z.string().regex(/^0x[a-fA-F0-9]{40}$/).describe('Spender contract address to check'),
     chain_id: z.number().int().describe('Chain ID'),
-    decimals: z.number().int().default(18).describe('Token decimals (6 for USDC, 18 for most tokens)'),
+    decimals: z.number().int().min(0).max(36).optional().describe('Token decimals. Resolved from the registry or the token contract when omitted; if given, it must match'),
   },
-  async ({ wallet_id, token, spender, chain_id, decimals }) => {
+  async ({ wallet_id, token, spender, chain_id, decimals: givenDecimals }) => {
     if (isSolanaChain(chain_id)) {
       throw new Error('get_allowance is not supported on Solana. Solana SPL tokens do not use ERC-20 style allowances.');
     }
@@ -1076,9 +1182,12 @@ server.tool(
 
     const result = await api('/eth-call', 'POST', { chain_id, to: token, data: calldata }) as { result: string };
 
-    // Parse uint256 result
-    const rawHex = result.result.replace('0x', '');
+    // Parse exactly one uint256 word: a hostile token returning more bytes must
+    // not turn into a 512-bit "allowance".
+    const rawHex = String(result?.result || '').replace(/^0x/, '').slice(0, 64);
+    if (rawHex && !/^[0-9a-fA-F]+$/.test(rawHex)) throw new Error('allowance() returned non-hex data.');
     const raw = BigInt('0x' + (rawHex || '0')).toString();
+    const decimals = await verifiedDecimals(chain_id, token, givenDecimals);
     const maxUint256 = (BigInt(2) ** BigInt(256) - BigInt(1)).toString();
 
     return jsonResponse({
@@ -1194,7 +1303,9 @@ function decodeAbiString(hex: string): string {
     if (!pairs) return '';
     // Convert hex to UTF-8
     const bytes = new Uint8Array(pairs.map(b => parseInt(b, 16)));
-    return new TextDecoder().decode(bytes);
+    // Attacker-controlled text: keep it short and printable so a token cannot
+    // smuggle kilobytes of instructions or terminal escapes into the agent's context.
+    return new TextDecoder().decode(bytes).replace(/[\u0000-\u001f\u007f-\u009f]/g, '').slice(0, 64);
   } catch {
     return '';
   }
@@ -1221,8 +1332,9 @@ server.tool(
 
     const name = decodeAbiString(nameResult.result);
     const symbol = decodeAbiString(symbolResult.result);
-    const decimalsHex = decimalsResult.result.replace('0x', '');
-    const decimals = decimalsHex ? parseInt(decimalsHex, 16) : 0;
+    const decimalsHex = String(decimalsResult?.result || '').replace(/^0x/, '').slice(0, 64);
+    const parsedDecimals = /^[0-9a-fA-F]+$/.test(decimalsHex) ? Number(BigInt('0x' + decimalsHex)) : NaN;
+    const decimals = Number.isInteger(parsedDecimals) && parsedDecimals >= 0 && parsedDecimals <= 255 ? parsedDecimals : null;
 
     return jsonResponse({
       token,
@@ -1371,15 +1483,28 @@ server.tool(
     approval_id: z.string().optional().describe(
       'An approval id from an earlier over-cap attempt. Once the owner has approved it, pass it here to make that one payment.',
     ),
+    fresh_authorization: z.boolean().optional().describe(
+      'Sign a new authorization even if one for the same endpoint, amount and recipient is still valid. By default a repeat call ' +
+        'within the validity window re-sends the earlier signature (same nonce, so it cannot settle twice) instead of paying again.',
+    ),
   },
-  async ({ url, wallet_id, method, headers: headersJson, body: reqBody, max_payment, prefer_chain, request_approval, approval_id }) => {
+  async ({ url, wallet_id, method, headers: headersJson, body: reqBody, max_payment, prefer_chain, request_approval, approval_id, fresh_authorization }) => {
     // Build request headers
     const reqHeaders: Record<string, string> = { Accept: 'application/json' };
     if (headersJson) {
-      try {
-        Object.assign(reqHeaders, JSON.parse(headersJson));
-      } catch {
+      let parsed: unknown;
+      try { parsed = JSON.parse(headersJson); } catch { parsed = null; }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
         throw new Error('Invalid headers JSON. Must be a JSON object (e.g. {"Authorization": "Bearer ..."}).');
+      }
+      for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+        const name = k.toLowerCase();
+        // Host would replace the TLS server name; the rest are hop-by-hop or framing headers the client owns.
+        if (FORBIDDEN_REQUEST_HEADERS.has(name) || name.startsWith('proxy-') || name.startsWith(':')) {
+          throw new Error(`Header "${k}" cannot be set by the caller.`);
+        }
+        if (typeof v !== 'string') throw new Error(`Header "${k}" must be a string.`);
+        reqHeaders[k] = v;
       }
     }
 
@@ -1416,6 +1541,15 @@ server.tool(
     }
 
     // Step 2: Requirements come from the PAYMENT-REQUIRED header (v2) or the JSON body (v1).
+    // A 402 that arrived through a cross-origin redirect cannot be paid here: the
+    // payment header would be stripped on the same hop and the money would go
+    // to whoever the redirecting server named. The agent should call the final URL.
+    const servedFrom = initialRes.headers.get(FINAL_URL_HEADER) || url;
+    if (new URL(servedFrom).origin !== new URL(url).origin) {
+      return jsonResponse({ status: 402, payment_required: true, payment_made: false,
+        error: `The endpoint redirected to another origin (${new URL(servedFrom).origin}) before asking for payment. Call pay_x402 with that URL directly if you trust it.`,
+        final_url: servedFrom });
+    }
     const initialText = await initialRes.text();
     let initialBody: unknown = null;
     try { initialBody = JSON.parse(initialText); } catch { initialBody = null; }
@@ -1457,31 +1591,46 @@ server.tool(
       : nativeDecimals(chainId); // 18 on EVM (wei), 9 on Solana (lamports)
     if (typeof option.requiredDecimals === 'number') assertDeclaredDecimals(option.requiredDecimals, trustedDecimals);
     const amount = formatUnits(rawAmount, trustedDecimals);
-    const tokenLabel = option.extra?.name || (tokenAddress ? 'tokens' : 'native');
+    const tokenLabel = assetLabel(chainId, tokenAddress); // never the 402's own label
     const skip = { 'X-AGW-SKIP-X402': 'true' };
+    assertPayTo(chainId, option.payTo);
+
+    // Step 3b: Can this asset be priced at all? The cap is in dollars; native
+    // ETH or an arbitrary token is refused unless the operator allowlisted it.
+    const assetPolicy = autopayAssetAllowed(chainId, tokenAddress);
+    if (!assetPolicy.allowed) {
+      return jsonResponse({
+        status: 402, payment_required: true, payment_made: false,
+        required_amount: amount, token: tokenLabel, token_address: tokenAddress || null, network: option.network, chain_id: chainId, pay_to: option.payTo,
+        error: assetPolicy.reason,
+      });
+    }
 
     // Step 4: Hard per-payment cap, ALWAYS applied. If the caller omits max_payment
     // we fall back to AGENTWALLET_MAX_AUTOPAY (default "1"). Above the cap a hosted
     // wallet can ask its owner instead of refusing: an approval is created, the
     // owner gets approve/deny links by email, and the agent retries with the id.
     // For upto the cap applies to the MAXIMUM the seller may settle.
-    const capSource = max_payment ? 'max_payment' : 'AGENTWALLET_MAX_AUTOPAY';
-    const effectiveMax = max_payment || process.env.AGENTWALLET_MAX_AUTOPAY || '1';
+    // max_payment can only lower the operator's ceiling; an agent-chosen number
+    // above it is ignored and reported, because the agent is what the cap bounds.
+    const { cap: effectiveMax, source: capSource, clamped } = effectiveAutopayCap(max_payment);
     let approvalUsed: string | null = null;
     if (!isWithinCap(rawAmount, trustedDecimals, effectiveMax)) {
       const overCap = {
         status: 402, payment_required: true, payment_made: false,
         required_amount: amount, max_allowed: effectiveMax, cap_source: capSource, token: tokenLabel,
+        ...(clamped ? { max_payment_ignored: `max_payment ${max_payment} exceeds the operator ceiling AGENTWALLET_MAX_AUTOPAY=${effectiveMax}; only the operator can raise it.` } : {}),
         network: option.network, chain_id: chainId, pay_to: option.payTo, description: option.description,
       };
       const wantApproval = request_approval ?? (process.env.AGENTWALLET_APPROVALS !== '0');
       if (approval_id) {
-        const a = (await api(`/approvals/${encodeURIComponent(approval_id)}`, 'GET', undefined, skip)) as { status?: string; used?: number; value?: string; pay_to?: string; chain_id?: number; error?: string };
+        const a = (await api(`/approvals/${encodeURIComponent(approval_id)}`, 'GET', undefined, skip)) as { status?: string; used?: number; value?: string; pay_to?: string; chain_id?: number; asset?: string; error?: string };
         if (a?.status !== 'approved' || Number((a as { used?: number }).used) === 1) {
           return jsonResponse({ ...overCap, approval_id, approval_status: a?.status ?? null, error: `Approval ${approval_id} is ${a?.status ?? 'unknown'}, not approved.${a?.error ? ' ' + a.error : ''}` });
         }
-        if (String(a.pay_to || '').toLowerCase() !== option.payTo.toLowerCase() || Number(a.chain_id) !== chainId || BigInt(String(a.value || '0')) < BigInt(rawAmount)) {
-          return jsonResponse({ ...overCap, approval_id, error: 'Approval does not cover this payment (recipient, chain or amount differ).' });
+        const sameAsset = String(a.asset ?? '').toLowerCase() === tokenAddress.toLowerCase();
+        if (!sameAsset || String(a.pay_to || '').toLowerCase() !== option.payTo.toLowerCase() || Number(a.chain_id) !== chainId || BigInt(String(a.value || '0')) < BigInt(rawAmount)) {
+          return jsonResponse({ ...overCap, approval_id, error: 'Approval does not cover this payment (asset, recipient, chain or amount differ).' });
         }
         approvalUsed = String(approval_id);
       } else if (wantApproval && !anyLocalMode()) {
@@ -1522,13 +1671,24 @@ server.tool(
     let payer: string | null = null;
     let permit2ApprovalTx: string | null = null;
     let payerDelegationInfo: PayerDelegation | null = null;
+    let authorizationReused = false;
 
-    if (isUpto) {
+    const cacheKey = [wallet_id, chainId, tokenAddress.toLowerCase(), option.payTo.toLowerCase(), rawAmount, option.scheme, new URL(url).origin + new URL(url).pathname].join('|');
+    const cachedAuth = fresh_authorization ? undefined : signedPayments.get(cacheKey);
+    for (const [k, v] of signedPayments) if (v.until <= Date.now()) signedPayments.delete(k);
+
+    if (cachedAuth && cachedAuth.until > Date.now()) {
+      // Same endpoint, same requirement, still inside the window: re-send the
+      // earlier signature. Its nonce is single-use, so a server that already
+      // settled it cannot settle it again, and one that never did now can.
+      ({ headerName, paymentHeader, txHash, authorization, uptoAuth, payer } = cachedAuth);
+      authorizationReused = true;
+    } else if (isUpto) {
       payer = await payerAddress(wallet_id);
       payerDelegationInfo = await payerDelegation(chainId, payer);
       const allowance = decodeUint(await ethCallHex(chainId, tokenAddress, permit2AllowanceCalldata(payer)));
       if (allowance < BigInt(rawAmount)) {
-        if (process.env.AGENTWALLET_PERMIT2_AUTO_APPROVE === '1') {
+        if (process.env.AGENTWALLET_PERMIT2_AUTO_APPROVE === '1' && assetPolicy.via === 'stablecoin') {
           const r = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: tokenAddress, value: '0', data: permit2ApproveCalldata(), chain_id: chainId }, skip)) as { tx_hash?: string };
           permit2ApprovalTx = String(r?.tx_hash || '');
           await new Promise(res => setTimeout(res, 4000));
@@ -1574,6 +1734,12 @@ server.tool(
       if (!txHash) throw new Error('x402: the payment transaction returned no hash.');
       paymentHeader = Buffer.from(JSON.stringify({ x402Version, scheme: option.scheme, network: option.network, payload: { txHash } })).toString('base64');
     }
+    if (!authorizationReused) {
+      const until = authorization ? Number(authorization.validBefore) * 1000
+        : uptoAuth ? Number(uptoAuth.deadline) * 1000
+        : Date.now() + maxAuthWindowSeconds() * 1000; // a broadcast transfer: the hash stays valid, re-sending it never pays twice
+      signedPayments.set(cacheKey, { headerName, paymentHeader, txHash, authorization, uptoAuth, payer, until });
+    }
 
     // Step 6: Retry with the payment header and read the settlement receipt.
     const retryHeaders = { ...reqHeaders, [headerName]: paymentHeader };
@@ -1594,6 +1760,11 @@ server.tool(
     // A second 402 means the facilitator declined (unfunded payer, expired window, bad domain...). v2 servers
     // put the reason in a fresh PAYMENT-REQUIRED header, v1 servers in the body; surface it instead of {}.
     let retryError: string | null = null;
+    const retryServedFrom = retryRes.headers.get(FINAL_URL_HEADER) || url;
+    const retryCrossOrigin = new URL(retryServedFrom).origin !== new URL(url).origin;
+    if (retryCrossOrigin) {
+      retryError = `The paid request was redirected to another origin (${new URL(retryServedFrom).origin}); the payment header is never forwarded across origins, so this response did not see the payment.`;
+    }
     if (retryRes.status === 402) {
       const again = parsePaymentRequired(n => retryRes.headers.get(n), retryParsed);
       retryError = String(again?.error || (retryParsed as { error?: string } | null)?.error || 'Payment was not accepted (no reason given).');
@@ -1606,7 +1777,8 @@ server.tool(
       // Paid means the endpoint accepted the payment: a settlement receipt, or a success status after the payment header.
       // A 4xx other than 402 (bad body, auth) means the request failed for another reason; the authorization was
       // sent but the facilitator normally does not settle a failed request, so it is not reported as paid.
-      payment_made: Boolean(settlement?.success) || (retryRes.status >= 200 && retryRes.status < 300),
+      payment_made: !retryCrossOrigin && (Boolean(settlement?.success) || (retryRes.status >= 200 && retryRes.status < 300)),
+      authorization_reused: authorizationReused,
       retry_error: retryError,
       payment_method: isUpto ? 'permit2-upto-authorization' : (standardExact ? 'eip3009-authorization' : 'onchain-transfer'),
       approval_id: approvalUsed,
@@ -1620,8 +1792,10 @@ server.tool(
       pay_to: option.payTo,
       payer,
       payer_delegation: payerDelegationInfo,
-      tx_hash: txHash ?? settlement?.transaction ?? null,
-      settlement,
+      // txHash is ours (we broadcast it); settlement.transaction is the server's
+      // claim and is surfaced only when it is shaped like a real hash.
+      tx_hash: txHash ?? (looksLikeTxHash(settlement?.transaction) ? settlement?.transaction : null) ?? null,
+      settlement_reported_by_server: settlement,
       authorization: authorization ? { nonce: authorization.nonce, valid_before: authorization.validBefore }
         : (uptoAuth ? { scheme: 'upto', max_amount: amount, nonce: uptoAuth.nonce, deadline: uptoAuth.deadline, facilitator: uptoAuth.witness.facilitator } : null),
       description: option.description,
@@ -1645,17 +1819,24 @@ server.tool(
 server.tool(
   'approve_permit2',
   'One-time ERC-20 approval of a token to the Permit2 contract, needed before paying x402 "upto" endpoints with that token. ' +
-    'A normal on-chain transaction (needs gas). Approves the maximum so it never has to be repeated; Permit2 itself only moves ' +
-    'what each signed authorization allows.',
+    'A normal on-chain transaction (needs gas). By default approves the maximum, the ecosystem norm, so it never has to be repeated; ' +
+    'pass amount to grant a bounded allowance instead (required under AGENTWALLET_MAX_TX_TOKEN, which refuses a max approval). ' +
+    'Permit2 itself only moves what each signed authorization allows.',
   {
     wallet_id: z.number().int().describe('Wallet ID'),
     token: z.string().regex(/^0x[a-fA-F0-9]{40}$/).describe('ERC-20 token address (e.g. USDC on Base)'),
     chain_id: z.number().int().describe('Chain ID'),
+    amount: z.string().optional().describe('Allowance to grant in human units (e.g. "100"). Omit for unlimited.'),
   },
-  async ({ wallet_id, token, chain_id }) => {
+  async ({ wallet_id, token, chain_id, amount }) => {
     if (isSolanaChain(chain_id)) throw new Error('Permit2 is an EVM contract; there is nothing to approve on Solana.');
-    const result = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: token, value: '0', data: permit2ApproveCalldata(), chain_id })) as Record<string, unknown>;
-    return jsonResponse({ ...result, token, spender: PERMIT2_ADDRESS, amount: 'unlimited', note: 'Permit2 only transfers what a signed authorization allows; the allowance itself moves nothing.' });
+    let data: string = permit2ApproveCalldata();
+    if (amount !== undefined) {
+      const raw = parseUnits(amount, await resolveTrustedDecimals(chain_id, token));
+      data = '0x095ea7b3' + padAddress(PERMIT2_ADDRESS) + encodeUint256(raw);
+    }
+    const result = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: token, value: '0', data, chain_id })) as Record<string, unknown>;
+    return jsonResponse({ ...result, token, spender: PERMIT2_ADDRESS, amount: amount ?? 'unlimited', note: 'Permit2 only transfers what a signed authorization allows; the allowance itself moves nothing.' });
   },
 );
 
@@ -1774,14 +1955,16 @@ server.tool(
     amount: z.string().describe('Price in human-readable format (e.g. "0.01" for 0.01 USDC)'),
     token_type: z.enum(['erc20', 'spl', 'native']).default('erc20').describe('"erc20" for EVM stablecoins, "spl" for Solana SPL tokens, "native" for ETH/SOL/POL/etc.'),
     token_address: z.string().default('').describe('Token contract address (ERC-20 for EVM, SPL mint Base58 for Solana). Required if token_type is "erc20" or "spl". Use get_chains to find stablecoin addresses.'),
-    token_decimals: z.number().int().default(6).describe('Token decimals (6 for USDC, 18 for ETH/most tokens)'),
+    token_decimals: z.number().int().min(0).max(36).optional().describe('Token decimals. Defaults to the chain native decimals for "native", else 6 (USDC); set it for any other token'),
     token_name: z.string().default('USDC').describe('Token display name (e.g. "USDC", "ETH")'),
     chain_id: z.number().int().default(8453).describe('Chain ID for payments (8453=Base, 1=Ethereum, etc.)'),
     resource_url: z.string().url().describe('URL of the protected resource to serve after payment verification'),
     resource_mime: z.string().default('application/json').describe('MIME type of the resource (e.g. "application/json", "text/plain")'),
   },
   async ({ wallet_id, name, description, amount, token_type, token_address, token_decimals, token_name, chain_id, resource_url, resource_mime }) => {
-    // Convert human-readable amount to raw token units
+    // Convert human-readable amount to raw token units. A native paywall used
+    // to default to 6 decimals and price 0.01 ETH as 10000 wei.
+    if (token_decimals === undefined) token_decimals = token_type === 'native' ? nativeDecimals(chain_id) : (lookupTrustedDecimals(chain_id, token_address) ?? 6);
     const rawAmount = parseUnits(amount, token_decimals);
 
     const data = await api('/x402/paywalls', 'POST', {
@@ -1814,7 +1997,7 @@ server.tool(
     'access URLs, payment counts, and revenue totals.',
   {
     page: z.number().int().default(1).describe('Page number'),
-    per_page: z.number().int().default(50).describe('Results per page (max 100)'),
+    per_page: z.number().int().min(1).max(100).default(50).describe('Results per page (max 100)'),
   },
   async ({ page, per_page }) => {
     const data = await api(`/x402/paywalls?page=${page}&per_page=${per_page}`);
@@ -1848,7 +2031,7 @@ server.tool(
     name: z.string().optional().describe('New paywall name'),
     description: z.string().optional().describe('New description'),
     amount: z.string().optional().describe('New price in human-readable format (e.g. "0.05")'),
-    token_decimals: z.number().int().optional().describe('Token decimals (needed if changing amount)'),
+    token_decimals: z.number().int().min(0).max(36).optional().describe('Token decimals. Read from the paywall itself when omitted'),
     resource_url: z.string().url().optional().describe('New resource URL'),
     resource_mime: z.string().optional().describe('New MIME type'),
     is_active: z.boolean().optional().describe('Enable (true) or disable (false) the paywall'),
@@ -1863,7 +2046,13 @@ server.tool(
 
     // Convert human-readable amount to raw if provided
     if (amount !== undefined) {
-      const decimals = token_decimals ?? 6; // Default to USDC decimals
+      let decimals = token_decimals;
+      if (decimals === undefined) {
+        const existing = (await api(`/x402/paywalls/${paywall_id}`)) as { token_decimals?: number | string };
+        const d = Number(existing?.token_decimals);
+        if (!Number.isInteger(d) || d < 0 || d > 36) throw new Error('Could not read the paywall decimals; pass token_decimals with the new amount.');
+        decimals = d;
+      }
       body.amount = parseUnits(amount, decimals);
     }
 
@@ -1895,7 +2084,7 @@ server.tool(
   {
     paywall_id: z.number().int().describe('Paywall ID'),
     page: z.number().int().default(1).describe('Page number'),
-    per_page: z.number().int().default(20).describe('Results per page (max 100)'),
+    per_page: z.number().int().min(1).max(100).default(20).describe('Results per page (max 100)'),
   },
   async ({ paywall_id, page, per_page }) => {
     const data = await api(`/x402/paywalls/${paywall_id}/payments?page=${page}&per_page=${per_page}`);
@@ -1941,6 +2130,10 @@ server.tool(
       custody: 'self',
       signing: 'Signed in this process. Keys are never sent to AgentWallet or anyone else.',
       max_autopay: process.env.AGENTWALLET_MAX_AUTOPAY || '1',
+      autopay_assets: process.env.AGENTWALLET_AUTOPAY_ASSETS || 'registry stablecoins only',
+      x402_max_timeout_seconds: maxAuthWindowSeconds(),
+      per_tx_cap_token: process.env.AGENTWALLET_MAX_TX_TOKEN || 'not set (ERC-20 and SPL transfers are uncapped)',
+      allow_unknown_token_calls: process.env.AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS === '1',
     };
 
     if (isLocalMode()) {
@@ -1950,7 +2143,7 @@ server.tool(
       } catch { /* chain has no default; not worth failing the report over */ }
       report.evm = {
         address: getLocalAddress(),
-        rpc_endpoint: rpc,
+        rpc_endpoint: redactUrl(rpc),
         per_tx_cap_native: process.env.AGENTWALLET_MAX_TX_NATIVE || 'not set',
       };
     } else {
@@ -1962,8 +2155,9 @@ server.tool(
       try { rpc = resolveSolanaRpc(900); } catch { /* fall through to the default label */ }
       report.solana = {
         address: getSolanaAddress(),
-        rpc_endpoint: rpc,
+        rpc_endpoint: redactUrl(rpc),
         per_tx_cap_sol: process.env.AGENTWALLET_MAX_TX_SOL || 'not set',
+        per_tx_cap_token: process.env.AGENTWALLET_MAX_TX_TOKEN || 'not set (SPL transfers are uncapped; AGENTWALLET_MAX_TX_SOL does not cover them)',
       };
     } else {
       report.solana = 'no local Solana key. Solana operations are refused, not sent to the hosted signer.';
@@ -2014,6 +2208,7 @@ server.tool(
 // ─── Start ──────────────────────────────────────────────────────
 
 async function main() {
+  validateGuardEnv();
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
@@ -2025,6 +2220,7 @@ async function main() {
       if (isLocalMode()) parts.push(`EVM ${getLocalAddress()}`);
       if (isSolanaLocalMode()) parts.push(`Solana ${getSolanaAddress()}`);
       console.error(`AgentWallet MCP: LOCAL signing mode. ${parts.join(', ')}. Keys never leave this machine.`);
+      if (!(process.env.AGENTWALLET_MAX_TX_TOKEN || '').trim()) console.error('AgentWallet MCP: warning, AGENTWALLET_MAX_TX_TOKEN is not set; ERC-20 and SPL transfers have no per-transaction ceiling.');
     } catch (e) {
       console.error(`AgentWallet MCP: local signing configured but a key could not be loaded: ${(e as Error).message}`);
       process.exit(1);

@@ -149,6 +149,7 @@ export function isPrivateAddress(ipRaw: string): boolean {
   if (zeroThrough(g, 7) && g[7] <= 1) return true;                  // :: unspecified, ::1 loopback
   if ((g[0] & 0xfe00) === 0xfc00) return true;                      // fc00::/7 unique-local
   if ((g[0] & 0xffc0) === 0xfe80) return true;                      // fe80::/10 link-local
+  if ((g[0] & 0xffc0) === 0xfec0) return true;                      // fec0::/10 deprecated site-local, still routed on old LANs
   if ((g[0] & 0xff00) === 0xff00) return true;                      // ff00::/8 multicast
   if (g[0] === 0x64 && g[1] === 0xff9b) return true;                // 64:ff9b::/96 NAT64
   if (g[0] === 0x2002) return true;                                 // 2002::/16 6to4
@@ -333,6 +334,35 @@ export function headersForRedirect(
 }
 
 /**
+ * Largest response body safeFetch will buffer, counted AFTER undici has
+ * decoded any Content-Encoding. x402 bodies are a few kilobytes; a hostile
+ * endpoint streaming (or gzip-bombing) into an unbounded arrayBuffer() could
+ * take the wallet process down. Wire bytes are capped separately on the Agent.
+ */
+export const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+
+/** Header safeFetch adds to every response: the URL the body actually came from, after redirects. */
+export const FINAL_URL_HEADER = 'x-agw-final-url';
+
+/** Read a body stream into memory, refusing past `limit` decoded bytes. */
+async function readBounded(stream: unknown, limit: number): Promise<ArrayBuffer> {
+  if (!stream) return new ArrayBuffer(0);
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  // Node's ReadableStream is async-iterable; iterating (rather than a reader)
+  // keeps this independent of the DOM vs undici stream typings.
+  for await (const chunk of stream as AsyncIterable<Uint8Array>) {
+    total += chunk.byteLength;
+    if (total > limit) throw new Error(`Response body exceeds the ${limit} byte limit; refusing to buffer it.`);
+    chunks.push(chunk);
+  }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+  return out.buffer;
+}
+
+/**
  * fetch() that validates the target, and every redirect hop, against
  * resolvePublicUrl, and connects only to the addresses that validation
  * returned. Redirects are followed manually because the automatic follower
@@ -356,6 +386,7 @@ export async function safeFetch(url: string, options: RequestInit = {}, maxHops 
     // untouched, so Host and TLS SNI/certificate validation still use the name.
     const agent = new Agent({
       connect: { lookup: createPinnedLookup(addresses) as unknown as LookupFunction },
+      maxResponseSize: MAX_RESPONSE_BYTES, // wire bytes, before decoding; readBounded caps the decoded size
     });
 
     let status: number;
@@ -378,11 +409,12 @@ export async function safeFetch(url: string, options: RequestInit = {}, maxHops 
         if (k === 'content-encoding' || k === 'content-length') continue;
         headers.push([k, v]);
       }
-      body = NULL_BODY_STATUS.has(status) ? null : await res.arrayBuffer();
+      body = NULL_BODY_STATUS.has(status) ? null : await readBounded(res.body, MAX_RESPONSE_BYTES);
     } finally {
       await agent.destroy();
     }
 
+    headers.push([FINAL_URL_HEADER, current]);
     const out = new Response(body, { status, statusText, headers });
     const isRedirect = status >= 300 && status < 400 && out.headers.has('location');
     if (!isRedirect) return out;
@@ -390,8 +422,10 @@ export async function safeFetch(url: string, options: RequestInit = {}, maxHops 
     const next = new URL(out.headers.get('location') as string, current).toString();
     // A redirected request must not replay the body or method blindly, and it
     // must not replay the caller's credentials to a different origin at all.
+    const method = (opts.method || 'GET').toUpperCase();
     const bodyDropped = status === 303
-      || ((status === 301 || status === 302) && !!opts.method && opts.method !== 'GET');
+      || ((status === 301 || status === 302) && method !== 'GET')
+      || (!sameOrigin(current, next) && method !== 'GET' && method !== 'HEAD');
     opts = { ...opts, headers: headersForRedirect(opts.headers, current, next, bodyDropped) };
     if (bodyDropped) {
       opts = { ...opts, method: 'GET', body: undefined };
