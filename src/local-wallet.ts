@@ -450,6 +450,35 @@ async function assertWithinTokenCap(chainId: number, to: Address, data: Hex, val
       `Raise the cap deliberately if this is intended.`
     );
   }
+
+  // increaseAllowance ADDS to what a spender may already pull. Checking the
+  // increment alone let two individually compliant calls leave a standing
+  // allowance above the cap (2026-09-28 report), so the resulting total is
+  // what gets checked, and an allowance that cannot be read refuses rather
+  // than assumes zero. approve() is absolute and needs no read.
+  if (selector === '39509351') {
+    const spenderWord = wordAt(0);
+    if (spenderWord.length !== 64) throw new Error(`Blocked by local guard: calldata for ${layout.what} is truncated (spender word has ${spenderWord.length / 2} bytes, expected 32).`);
+    const spender = ('0x' + spenderWord.slice(24)) as Address;
+    let current: bigint;
+    try {
+      const { pub } = clients(chainId);
+      current = await pub.readContract({ address: token, abi: ERC20_ABI, functionName: 'allowance', args: [getLocalAddress(), spender] }) as bigint;
+    } catch (err) {
+      throw new Error(
+        `Blocked by local guard: could not read the current allowance of ${spender} on ${token} ` +
+        `(${String((err as Error).message).split('\n')[0]}), so the resulting total cannot be checked against AGENTWALLET_MAX_TX_TOKEN.`
+      );
+    }
+    const total = current + amount;
+    if (total > capRaw) {
+      throw new Error(
+        `Blocked by local guard: ${layout.what} of ${amount} base units would leave a standing allowance of ${total} base units ` +
+        `for ${spender}, above AGENTWALLET_MAX_TX_TOKEN (${cap}, evaluated at ${decimals} decimals). ` +
+        `Use approve with an absolute amount, or raise the cap deliberately.`
+      );
+    }
+  }
 }
 
 export async function localSend(

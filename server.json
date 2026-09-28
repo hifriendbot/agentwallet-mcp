@@ -6,12 +6,12 @@
     "url": "https://github.com/hifriendbot/agentwallet-mcp",
     "source": "github"
   },
-  "version": "1.13.0",
+  "version": "1.13.1",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "agentwallet-mcp",
-      "version": "1.13.0",
+      "version": "1.13.1",
       "transport": {
         "type": "stdio"
       },
@@ -61,6 +61,13 @@
         {
           "name": "AGENTWALLET_MAX_TX_TOKEN",
           "description": "Local mode: per-transaction ceiling for ERC-20 and SPL transfers and approvals, in token units",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_TOKEN_DECIMALS",
+          "description": "Optional: pin decimals for tokens outside the registry, e.g. 8453:0x<token>=6,<mint>=9; used for amounts and caps instead of the RPC's answer",
           "isRequired": false,
           "format": "string",
           "isSecret": false

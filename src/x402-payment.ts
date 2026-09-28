@@ -184,8 +184,49 @@ export const TRUSTED_SPL_DECIMALS: Record<string, number> = {
  * Look up decimals we already know to be correct. Returns null when the asset
  * is unknown, which means the caller must resolve it on-chain or refuse.
  */
+/**
+ * Operator-pinned decimals: AGENTWALLET_TOKEN_DECIMALS="8453:0x<token>=6,<mint>=9".
+ *
+ * Consulted before the registry and before any RPC answer. The registry pins
+ * the major stablecoins; for any other token the only remaining source of
+ * decimals is the operator's RPC, and a compromised RPC scales the amount and
+ * the cap by the same false factor, so the cap never notices (2026-09-28
+ * report). A pin makes the token's decimals a fact the RPC cannot change.
+ */
+export function parseDecimalPins(raw: string | undefined): Map<string, number> {
+  const pins = new Map<string, number>();
+  for (const entry of (raw || '').split(',').map((s) => s.trim()).filter(Boolean)) {
+    const m = /^(?:(\d+):)?([0-9a-zA-Z]+)=(\d{1,2})$/.exec(entry);
+    if (!m) throw new Error(`AGENTWALLET_TOKEN_DECIMALS entry "${entry}" is not chainId:0xtoken=decimals or mint=decimals.`);
+    const [, chain, token, dec] = m;
+    const d = Number(dec);
+    if (d > 36) throw new Error(`AGENTWALLET_TOKEN_DECIMALS entry "${entry}": decimals must be 0..36.`);
+    if (/^0x[0-9a-fA-F]{40}$/.test(token)) {
+      if (!chain) throw new Error(`AGENTWALLET_TOKEN_DECIMALS entry "${entry}": an EVM token needs a chain id prefix (8453:0x...=6).`);
+      pins.set(`${Number(chain)}:${token.toLowerCase()}`, d);
+    } else if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(token)) {
+      pins.set(`spl:${token}`, d);
+    } else {
+      throw new Error(`AGENTWALLET_TOKEN_DECIMALS entry "${entry}": "${token}" is not an EVM address or an SPL mint.`);
+    }
+  }
+  return pins;
+}
+
+let pinCache: { raw: string; pins: Map<string, number> } | null = null;
+export function pinnedDecimals(chainId: number, token: string): number | null {
+  const raw = process.env.AGENTWALLET_TOKEN_DECIMALS || '';
+  if (!pinCache || pinCache.raw !== raw) pinCache = { raw, pins: parseDecimalPins(raw) };
+  const evm = pinCache.pins.get(`${chainId}:${token.toLowerCase()}`);
+  if (typeof evm === 'number') return evm;
+  const spl = pinCache.pins.get(`spl:${token}`);
+  return typeof spl === 'number' ? spl : null;
+}
+
 export function lookupTrustedDecimals(chainId: number, token: string): number | null {
   if (!token) return null;
+  const pinned = pinnedDecimals(chainId, token);
+  if (pinned !== null) return pinned;
   const spl = TRUSTED_SPL_DECIMALS[token];
   if (typeof spl === 'number') return spl;
   const forChain = TRUSTED_DECIMALS[chainId];

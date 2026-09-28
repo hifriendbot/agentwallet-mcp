@@ -26,6 +26,7 @@ import {
   autopayEnvCap,
   effectiveAutopayCap,
   maxAuthWindowSeconds,
+  parseDecimalPins,
 } from './x402-payment.js';
 import {
   isLocalMode,
@@ -403,7 +404,19 @@ async function handleX402Payment(
     throw new Error('402 Payment Required but no payment options available.');
   }
 
-  const accept = accepts[0]; // Use first option
+  // Only an "exact" requirement can be settled by a transfer. An upto offer
+  // names the MAXIMUM of a usage authorization; paying that maximum upfront
+  // hands the endpoint the whole ceiling instead of what was used (2026-09-28
+  // report). Such offers are refused here, before any wallet call; pay_x402
+  // settles them with a Permit2 authorization. A missing scheme is our own
+  // legacy paywall shape and means exact.
+  const accept = accepts.find((a) => !a.scheme || a.scheme === 'exact');
+  if (!accept) {
+    throw new Error(
+      `x402 auto-pay: no "exact" payment option was offered (schemes: ${accepts.map((a) => a.scheme || '?').join(', ')}); ` +
+      `an upto maximum is not paid upfront. Use pay_x402 for this endpoint.`
+    );
+  }
   const payTo = String(accept.payTo || '');
 
   // Determine chain_id from network string (CAIP-2, plain name, or raw ID)
@@ -564,6 +577,7 @@ async function verifiedDecimals(chainId: number, token: string, given?: number):
 
 /** Cap variables are read at send time; a typo must fail at startup, not after funding. */
 function validateGuardEnv(): void {
+  parseDecimalPins(process.env.AGENTWALLET_TOKEN_DECIMALS); // throws on a malformed pin
   for (const name of ['AGENTWALLET_MAX_TX_NATIVE', 'AGENTWALLET_MAX_TX_TOKEN', 'AGENTWALLET_MAX_TX_SOL', 'AGENTWALLET_MAX_AUTOPAY']) {
     const v = (process.env[name] || '').trim();
     if (v && !/^\d+(\.\d+)?$/.test(v)) throw new Error(`${name} must be a decimal number, got "${v}".`);
@@ -691,7 +705,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.13.0',
+    version: '1.13.1',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()
@@ -2134,6 +2148,7 @@ server.tool(
       x402_max_timeout_seconds: maxAuthWindowSeconds(),
       per_tx_cap_token: process.env.AGENTWALLET_MAX_TX_TOKEN || 'not set (ERC-20 and SPL transfers are uncapped)',
       allow_unknown_token_calls: process.env.AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS === '1',
+      token_decimals_pins: parseDecimalPins(process.env.AGENTWALLET_TOKEN_DECIMALS).size,
     };
 
     if (isLocalMode()) {
