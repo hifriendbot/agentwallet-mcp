@@ -434,18 +434,35 @@ export async function localSplTransfer(
 }
 
 const TOKEN_ACCOUNT_SIZE = 165;
+const MINT_SIZE = 82;
+/** Token-2022 pads a mint to the token-account size and tags the next byte: 1 = mint, 2 = token account. */
+const TOKEN_2022_TYPE_MINT = 1;
 
 /**
  * A recipient must be something that can own a token account: a wallet or a
- * program-derived wallet (Squads and friends), never a program and never a
- * token account. SPL sent to ATA(ATA) or to a program id is gone for good.
+ * program-derived wallet (Squads and friends), never a program and never an
+ * account the token programs own. SPL sent to ATA(ATA), ATA(mint) or a program
+ * id is gone for good, or belongs to whoever kept the mint's keypair.
+ *
+ * Ownership alone decides. A length gate (>= 165 bytes) used to sit here and
+ * let an 82-byte mint through as a "wallet" (2026-10-02 report): everything
+ * the token programs own is a mint, a token account or a multisig, and none
+ * of those is a wallet.
  */
 async function assertRecipientIsWallet(conn: Connection, recipient: PublicKey): Promise<void> {
   const info = await conn.getAccountInfo(recipient);
   if (!info) return; // never seen on chain: an ordinary fresh wallet
   if (info.executable) throw new Error(`Refusing to send to ${recipient.toBase58()}: it is a program, not a wallet.`);
-  if ((info.owner.equals(TOKEN_PROGRAM) || info.owner.equals(TOKEN_2022_PROGRAM)) && info.data.length >= TOKEN_ACCOUNT_SIZE) {
-    throw new Error(`Refusing to send to ${recipient.toBase58()}: it is a token account, not a wallet. Pass the owner's wallet address instead.`);
+  if (info.owner.equals(TOKEN_PROGRAM) || info.owner.equals(TOKEN_2022_PROGRAM)) {
+    const isMint = info.data.length === MINT_SIZE
+      || (info.data.length > TOKEN_ACCOUNT_SIZE && info.data[TOKEN_ACCOUNT_SIZE] === TOKEN_2022_TYPE_MINT);
+    if (isMint) {
+      throw new Error(`Refusing to send to ${recipient.toBase58()}: it is a token mint, not a wallet. Pass the recipient's wallet address; the mint belongs in token_mint.`);
+    }
+    if (info.data.length >= TOKEN_ACCOUNT_SIZE) {
+      throw new Error(`Refusing to send to ${recipient.toBase58()}: it is a token account, not a wallet. Pass the owner's wallet address instead.`);
+    }
+    throw new Error(`Refusing to send to ${recipient.toBase58()}: it is an account owned by the SPL token program, not a wallet.`);
   }
 }
 

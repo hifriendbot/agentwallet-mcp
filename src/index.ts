@@ -27,6 +27,8 @@ import {
   effectiveAutopayCap,
   maxAuthWindowSeconds,
   parseDecimalPins,
+  approvalRefusal,
+  type ApprovalRow,
 } from './x402-payment.js';
 import {
   isLocalMode,
@@ -705,7 +707,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.13.1',
+    version: '1.13.2',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()
@@ -1638,13 +1640,14 @@ server.tool(
       };
       const wantApproval = request_approval ?? (process.env.AGENTWALLET_APPROVALS !== '0');
       if (approval_id) {
-        const a = (await api(`/approvals/${encodeURIComponent(approval_id)}`, 'GET', undefined, skip)) as { status?: string; used?: number; value?: string; pay_to?: string; chain_id?: number; asset?: string; error?: string };
-        if (a?.status !== 'approved' || Number((a as { used?: number }).used) === 1) {
-          return jsonResponse({ ...overCap, approval_id, approval_status: a?.status ?? null, error: `Approval ${approval_id} is ${a?.status ?? 'unknown'}, not approved.${a?.error ? ' ' + a.error : ''}` });
-        }
-        const sameAsset = String(a.asset ?? '').toLowerCase() === tokenAddress.toLowerCase();
-        if (!sameAsset || String(a.pay_to || '').toLowerCase() !== option.payTo.toLowerCase() || Number(a.chain_id) !== chainId || BigInt(String(a.value || '0')) < BigInt(rawAmount)) {
-          return jsonResponse({ ...overCap, approval_id, error: 'Approval does not cover this payment (asset, recipient, chain or amount differ).' });
+        // Local mode refuses before any lookup: only the hosted signer can consume
+        // an approval, so here the same id would lift the cap on every call.
+        const want = { walletId: wallet_id, chainId, asset: tokenAddress, payTo: option.payTo, rawAmount };
+        const local = anyLocalMode();
+        const a = local ? null : (await api(`/approvals/${encodeURIComponent(approval_id)}`, 'GET', undefined, skip)) as ApprovalRow;
+        const refusal = approvalRefusal(approval_id, a, want, local);
+        if (refusal) {
+          return jsonResponse({ ...overCap, approval_id, ...refusal });
         }
         approvalUsed = String(approval_id);
       } else if (wantApproval && !anyLocalMode()) {

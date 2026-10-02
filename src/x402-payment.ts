@@ -355,3 +355,63 @@ export function isWithinCap(
   const capRaw = toBaseUnits(capHuman, trustedDecimals);
   return BigInt(rawAmountRequired) <= BigInt(capRaw);
 }
+
+/** The row GET /approvals/{id} answers with. Numbers arrive as strings from the server. */
+export interface ApprovalRow {
+  status?: string;
+  used?: number | string;
+  wallet_id?: number | string;
+  chain_id?: number | string;
+  asset?: string;
+  pay_to?: string;
+  value?: string;
+  error?: string;
+}
+
+export interface ApprovalWant {
+  walletId: number;
+  chainId: number;
+  asset: string;
+  payTo: string;
+  rawAmount: string;
+}
+
+/**
+ * Why an approval cannot stand in for the cap on this payment, or null when it can.
+ *
+ * An approval is single-use because the hosted signer marks it used in the same
+ * request that signs. A local signer never talks to that server, so in local
+ * mode nothing could ever consume one and the same id would lift the cap again
+ * on every call (2026-10-02 report). Local mode therefore refuses approvals
+ * outright, before any lookup. For a hosted wallet every bound field is checked
+ * here, the wallet included, and the server checks them again when it signs.
+ */
+export function approvalRefusal(
+  approvalId: string,
+  row: ApprovalRow | null | undefined,
+  want: ApprovalWant,
+  localMode: boolean,
+): { error: string; approval_status?: string | null } | null {
+  if (localMode) {
+    return {
+      error: `Approval ${approvalId} cannot be used in local mode: approvals are consumed by the hosted signer, and this server signs with your own key, so nothing could mark it used. Local mode has no approval channel: raise AGENTWALLET_MAX_AUTOPAY or AGENTWALLET_MAX_TX_TOKEN yourself.`,
+    };
+  }
+  const status = row?.status ?? null;
+  // "used" must read as exactly 0. A missing or unparseable field refuses rather than passes.
+  if (status !== 'approved' || Number(row?.used) !== 0) {
+    const state = status === 'approved' ? 'already used' : `${status ?? 'unknown'}, not approved`;
+    return { approval_status: status, error: `Approval ${approvalId} is ${state}.${row?.error ? ' ' + row.error : ''}` };
+  }
+  const value = String(row?.value ?? '');
+  const covers = Number(row?.wallet_id) === want.walletId
+    && Number(row?.chain_id) === want.chainId
+    && String(row?.asset ?? '').toLowerCase() === want.asset.toLowerCase()
+    && String(row?.pay_to ?? '').toLowerCase() === want.payTo.toLowerCase()
+    && /^\d+$/.test(value) && /^\d+$/.test(want.rawAmount)
+    && BigInt(value) >= BigInt(want.rawAmount);
+  if (!covers) {
+    return { error: 'Approval does not cover this payment (wallet, asset, recipient, chain or amount differ).' };
+  }
+  return null;
+}
