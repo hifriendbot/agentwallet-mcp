@@ -250,12 +250,67 @@ export async function localSolBalance(chainId = 900) {
   };
 }
 
-/** Which token program owns this mint: classic SPL or Token-2022. */
-async function tokenProgramFor(conn: Connection, mint: PublicKey): Promise<PublicKey> {
+/** Which token program owns this mint, and how big a token account for it is. */
+async function mintLayout(conn: Connection, mint: PublicKey): Promise<{ tokenProgram: PublicKey; ataSize: number }> {
   const info = await conn.getAccountInfo(mint);
   if (!info) throw new Error(`Mint ${mint.toBase58()} not found on this cluster.`);
-  if (info.owner.equals(TOKEN_2022_PROGRAM)) return TOKEN_2022_PROGRAM;
-  return TOKEN_PROGRAM;
+  const token2022 = info.owner.equals(TOKEN_2022_PROGRAM);
+  return {
+    tokenProgram: token2022 ? TOKEN_2022_PROGRAM : TOKEN_PROGRAM,
+    ataSize: associatedAccountSize(token2022, info.data),
+  };
+}
+
+/** Which token program owns this mint: classic SPL or Token-2022. */
+async function tokenProgramFor(conn: Connection, mint: PublicKey): Promise<PublicKey> {
+  return (await mintLayout(conn, mint)).tokenProgram;
+}
+
+/* Token-2022 mint extensions that make every token account for the mint carry
+   an extension of its own, and the size of that account extension's value.
+   Mirrors required_init_account_extensions in the token-2022 program. */
+const ACCOUNT_EXTENSION_FOR_MINT_EXTENSION: Record<number, number> = {
+  1: 8,   // TransferFeeConfig -> TransferFeeAmount (withheld amount, u64)
+  9: 0,   // NonTransferable   -> NonTransferableAccount (plus ImmutableOwner, always present below)
+  14: 1,  // TransferHook      -> TransferHookAccount (one flag byte)
+  26: 0,  // Pausable          -> PausableAccount
+};
+/** Highest extension type this table was written against (PermissionedBurn). */
+const HIGHEST_KNOWN_EXTENSION = 28;
+/** Charged for a mint extension newer than the table, so the estimate errs high, never low. */
+const UNKNOWN_EXTENSION_ALLOWANCE = 64;
+const TLV_HEADER = 4;       // u16 type + u16 length
+const MULTISIG_SIZE = 355;  // the program pads an account that would collide with a multisig's size
+
+/**
+ * Bytes the Associated Token Account program allocates for a new token account
+ * of this mint. Classic SPL is always 165. Token-2022 adds an account-type byte
+ * and one TLV entry per account extension: ImmutableOwner on every associated
+ * account, plus whatever the mint's own extensions require.
+ *
+ * The rent charged follows this size, so the SOL cap has to be checked against
+ * it. A flat 165 under-counted every Token-2022 account (2026-10-02 report).
+ */
+export function associatedAccountSize(token2022: boolean, mintData: Uint8Array): number {
+  if (!token2022) return TOKEN_ACCOUNT_SIZE;
+  let tlvBytes = TLV_HEADER; // ImmutableOwner, zero-length value
+  const seen = new Set<number>();
+  // Mint layout: 82 bytes of base state padded to 165, the account-type byte, then TLV entries.
+  let offset = TOKEN_ACCOUNT_SIZE + 1;
+  while (offset + TLV_HEADER <= mintData.length) {
+    const type = mintData[offset] | (mintData[offset + 1] << 8);
+    const length = mintData[offset + 2] | (mintData[offset + 3] << 8);
+    if (type === 0) break; // uninitialized: the rest is padding
+    if (!seen.has(type)) {
+      seen.add(type);
+      const accountValue = ACCOUNT_EXTENSION_FOR_MINT_EXTENSION[type];
+      if (accountValue !== undefined) tlvBytes += TLV_HEADER + accountValue;
+      else if (type > HIGHEST_KNOWN_EXTENSION) tlvBytes += TLV_HEADER + UNKNOWN_EXTENSION_ALLOWANCE;
+    }
+    offset += TLV_HEADER + length;
+  }
+  const size = TOKEN_ACCOUNT_SIZE + 1 + tlvBytes;
+  return size === MULTISIG_SIZE ? size + 2 : size;
 }
 
 function associatedTokenAddress(owner: PublicKey, mint: PublicKey, tokenProgram: PublicKey): PublicKey {
@@ -400,7 +455,7 @@ export async function localSplTransfer(
   const mint = new PublicKey(mintStr);
   const recipient = new PublicKey(to);
   await assertRecipientIsWallet(conn, recipient);
-  const tokenProgram = await tokenProgramFor(conn, mint);
+  const { tokenProgram, ataSize } = await mintLayout(conn, mint);
   // The instruction's decimals byte is the mint's real value, not whatever the
   // caller passed; TransferChecked would reject a wrong one on-chain anyway.
   decimals = await resolveMintDecimals(mintStr, chainId);
@@ -413,7 +468,8 @@ export async function localSplTransfer(
   if (!destInfo) {
     // Creating the recipient's token account costs the payer rent in SOL, an
     // outflow the SOL cap must see (0.002 SOL a time adds up over many sends).
-    const rent = await conn.getMinimumBalanceForRentExemption(TOKEN_ACCOUNT_SIZE);
+    // Rent follows the account's real size, which for Token-2022 is above 165.
+    const rent = await conn.getMinimumBalanceForRentExemption(ataSize);
     assertWithinSolCap(BigInt(rent));
     tx.add(createAtaIdempotentIx(payer.publicKey, destAta, recipient, mint, tokenProgram));
   }
