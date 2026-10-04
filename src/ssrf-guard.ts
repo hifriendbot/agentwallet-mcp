@@ -344,6 +344,45 @@ export const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 /** Header safeFetch adds to every response: the URL the body actually came from, after redirects. */
 export const FINAL_URL_HEADER = 'x-agw-final-url';
 
+/* The final URL is also recorded here, keyed by the Response object, and
+   finalUrlOf() reads this rather than the header. A server could send a
+   header of the same name (it was copied straight through and read back
+   as the real one, 2026-10-04 report); nothing a server sends can reach
+   this map. */
+const finalUrls = new WeakMap<Response, string>();
+
+/** The URL a safeFetch response actually came from, after every redirect. Only safeFetch can set it. */
+export function finalUrlOf(res: Response, fallback: string): string {
+  return finalUrls.get(res) ?? fallback;
+}
+
+/** Response headers that only this client may set on what it hands back. */
+const CLIENT_ONLY_RESPONSE_HEADERS = new Set([FINAL_URL_HEADER]);
+
+/**
+ * The synthetic Response safeFetch hands back: the server's headers minus the
+ * transfer-level ones (the body is already decoded) and minus any header only
+ * this client may set, plus the final URL, which is also recorded out of band.
+ */
+export function buildFetchedResponse(
+  status: number,
+  statusText: string,
+  serverHeaders: Iterable<[string, string]>,
+  body: ArrayBuffer | null,
+  finalUrl: string,
+): Response {
+  const headers: Array<[string, string]> = [];
+  for (const [k, v] of serverHeaders) {
+    const name = k.toLowerCase();
+    if (name === 'content-encoding' || name === 'content-length' || CLIENT_ONLY_RESPONSE_HEADERS.has(name)) continue;
+    headers.push([k, v]);
+  }
+  headers.push([FINAL_URL_HEADER, finalUrl]);
+  const out = new Response(body, { status, statusText, headers });
+  finalUrls.set(out, finalUrl);
+  return out;
+}
+
 /** Read a body stream into memory, refusing past `limit` decoded bytes. */
 async function readBounded(stream: unknown, limit: number): Promise<ArrayBuffer> {
   if (!stream) return new ArrayBuffer(0);
@@ -403,19 +442,13 @@ export async function safeFetch(url: string, options: RequestInit = {}, maxHops 
       status = res.status;
       statusText = res.statusText;
       headers = [];
-      for (const [k, v] of res.headers) {
-        // The body below is already decoded, so the transfer-level description
-        // of it would be wrong if carried over.
-        if (k === 'content-encoding' || k === 'content-length') continue;
-        headers.push([k, v]);
-      }
+      for (const [k, v] of res.headers) headers.push([k, v]);
       body = NULL_BODY_STATUS.has(status) ? null : await readBounded(res.body, MAX_RESPONSE_BYTES);
     } finally {
       await agent.destroy();
     }
 
-    headers.push([FINAL_URL_HEADER, current]);
-    const out = new Response(body, { status, statusText, headers });
+    const out = buildFetchedResponse(status, statusText, headers, body, current);
     const isRedirect = status >= 300 && status < 400 && out.headers.has('location');
     if (!isRedirect) return out;
 

@@ -371,7 +371,9 @@ const CAP_LAYOUTS: Record<string, CapLayout> = {
  * checked, and unpriced calldata aimed at a token contract or at Permit2 is
  * refused, because any state change there can move funds. Calls to other
  * contracts (routers, bridges) still pass: they can only pull what an approval
- * already allowed, and approvals are what this guard bounds.
+ * already allows. Approvals granted through this guard are bounded by it; an
+ * allowance that existed before the cap was set, or was granted elsewhere, is
+ * not, and a router call can spend up to that allowance (noted 2026-10-04).
  *
  * Reported privately 2026-09-27: that refusal also caught our own wrap_eth and
  * unwrap_eth, whose WETH deposit() / withdraw(uint256) calldata was unpriced,
@@ -414,7 +416,7 @@ async function assertWithinTokenCap(chainId: number, to: Address, data: Hex, val
         `or set AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS=1 to allow it deliberately.`
       );
     }
-    return; // an ordinary contract call; it can only pull what an approval already allowed
+    return; // an ordinary contract call; it can only pull what an existing approval allows (see the note above)
   }
 
   const wordAt = (i: number) => hex.slice(8 + i * 64, 8 + (i + 1) * 64);

@@ -13,7 +13,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { assertPublicUrl, safeFetch, FINAL_URL_HEADER } from './ssrf-guard.js';
+import { assertPublicUrl, safeFetch, finalUrlOf } from './ssrf-guard.js';
 import {
   deriveX402Payment,
   isWithinCap,
@@ -29,6 +29,7 @@ import {
   parseDecimalPins,
   approvalRefusal,
   type ApprovalRow,
+  authorizationResource,
 } from './x402-payment.js';
 import {
   isLocalMode,
@@ -707,7 +708,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.13.3',
+    version: '1.13.4',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()
@@ -1560,7 +1561,7 @@ server.tool(
     // A 402 that arrived through a cross-origin redirect cannot be paid here: the
     // payment header would be stripped on the same hop and the money would go
     // to whoever the redirecting server named. The agent should call the final URL.
-    const servedFrom = initialRes.headers.get(FINAL_URL_HEADER) || url;
+    const servedFrom = finalUrlOf(initialRes, url); // recorded by safeFetch itself, never read from a header the server could set
     if (new URL(servedFrom).origin !== new URL(url).origin) {
       return jsonResponse({ status: 402, payment_required: true, payment_made: false,
         error: `The endpoint redirected to another origin (${new URL(servedFrom).origin}) before asking for payment. Call pay_x402 with that URL directly if you trust it.`,
@@ -1690,7 +1691,10 @@ server.tool(
     let payerDelegationInfo: PayerDelegation | null = null;
     let authorizationReused = false;
 
-    const cacheKey = [wallet_id, chainId, tokenAddress.toLowerCase(), option.payTo.toLowerCase(), rawAmount, option.scheme, new URL(url).origin + new URL(url).pathname].join('|');
+    // The resource is the whole URL including its query: /buy?id=1 and /buy?id=2
+    // are different purchases, and reusing the first signature for the second
+    // would report a payment the second resource never received.
+    const cacheKey = [wallet_id, chainId, tokenAddress.toLowerCase(), option.payTo.toLowerCase(), rawAmount, option.scheme, authorizationResource(url)].join('|');
     const cachedAuth = fresh_authorization ? undefined : signedPayments.get(cacheKey);
     for (const [k, v] of signedPayments) if (v.until <= Date.now()) signedPayments.delete(k);
 
@@ -1777,7 +1781,7 @@ server.tool(
     // A second 402 means the facilitator declined (unfunded payer, expired window, bad domain...). v2 servers
     // put the reason in a fresh PAYMENT-REQUIRED header, v1 servers in the body; surface it instead of {}.
     let retryError: string | null = null;
-    const retryServedFrom = retryRes.headers.get(FINAL_URL_HEADER) || url;
+    const retryServedFrom = finalUrlOf(retryRes, url);
     const retryCrossOrigin = new URL(retryServedFrom).origin !== new URL(url).origin;
     if (retryCrossOrigin) {
       retryError = `The paid request was redirected to another origin (${new URL(retryServedFrom).origin}); the payment header is never forwarded across origins, so this response did not see the payment.`;

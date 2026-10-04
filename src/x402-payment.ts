@@ -386,6 +386,16 @@ export interface ApprovalWant {
  * outright, before any lookup. For a hosted wallet every bound field is checked
  * here, the wallet included, and the server checks them again when it signs.
  */
+/**
+ * The part of a URL that names the resource an authorization was signed for:
+ * origin, path and query. /buy?id=1 and /buy?id=2 are different purchases
+ * (2026-10-04 report); the fragment is never sent, so it is left out.
+ */
+export function authorizationResource(url: string): string {
+  const u = new URL(url);
+  return u.origin + u.pathname + u.search;
+}
+
 export function approvalRefusal(
   approvalId: string,
   row: ApprovalRow | null | undefined,
