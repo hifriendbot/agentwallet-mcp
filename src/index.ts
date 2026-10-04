@@ -725,7 +725,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.13.6',
+    version: '1.13.7',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()
@@ -2030,12 +2030,18 @@ server.tool(
 server.tool(
   'delete_wallet',
   'Delete (soft-delete) a wallet. The wallet will no longer appear in listings ' +
-    'and cannot be used for transactions.',
+    'and cannot be used for transactions. The wallet is read first and the delete names its address, ' +
+    'so a wallet that cannot be read is never deleted.',
   {
     wallet_id: z.number().int().describe('Wallet ID to delete'),
   },
   async ({ wallet_id }) => {
-    const data = await api(`/wallets/${wallet_id}`, 'DELETE');
+    // The server asks the caller to name the wallet it means to delete, so a
+    // leaked API key alone cannot destroy a key (2026-10-04 audit, server 1.7.1).
+    const w = (await api(`/wallets/${wallet_id}`, 'GET', undefined, { 'X-AGW-SKIP-X402': 'true' })) as { address?: string; wallet_address?: string; error?: string };
+    const address = String(w?.address || w?.wallet_address || '');
+    if (!address) throw new Error(`Wallet ${wallet_id} could not be read (${serverText(w?.error) || 'no address in the response'}); nothing was deleted.`);
+    const data = await api(`/wallets/${wallet_id}`, 'DELETE', { confirm: address });
     return jsonResponse(data);
   },
 );
