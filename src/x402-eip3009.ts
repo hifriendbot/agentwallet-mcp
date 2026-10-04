@@ -178,7 +178,9 @@ export function decodeAbiString(hex: string): string {
   const len = parseInt(h.slice(64, 128), 16);
   if (!Number.isFinite(len) || len <= 0 || len > 256) return '';
   const bytes = Buffer.from(h.slice(128, 128 + len * 2), 'hex');
-  return bytes.toString('utf8');
+  // The domain separator is keccak of the raw bytes: a name that is not valid
+  // UTF-8 cannot be reproduced from a string, so it is refused, never guessed.
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); } catch { return ''; }
 }
 
 /** Build the payment payload the resource server expects for this x402 version. */
@@ -261,22 +263,28 @@ export function parsePaymentRequired(
    network and payTo are strings. A null entry, or an array where an address
    should be, used to reach the pickers and surface a raw TypeError or a
    coerced value (2026-10-04 round 2). Numeric amounts are kept as strings. */
-const MAX_ACCEPTS = 64; // a bound on the picker's work, well above anything a real server lists
+const MAX_ACCEPTS = 64;
+/** An all-uppercase hex address is not an EIP-55 checksum and viem refuses it at signing; lowercase has no checksum to fail (round 3). Mixed case is kept: it IS a checksum. */
+function lowerIfAllCaps<T>(v: T): T {
+  return (typeof v === 'string' && /^0x[0-9A-F]{40}$/.test(v) && /[A-F]/.test(v)) ? (v.toLowerCase() as unknown as T) : v;
+} // a bound on the picker's work, well above anything a real server lists
 export function sanitizeRequired(req: X402PaymentRequired): X402PaymentRequired {
   const str = (v: unknown) => (typeof v === 'string' ? v : typeof v === 'number' && Number.isFinite(v) ? String(v) : undefined);
   const accepts: X402Requirement[] = [];
   for (const a of (req.accepts as unknown[]).slice(0, MAX_ACCEPTS)) {
     if (!a || typeof a !== 'object' || Array.isArray(a)) continue;
     const o = a as Record<string, unknown>;
-    const scheme = str(o.scheme), network = str(o.network), payTo = str(o.payTo);
+    const scheme = str(o.scheme), network = str(o.network), payTo = lowerIfAllCaps(str(o.payTo));
     if (scheme === undefined || network === undefined || payTo === undefined) continue;
     const extraIn = (o.extra && typeof o.extra === 'object' && !Array.isArray(o.extra)) ? o.extra as Record<string, unknown> : undefined;
     const extra: Record<string, unknown> | undefined = extraIn ? { ...extraIn } : undefined;
     if (extra) for (const k of ['token', 'name', 'version', 'facilitatorAddress', 'spender', 'permit2']) { if (k in extra && typeof extra[k] !== 'string') delete extra[k]; }
+    if (extra && typeof extra.token === 'string') extra.token = lowerIfAllCaps(extra.token);
     const out: Record<string, unknown> = { ...o, scheme, network, payTo };
     for (const k of ['amount', 'maxAmountRequired', 'asset', 'description', 'resource', 'mimeType']) {
       const v = str(o[k]); if (v === undefined) delete out[k]; else out[k] = v;
     }
+    if (typeof out.asset === 'string') out.asset = lowerIfAllCaps(out.asset);
     if (extra) out.extra = extra; else delete out.extra;
     accepts.push(out as unknown as X402Requirement);
   }
@@ -323,7 +331,11 @@ export function pickOption(
   const payable = [...exact, ...upto];
   if (payable.length === 0) {
     const schemes = Array.from(new Set(accepts.map(a => String(a.scheme).slice(0, 40)))).slice(0, 10).join(', ') || 'none';
-    const reason = accepts.some(a => a.scheme === 'upto')
+    if (onChain.length === 0 && accepts.length > 0) {
+      const nets = Array.from(new Set(accepts.map(a => String(a.network).slice(0, 40)))).slice(0, 10).join(', ');
+      return { option: null, chainId: null, reason: `No payable option: the offered network(s) ${nets} are not ones this client knows (pass a CAIP-2 id like eip155:8453 or a chain id).` };
+    }
+    const reason = onChain.some(a => a.scheme === 'upto')
       ? 'This endpoint offers the x402 "upto" scheme without an extra.facilitatorAddress (or without an asset), so the ' +
         'Permit2 authorization cannot be bound to a facilitator. AgentWallet will not approximate it with an upfront transfer. ' +
         'Ask the endpoint operator to publish facilitatorAddress, or an "exact" option.'

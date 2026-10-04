@@ -57,7 +57,7 @@ import {
 import { assessTokenRisk } from './token-risk.js';
 import {
   isLegacyAgentWalletAccept, requiredAmount, buildAuthorization, buildPaymentPayload, buildPaymentPayloadRaw, paymentHeaderFor,
-  parsePaymentRequired, parseSettlement, pickOption, knownTokenDomain,
+  parsePaymentRequired, parseSettlement, pickOption, knownTokenDomain, decodeAbiString as decodeDomainString,
   parseEip7702Delegation, erc1271ProbeCalldata, classifyErc1271Probe,
   type X402Requirement, type Eip3009Authorization, type Erc1271Support,
   settlementVerdict, legacyReceiptAllowed,
@@ -817,7 +817,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.13.8',
+    version: '1.13.9',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()
@@ -1538,8 +1538,11 @@ async function resolveTokenDomain(chainId: number, asset: string, extra?: X402Re
   if (declared) return declared;
   let name = '', version = '';
   try {
-    name = decodeAbiString(await ethCallHex(chainId, asset, '0x06fdde03'));    // name()
-    version = decodeAbiString(await ethCallHex(chainId, asset, '0x54fd4d50')); // version()
+    // The signing decoder (256 bytes, strict UTF-8), not the 64-char display sanitiser
+    // get_token_info uses: a truncated or replaced name signs under a domain the
+    // token never had (round 3).
+    name = decodeDomainString(await ethCallHex(chainId, asset, '0x06fdde03'));    // name()
+    version = decodeDomainString(await ethCallHex(chainId, asset, '0x54fd4d50')); // version()
   } catch { /* refused below */ }
   if (!name || !version) {
     throw new Error(
@@ -1872,7 +1875,7 @@ server.tool(
         const [, live] = other;
         return jsonResponse({
           status: 402, payment_required: true, payment_made: false,
-          error: `This resource already holds a live authorization signed ${Math.round((Date.now() - live.signedAt) / 1000)} s ago for ${live.amount} ${tokenLabel} (the endpoint's requirement changed between answers: amount, recipient, asset or scheme). It is re-sent by calling pay_x402 again with the same arguments once the endpoint asks for the same requirement; to sign a second authorization for this resource pass fresh_authorization=true.`,
+          error: `This resource already holds a live authorization signed ${Math.round((Date.now() - live.signedAt) / 1000)} s ago for ${live.amount} ${tokenLabel} (the endpoint's requirement changed between answers: amount, recipient, asset or scheme). It is re-sent by calling pay_x402 again with the same arguments once the endpoint asks for the same requirement. Nothing more is signed for this resource until that authorization expires.`,
           live_authorization: { amount: live.amount, valid_until: new Date(live.until).toISOString(), payer: live.payer },
           requested_amount: amount, token: tokenLabel, pay_to: option.payTo, chain_id: chainId,
         });
@@ -1913,7 +1916,7 @@ server.tool(
               token: tokenLabel, token_address: tokenAddress, chain_id: chainId, payer, permit2: permit2Address(chainId),
               error: `This endpoint uses the x402 "upto" scheme, which settles through Permit2. Wallet ${payer} has not approved ` +
                 `${tokenLabel} to Permit2 on chain ${chainId}. Call approve_permit2 once for this token (a normal transaction that needs gas), ` +
-                `or set AGENTWALLET_PERMIT2_AUTO_APPROVE=1, then call pay_x402 again.`,
+                `then call pay_x402 again.` + (assetPolicy.via === 'stablecoin' ? ' The operator may instead set AGENTWALLET_PERMIT2_AUTO_APPROVE=1 (registry stablecoins only); that is the operator\'s setting, not the agent\'s.' : ''),
             });
           }
         }
@@ -1997,6 +2000,8 @@ server.tool(
     const retryServedFrom = finalUrlOf(retryRes, url);
     const retryCrossOrigin = new URL(retryServedFrom).origin !== new URL(url).origin;
     const verdict = settlementVerdict(retryRes.status, settlement, retryCrossOrigin);
+    const claimedRaw = typeof settlement?.amount === 'string' && /^\d+$/.test(settlement.amount) ? settlement.amount : null;
+    const claimedAboveMax = claimedRaw !== null && BigInt(claimedRaw) > BigInt(rawAmount);
     if (retryCrossOrigin) {
       retryError = `The paid request was redirected to another origin (${new URL(retryServedFrom).origin}); the payment header is never forwarded across origins, so this response did not see the payment.`;
     }
@@ -2021,6 +2026,9 @@ server.tool(
       permit2_approval_tx: permit2ApprovalTx,
       x402_version: x402Version,
       amount,
+      // For upto the amount is the MAXIMUM the facilitator may settle, not what was
+      // taken; the server's claimed settled amount is shown apart and unverified (round 3).
+      ...(isUpto ? { amount_is_maximum: true, authorized_max: amount, settled_amount_claimed: serverText(settlement?.amount), settled_claim_inconsistent: claimedAboveMax } : {}),
       token: tokenLabel,
       token_address: tokenAddress || null,
       network: option.network,
