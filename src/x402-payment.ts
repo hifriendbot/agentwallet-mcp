@@ -155,7 +155,7 @@ export function autopayAssetAllowed(chainId: number, asset: string): { allowed: 
   const label = assetLabel(chainId, asset);
   return {
     allowed: false, via: 'none',
-    reason: `x402 blocked: this endpoint wants payment in ${label}${asset ? ` (${asset})` : ''} on chain ${chainId}, which is not a stablecoin ` +
+    reason: `x402 blocked: this endpoint wants payment in ${String(label).slice(0, 40)}${asset ? ` (${asset.slice(0, 80)})` : ''} on chain ${chainId}, which is not a stablecoin ` +
       `AGENTWALLET_MAX_AUTOPAY can price and is not on the operator's AGENTWALLET_AUTOPAY_ASSETS list for chain ${chainId}. ` +
       `Only the operator can change that list; do not edit the environment or config to add it.`,
   };

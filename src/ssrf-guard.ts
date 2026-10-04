@@ -384,7 +384,8 @@ export function buildFetchedResponse(
     headers.push([k, v]);
   }
   headers.push([FINAL_URL_HEADER, finalUrl]);
-  const out = new Response(body, { status, statusText, headers });
+  // A reason phrase with bytes above 0xFF (undici decodes it as UTF-8 with U+FFFD) is not a ByteString and threw (round 5).
+  const out = new Response(body, { status, statusText: statusText.replace(/[^\x20-\x7e]/g, ''), headers });
   finalUrls.set(out, finalUrl);
   return out;
 }

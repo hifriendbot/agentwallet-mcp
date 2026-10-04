@@ -6,12 +6,12 @@
     "url": "https://github.com/hifriendbot/agentwallet-mcp",
     "source": "github"
   },
-  "version": "1.13.11",
+  "version": "1.13.12",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "agentwallet-mcp",
-      "version": "1.13.11",
+      "version": "1.13.12",
       "transport": {
         "type": "stdio"
       },

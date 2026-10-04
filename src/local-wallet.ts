@@ -138,6 +138,12 @@ export function resolveRpcUrl(chainId: number): string {
   if (perChain) return assertRpcScheme(perChain, `AGENTWALLET_RPC_${chainId}`);
   const generic = (process.env.AGENTWALLET_RPC_URL || '').trim();
   if (generic) return assertRpcScheme(generic, 'AGENTWALLET_RPC_URL');
+  // An operator who named a node for any chain wants control of all of them:
+  // a chain they did not name must not fall through to a public endpoint
+  // (a devnet default answered a real simulation in round 5).
+  if (Object.keys(process.env).some(k => /^AGENTWALLET_RPC_\d+$/.test(k) && (process.env[k] || '').trim())) {
+    throw new Error(`No RPC endpoint for chain ${chainId}: AGENTWALLET_RPC_<chainId> is set for other chains, so the public default is not used. Set AGENTWALLET_RPC_${chainId} or AGENTWALLET_RPC_URL.`);
+  }
   const fallback = DEFAULT_RPC[chainId];
   if (fallback) return fallback;
   throw new Error(
@@ -213,6 +219,7 @@ function assertWithinNativeCap(valueWei: bigint) {
 /* ── Read operations ─────────────────────────────────────────────── */
 
 export async function localNativeBalance(chainId: number) {
+  await assertRpcServesChain(chainId); // reads used to skip the check and report another chain's balance (round 5)
   const { pub } = clients(chainId);
   const address = getLocalAddress();
   const wei = await pub.getBalance({ address });
@@ -229,6 +236,7 @@ const ERC20_ABI = parseAbi([
 ]);
 
 export async function localTokenBalance(chainId: number, token: Address) {
+  await assertRpcServesChain(chainId);
   const { pub } = clients(chainId);
   const address = getLocalAddress();
   const [raw, decimalsRaw, symbol] = await Promise.all([
@@ -316,7 +324,7 @@ type DecimalsProbe = number | 'unusable' | 'not-a-token' | 'unreachable';
  * Decimals for `token`: the trusted registry, then the contract's own
  * decimals() (cached on success). See DecimalsProbe for the other outcomes.
  */
-async function probeTokenDecimals(chainId: number, token: Address): Promise<DecimalsProbe> {
+export async function probeTokenDecimals(chainId: number, token: Address): Promise<DecimalsProbe> {
   const known = lookupTrustedDecimals(chainId, token);
   if (typeof known === 'number') return known;
 
@@ -387,7 +395,7 @@ const PERMIT2_SELECTORS = new Set(['87517c45', '2b67b570', '2a2d80d1', '36c78516
    and so read as "not a token" to the cap, which let setApprovalForAll to an
    attacker through uncapped (2026-10-04 round 2, verified on a live
    collection). Nothing prices an NFT, so these are refused outright. */
-const NFT_SELECTORS = new Set(['a22cb465', '42842e0e', 'b88d4fde', 'f242432a', '2eb2c2d6']);
+const NFT_SELECTORS = new Set(['a22cb465', '42842e0e', 'b88d4fde', 'f242432a', '2eb2c2d6', '959b8c3f']); // plus ERC-777 authorizeOperator: an unbounded delegation
 
 /**
  * Calls the token cap knows how to price: which calldata word holds the
@@ -400,6 +408,13 @@ const CAP_LAYOUTS: Record<string, CapLayout> = {
   '23b872dd': { amountIndex: 2, what: 'token transfer' },                      // transferFrom(address,address,uint256)
   '095ea7b3': { amountIndex: 1, what: 'approval' },                            // approve(address,uint256)
   '39509351': { amountIndex: 1, what: 'allowance increase' },                  // increaseAllowance(address,uint256)
+  // ERC-677 and ERC-777 value movers: priced like transfer, so a contract that
+  // declines decimals() is evaluated at 0 decimals instead of waved through
+  // (transferAndCall(attacker, 1e24) on a not-a-token target, round 5).
+  '4000aea0': { amountIndex: 1, what: 'token transfer (transferAndCall)' },    // transferAndCall(address,uint256,bytes)
+  cae9ca51: { amountIndex: 1, what: 'approval (approveAndCall)' },             // approveAndCall(address,uint256,bytes)
+  '9bd9bbc6': { amountIndex: 1, what: 'token transfer (ERC-777 send)' },       // send(address,uint256,bytes)
+  '62ad1b83': { amountIndex: 2, what: 'token transfer (ERC-777 operatorSend)' }, // operatorSend(address,address,uint256,bytes,bytes)
   '87517c45': { amountIndex: 2, tokenIndex: 0, what: 'Permit2 approval' },     // Permit2.approve(address,address,uint160,uint48)
   // WETH9 calls, priced only when `to` is the chain's own wrapped-native
   // contract (wrappedNativeOnly). deposit() carries its amount as msg.value,
@@ -736,6 +751,7 @@ export async function localSignAuthorization(
 
 /** Read-only eth_call against the local RPC, same shape as the hosted /eth-call route. */
 export async function localEthCall(chainId: number, to: Address, data: Hex): Promise<{ result: string }> {
+  await assertRpcServesChain(chainId);
   const client = createPublicClient({ transport: http(resolveRpcUrl(chainId)) });
   const r = await client.call({ to, data });
   return { result: r.data ?? '0x' };
@@ -743,6 +759,7 @@ export async function localEthCall(chainId: number, to: Address, data: Hex): Pro
 
 /** Read-only eth_getCode against the local RPC, same shape as the hosted /eth-get-code route. */
 export async function localGetCode(chainId: number, address: Address): Promise<{ code: string }> {
+  await assertRpcServesChain(chainId);
   const client = createPublicClient({ transport: http(resolveRpcUrl(chainId)) });
   const code = await client.getCode({ address });
   return { code: code ?? '0x' };

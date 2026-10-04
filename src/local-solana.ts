@@ -122,6 +122,9 @@ export function resolveSolanaRpc(chainId = 900): string {
   if (perChain) return perChain;
   const explicit = (process.env.AGENTWALLET_SOLANA_RPC || '').trim();
   if (explicit) return explicit;
+  if (Object.keys(process.env).some(k => /^AGENTWALLET_SOLANA_RPC_\d+$/.test(k) && (process.env[k] || '').trim())) {
+    throw new Error(`No Solana RPC for chain ${chainId}: AGENTWALLET_SOLANA_RPC_<chainId> is set for another cluster, so the public default is not used. Set AGENTWALLET_SOLANA_RPC_${chainId} or AGENTWALLET_SOLANA_RPC.`);
+  }
   const fallback = DEFAULT_SOLANA_RPC[chainId];
   if (fallback) return fallback;
   throw new Error(`No Solana RPC for chain ${chainId}. Set AGENTWALLET_SOLANA_RPC.`);

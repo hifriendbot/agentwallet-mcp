@@ -48,7 +48,7 @@ import {
   localSignMessage,
   resolveRpcUrl,
 } from './local-wallet.js';
-import { localSignAuthorization, localEthCall, localGetCode, localSignPermit2Upto } from './local-wallet.js';
+import { localSignAuthorization, localEthCall, localGetCode, localSignPermit2Upto, probeTokenDecimals } from './local-wallet.js';
 import { WRAPPED_NATIVE } from './wrapped-native.js';
 import {
   buildUptoAuthorization, uptoPayload, permit2AllowanceCalldata, permit2ApproveCalldata, decodeUint, permit2Address,
@@ -475,19 +475,26 @@ async function resolveTrustedDecimals(chainId: number, token: string): Promise<n
     );
   }
 
-  // decimals() selector
+  // decimals() selector. In local mode this is the SAME probe and cache the
+  // local cap uses: two caches let a node answer 6 to one and 18 to the other
+  // and move 1000x the cap (round 5).
   let onChain: number | null = null;
-  try {
-    const r = (await api('/eth-call', 'POST', {
-      chain_id: chainId, to: token, data: '0x313ce567',
-    }, { 'X-AGW-SKIP-X402': 'true' })) as { result?: string };
-    const hex = (r?.result || '').replace(/^0x/, '');
-    if (hex && /^[0-9a-fA-F]+$/.test(hex)) {
-      const n = parseInt(hex, 16);
-      if (Number.isInteger(n) && n >= 0 && n <= 36) onChain = n;
+  if (anyLocalMode()) {
+    const p = await probeTokenDecimals(chainId, token as `0x${string}`);
+    onChain = typeof p === 'number' ? p : null;
+  } else {
+    try {
+      const r = (await api('/eth-call', 'POST', {
+        chain_id: chainId, to: token, data: '0x313ce567',
+      }, { 'X-AGW-SKIP-X402': 'true' })) as { result?: string };
+      const hex = (r?.result || '').replace(/^0x/, '');
+      if (hex && /^[0-9a-fA-F]+$/.test(hex)) {
+        const n = parseInt(hex, 16);
+        if (Number.isInteger(n) && n >= 0 && n <= 36) onChain = n;
+      }
+    } catch {
+      onChain = null; // fall through to the refusal below
     }
-  } catch {
-    onChain = null; // fall through to the refusal below
   }
 
   if (onChain === null) {
@@ -700,8 +707,34 @@ function redactRpcSecrets(err: unknown): string {
   const e = err as { shortMessage?: string; details?: string; message?: string };
   // A rejection that is not an Error (web3.js rejects with a raw {InstructionError} object) used to read "[object Object]".
   let msg = e?.shortMessage ? [e.shortMessage, e.details].filter(Boolean).join(' ') : (e?.message !== undefined ? String(e.message) : (err && typeof err === 'object' ? JSON.stringify(err) : String(err)));
+  // Bounded BEFORE the regex: the URL pattern is quadratic on text without "://",
+  // and a node's 160 KB error page held the whole server for 14 s (round 5).
+  msg = msg.slice(0, RPC_ERROR_MAX_CHARS);
   msg = msg.split(/\r?\n/).filter(l => !/^\s*(URL|Request body|Request Arguments|Raw Call Arguments)\s*:/i.test(l)).join('\n').trim();
-  return msg.replace(/[a-z][a-z0-9+.-]*:\/\/[^\s"'<>)]+/gi, (u) => redactUrl(u)); // brackets stay in: IPv6 hosts
+  msg = msg.replace(/[a-z][a-z0-9+.-]*:\/\/[^\s"'<>)]+/gi, (u) => redactUrl(u)); // brackets stay in: IPv6 hosts
+  // A node that echoes the request path ("The requested URL /v3/<key> was not found")
+  // leaks the provider key without a scheme in front of it; every configured RPC
+  // URL's path and query are scrubbed as plain text as well (round 5).
+  for (const secret of rpcPathSecrets()) msg = msg.split(secret).join('/…');
+  return msg.length > 2000 ? msg.slice(0, 2000) + '…' : msg;
+}
+
+const RPC_ERROR_MAX_CHARS = 4000;
+let rpcPathSecretsCache: string[] | null = null;
+/** The path+query of every configured RPC URL (and its URL-decoded form), longest first. */
+function rpcPathSecrets(): string[] {
+  if (rpcPathSecretsCache) return rpcPathSecretsCache;
+  const out = new Set<string>();
+  for (const [k, v] of Object.entries(process.env)) {
+    if (!/^AGENTWALLET_(RPC_URL|RPC_\d+|SOLANA_RPC|SOLANA_RPC_\d+)$/.test(k) || !v) continue;
+    try {
+      const u = new URL(v.trim());
+      const tail = u.pathname + u.search;
+      if (tail.length > 1) { out.add(tail); try { out.add(decodeURIComponent(tail)); } catch { /* keep the raw form */ } }
+    } catch { /* not a URL; nothing to scrub */ }
+  }
+  rpcPathSecretsCache = [...out].sort((a, b) => b.length - a.length);
+  return rpcPathSecretsCache;
 }
 
 /**
@@ -870,7 +903,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.13.11',
+    version: '1.13.12',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()
@@ -1586,7 +1619,10 @@ async function resolveTokenDomain(chainId: number, asset: string, extra?: X402Re
     }
     return known;
   }
-  if (declared) return declared;
+  // Outside the registry the contract's own name()/version() come first; the
+  // 402's declared pair is accepted only when the contract does not answer, and
+  // a declared pair that contradicts the contract is refused (round 5: a
+  // declared "Evil Name"/"9" used to be signed over the real domain).
   let name = '', version = '';
   try {
     // The signing decoder (256 bytes, strict UTF-8), not the 64-char display sanitiser
@@ -1594,14 +1630,18 @@ async function resolveTokenDomain(chainId: number, asset: string, extra?: X402Re
     // token never had (round 3).
     name = decodeDomainString(await ethCallHex(chainId, asset, '0x06fdde03'));    // name()
     version = decodeDomainString(await ethCallHex(chainId, asset, '0x54fd4d50')); // version()
-  } catch { /* refused below */ }
-  if (!name || !version) {
-    throw new Error(
-      `x402: cannot determine the EIP-712 domain for token ${asset} on chain ${chainId}: the endpoint sent no ` +
-      `extra.name/extra.version and the contract did not answer name()/version(). Refused rather than signed with a guessed domain.`,
-    );
+  } catch { /* handled below */ }
+  if (name && version) {
+    if (declared && (declared.name !== name || declared.version !== version)) {
+      throw new Error(`x402: the endpoint declared EIP-712 domain "${serverText(declared.name)}"/"${serverText(declared.version)}" for ${asset} on chain ${chainId}, but the contract reports "${serverText(name)}"/"${serverText(version)}"; refusing to sign under a domain the token would reject.`);
+    }
+    return { name, version };
   }
-  return { name, version };
+  if (declared) return declared;
+  throw new Error(
+    `x402: cannot determine the EIP-712 domain for token ${asset} on chain ${chainId}: the endpoint sent no ` +
+    `extra.name/extra.version and the contract did not answer name()/version(). Refused rather than signed with a guessed domain.`,
+  );
 }
 
 /** Text an endpoint wrote, bounded so it cannot flood the agent's context. */
@@ -2054,8 +2094,14 @@ tool(
     const retryServedFrom = finalUrlOf(retryRes, url);
     const retryCrossOrigin = new URL(retryServedFrom).origin !== new URL(url).origin;
     const verdict = settlementVerdict(retryRes.status, settlement, retryCrossOrigin);
-    const claimedRaw = typeof settlement?.amount === 'string' && /^\d+$/.test(settlement.amount) ? settlement.amount : null;
-    const claimedAboveMax = claimedRaw !== null && BigInt(claimedRaw) > BigInt(rawAmount);
+    // The server's claimed settled amount may be in base units or human units; it is inconsistent if it exceeds the maximum in either reading.
+    const claimedStr = typeof settlement?.amount === 'string' ? settlement.amount.trim() : null;
+    let claimedAboveMax = false;
+    if (claimedStr && /^\d+(\.\d+)?$/.test(claimedStr)) {
+      try {
+        claimedAboveMax = (/^\d+$/.test(claimedStr) && BigInt(claimedStr) > BigInt(rawAmount)) || BigInt(parseUnits(claimedStr, trustedDecimals)) > BigInt(rawAmount);
+      } catch { claimedAboveMax = false; }
+    }
     if (retryCrossOrigin) {
       retryError = `The paid request was redirected to another origin (${new URL(retryServedFrom).origin}); the payment header is never forwarded across origins, so this response did not see the payment.`;
     }
@@ -2074,6 +2120,8 @@ tool(
       payment_made: verdict.payment_made,
       payment_outcome: verdict.outcome,
       authorization_reused: authorizationReused,
+      // A cached authorization is re-sent as signed; if this call's max_payment is lower than it, say so (no new authorization was signed).
+      cached_authorization_above_current_cap: authorizationReused && !isWithinCap(rawAmount, trustedDecimals, effectiveMax),
       retry_error: retryError,
       payment_method: isUpto ? 'permit2-upto-authorization' : (standardExact ? 'eip3009-authorization' : 'onchain-transfer'),
       approval_id: approvalUsed,
@@ -2151,7 +2199,13 @@ tool(
     token: z.string().regex(/^0x[a-fA-F0-9]{40}$/).describe('ERC-20 token contract address'),
     chain_id: z.number().int().describe('Chain ID'),
   },
-  async ({ token, chain_id }) => jsonResponse({ token, chain_id, risk: await assessTokenRisk(chain_id, token, (to, data) => ethCallHex(chain_id, to, data)) }),
+  async ({ token, chain_id }) => {
+    if (process.env.AGENTWALLET_TOKEN_RISK === '0') {
+      // The operator said no third-party lookups; approve_token honoured it, this tool did not (round 5).
+      return jsonResponse({ token, chain_id, risk: { source: 'none', notes: ['The GoPlus lookup is disabled by AGENTWALLET_TOKEN_RISK=0; no third party was contacted.'] } });
+    }
+    return jsonResponse({ token, chain_id, risk: await assessTokenRisk(chain_id, token, (to, data) => ethCallHex(chain_id, to, data)) });
+  },
 );
 
 // ─── Tool: get_usage ─────────────────────────────────────────────
