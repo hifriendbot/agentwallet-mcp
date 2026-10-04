@@ -199,7 +199,12 @@ async function routeLocally(
       throw new Error(`Local mode expects an EVM address, got "${to}".`);
     }
     const hasData = data && data !== '0x';
-    return localSend(chainId, to as `0x${string}`, value, hasData ? (data as `0x${string}`) : undefined);
+    const fees = {
+      ...(body?.gas_limit ? { gas: String(body.gas_limit) } : {}),
+      ...(body?.max_fee ? { maxFeePerGas: String(body.max_fee) } : {}),
+      ...(body?.priority_fee ? { maxPriorityFeePerGas: String(body.priority_fee) } : {}),
+    };
+    return localSend(chainId, to as `0x${string}`, value, hasData ? (data as `0x${string}`) : undefined, fees);
   }
 
   // POST /wallets/{id}/x402/authorize  (x402 "exact": EIP-3009 authorization, signed here, broadcast by nobody)
@@ -724,7 +729,7 @@ async function verifiedDecimals(chainId: number, token: string, given?: number):
 /** Cap variables are read at send time; a typo must fail at startup, not after funding. */
 function validateGuardEnv(): void {
   parseDecimalPins(process.env.AGENTWALLET_TOKEN_DECIMALS); // throws on a malformed pin
-  for (const name of ['AGENTWALLET_MAX_TX_NATIVE', 'AGENTWALLET_MAX_TX_TOKEN', 'AGENTWALLET_MAX_TX_SOL', 'AGENTWALLET_MAX_AUTOPAY']) {
+  for (const name of ['AGENTWALLET_MAX_TX_NATIVE', 'AGENTWALLET_MAX_TX_TOKEN', 'AGENTWALLET_MAX_TX_SOL', 'AGENTWALLET_MAX_AUTOPAY', 'AGENTWALLET_MAX_FEE_NATIVE']) {
     const raw = process.env[name];
     const v = (raw || '').trim();
     // Set but blank is a typo, not "no cap": refuse to start rather than run uncapped.
@@ -766,7 +771,7 @@ function validateGuardEnv(): void {
     throw new Error(`Unknown environment variable ${k}. AgentWallet refuses to start on an unrecognised AGENTWALLET_* name so that a misspelled cap cannot run uncapped. Known names: ${[...KNOWN_ENV].join(', ')}, AGENTWALLET_RPC_<chainId>, AGENTWALLET_SOLANA_RPC_<chainId>.`);
   }
 }
-const KNOWN_ENV = new Set(["AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS","AGENTWALLET_API_URL","AGENTWALLET_APPROVALS","AGENTWALLET_AUTOPAY_ASSETS","AGENTWALLET_CHAIN_ID","AGENTWALLET_DASHBOARD_URL","AGENTWALLET_KEYFILE","AGENTWALLET_LEGACY_PAYWALL_ORIGINS","AGENTWALLET_MAX_AUTOPAY","AGENTWALLET_MAX_AUTOPAY_PER_HOUR","AGENTWALLET_MAX_TX_NATIVE","AGENTWALLET_MAX_TX_SOL","AGENTWALLET_MAX_TX_TOKEN","AGENTWALLET_PASS","AGENTWALLET_PERMIT2_AUTO_APPROVE","AGENTWALLET_PRIVATE_KEY","AGENTWALLET_RPC_URL","AGENTWALLET_SOLANA_KEY","AGENTWALLET_SOLANA_KEYFILE","AGENTWALLET_SOLANA_RPC","AGENTWALLET_TOKEN_DECIMALS","AGENTWALLET_TOKEN_RISK","AGENTWALLET_USER","AGENTWALLET_WALLET_ID","AGENTWALLET_X402_MAX_TIMEOUT"]);
+const KNOWN_ENV = new Set(["AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS","AGENTWALLET_API_URL","AGENTWALLET_APPROVALS","AGENTWALLET_AUTOPAY_ASSETS","AGENTWALLET_CHAIN_ID","AGENTWALLET_DASHBOARD_URL","AGENTWALLET_KEYFILE","AGENTWALLET_LEGACY_PAYWALL_ORIGINS","AGENTWALLET_MAX_AUTOPAY","AGENTWALLET_MAX_AUTOPAY_PER_HOUR","AGENTWALLET_MAX_FEE_NATIVE","AGENTWALLET_MAX_TX_NATIVE","AGENTWALLET_MAX_TX_SOL","AGENTWALLET_MAX_TX_TOKEN","AGENTWALLET_PASS","AGENTWALLET_PERMIT2_AUTO_APPROVE","AGENTWALLET_PRIVATE_KEY","AGENTWALLET_RPC_URL","AGENTWALLET_SOLANA_KEY","AGENTWALLET_SOLANA_KEYFILE","AGENTWALLET_SOLANA_RPC","AGENTWALLET_TOKEN_DECIMALS","AGENTWALLET_TOKEN_RISK","AGENTWALLET_USER","AGENTWALLET_WALLET_ID","AGENTWALLET_X402_MAX_TIMEOUT"]);
 
 /**
  * Register a tool whose arguments are strict: an unknown key (max_payemnt for
@@ -865,7 +870,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.13.10',
+    version: '1.13.11',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()
@@ -2464,6 +2469,7 @@ tool(
         address: getLocalAddress(),
         rpc_endpoint: redactUrl(rpc),
         per_tx_cap_native: (process.env.AGENTWALLET_MAX_TX_NATIVE || '').trim() || 'not set',
+        per_tx_fee_cap_native: (process.env.AGENTWALLET_MAX_FEE_NATIVE || '').trim() || '0.01 (default)',
       };
     } else {
       report.evm = 'no local EVM key. EVM operations are refused, not sent to the hosted signer.';

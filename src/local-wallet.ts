@@ -29,6 +29,7 @@ import {
   ExecutionRevertedError,
   AbiDecodingDataSizeTooSmallError,
   AbiDecodingDataSizeInvalidError,
+  keccak256,
   type Address,
   type Hex,
 } from 'viem';
@@ -134,15 +135,26 @@ const DEFAULT_RPC: Record<number, string> = {
 
 export function resolveRpcUrl(chainId: number): string {
   const perChain = (process.env[`AGENTWALLET_RPC_${chainId}`] || '').trim();
-  if (perChain) return perChain;
+  if (perChain) return assertRpcScheme(perChain, `AGENTWALLET_RPC_${chainId}`);
   const generic = (process.env.AGENTWALLET_RPC_URL || '').trim();
-  if (generic) return generic;
+  if (generic) return assertRpcScheme(generic, 'AGENTWALLET_RPC_URL');
   const fallback = DEFAULT_RPC[chainId];
   if (fallback) return fallback;
   throw new Error(
     `No RPC endpoint for chain ${chainId} in local mode. ` +
     `Set AGENTWALLET_RPC_${chainId} to an endpoint you trust.`
   );
+}
+
+/** An RPC over plain http to anything but loopback is the hostile-node model in full; refused like the API URL is. */
+function assertRpcScheme(url: string, name: string): string {
+  let u: URL;
+  try { u = new URL(url); } catch { throw new Error(`${name} is not a URL: "${url}".`); }
+  const loopback = u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '[::1]';
+  if (u.protocol !== 'https:' && !(u.protocol === 'http:' && loopback)) {
+    throw new Error(`${name} must be https (got ${u.protocol}//${u.host}); plain http is allowed only for localhost.`);
+  }
+  return url;
 }
 
 /**
@@ -219,16 +231,21 @@ const ERC20_ABI = parseAbi([
 export async function localTokenBalance(chainId: number, token: Address) {
   const { pub } = clients(chainId);
   const address = getLocalAddress();
-  const [raw, decimals, symbol] = await Promise.all([
+  const [raw, decimalsRaw, symbol] = await Promise.all([
     pub.readContract({ address: token, abi: ERC20_ABI, functionName: 'balanceOf', args: [address] }) as Promise<bigint>,
-    pub.readContract({ address: token, abi: ERC20_ABI, functionName: 'decimals' }).catch(() => 18) as Promise<number>,
+    pub.readContract({ address: token, abi: ERC20_ABI, functionName: 'decimals' }).catch(() => null) as Promise<number | null>,
     pub.readContract({ address: token, abi: ERC20_ABI, functionName: 'symbol' }).catch(() => '') as Promise<string>,
   ]);
+  // A decimals() of 2^20 handed to viem's formatUnits held the whole server for
+  // minutes (quadratic trailing-zero trim, round 4): only 0..36 is formatted.
+  const d = Number(decimalsRaw);
+  const safe = Number.isInteger(d) && d >= 0 && d <= 36 ? d : null;
   return {
     address, chain_id: chainId, token, symbol,
-    decimals: Number(decimals),
+    decimals: safe,
     balance_raw: raw.toString(),
-    balance: formatUnits(raw, Number(decimals)),
+    balance: safe === null ? null : formatUnits(raw, safe),
+    ...(safe === null ? { warning: 'the token reported decimals outside 0..36 (or none); only the raw balance is shown' } : {}),
     mode: 'local',
   };
 }
@@ -243,6 +260,7 @@ export interface LocalSendResult {
   chain_id: number;
   mode: 'local';
   signed_locally: true;
+  gas?: string; max_fee_per_gas?: string; worst_case_fee?: string;
 }
 
 /**
@@ -323,8 +341,11 @@ async function probeTokenDecimals(chainId: number, token: Address): Promise<Deci
   if (result.length !== 66) return 'unusable'; // answered, but not one uint8 word
   const d = Number(BigInt(result));
   // Reject nonsense rather than trusting it; an out-of-range value would
-  // widen the ceiling exactly like the old assumption did.
-  if (Number.isInteger(d) && d >= 0 && d <= 36) {
+  // widen the ceiling exactly like the old assumption did. Above 18 the RPC is
+  // the only witness and a lie there scales the cap by 10^18 (a node saying 36
+  // for mainnet WETH, round 4): such tokens must be pinned with
+  // AGENTWALLET_TOKEN_DECIMALS.
+  if (Number.isInteger(d) && d >= 0 && d <= 18) {
     decimalsCache.set(key, d);
     return d;
   }
@@ -519,11 +540,33 @@ async function assertWithinTokenCap(chainId: number, to: Address, data: Hex, val
   }
 }
 
+/** Caller-chosen gas parameters (wei / gas units as decimal strings); honoured, then bounded by the fee cap. */
+export interface FeeOverrides { gas?: string; maxFeePerGas?: string; maxPriorityFeePerGas?: string }
+
+function parseUint(v: string, what: string): bigint {
+  if (!/^\d{1,40}$/.test(v)) throw new Error(`${what} must be a non-negative integer string, got "${v}".`);
+  return BigInt(v);
+}
+
+/**
+ * The most a transaction may burn in fees: gas x maxFeePerGas, in native units.
+ * Without it a node that answered a 47,000 gwei tip or a 30M gas estimate took
+ * the whole balance as fees on a cap-compliant 0.001 ETH transfer (round 4).
+ * Default 0.01; AGENTWALLET_MAX_FEE_NATIVE raises or lowers it.
+ */
+export function feeCapWei(): bigint {
+  const raw = (process.env.AGENTWALLET_MAX_FEE_NATIVE || '0.01').trim();
+  if (!/^\d+(\.\d+)?$/.test(raw)) throw new Error(`AGENTWALLET_MAX_FEE_NATIVE must be a decimal number, got "${raw}".`);
+  const [whole, frac = ''] = raw.split('.');
+  return BigInt(whole + frac.padEnd(18, '0').slice(0, 18));
+}
+
 export async function localSend(
   chainId: number,
   to: Address,
   valueWei: bigint,
-  data?: Hex
+  data?: Hex,
+  fees?: FeeOverrides
 ): Promise<LocalSendResult> {
   assertWithinNativeCap(valueWei);
   if (data && data !== '0x') {
@@ -531,21 +574,75 @@ export async function localSend(
     await assertWithinTokenCap(chainId, to, data, valueWei);
   }
   await assertRpcServesChain(chainId);
-  const { wallet } = clients(chainId);
-  const hash = await wallet.sendTransaction({
-    to,
-    value: valueWei,
-    ...(data ? { data } : {}),
-  } as Parameters<typeof wallet.sendTransaction>[0]);
+  const { pub, wallet } = clients(chainId);
+  const account = getLocalAccount();
+  const base = { account, to, value: valueWei, ...(data ? { data } : {}) };
+
+  // Gas: the caller's figure when given (it used to be read and dropped,
+  // round 4), otherwise the node's estimate.
+  const gas = fees?.gas ? parseUint(fees.gas, 'gas_limit') : await pub.estimateGas(base);
+
+  // Fees: the caller's figures when given, otherwise the node's; either way the
+  // worst case gas x maxFeePerGas must fit the fee cap before anything is signed.
+  let maxFeePerGas: bigint | undefined;
+  let maxPriorityFeePerGas: bigint | undefined;
+  let gasPrice: bigint | undefined;
+  if (fees?.maxFeePerGas) {
+    maxFeePerGas = parseUint(fees.maxFeePerGas, 'max_fee');
+    maxPriorityFeePerGas = fees.maxPriorityFeePerGas ? parseUint(fees.maxPriorityFeePerGas, 'priority_fee') : maxFeePerGas;
+  } else {
+    try {
+      const est = await pub.estimateFeesPerGas();
+      maxFeePerGas = est.maxFeePerGas;
+      maxPriorityFeePerGas = fees?.maxPriorityFeePerGas ? parseUint(fees.maxPriorityFeePerGas, 'priority_fee') : est.maxPriorityFeePerGas;
+    } catch {
+      gasPrice = (await pub.estimateFeesPerGas({ type: 'legacy' })).gasPrice; // a chain without EIP-1559
+    }
+  }
+  if (maxFeePerGas !== undefined && maxPriorityFeePerGas !== undefined && maxPriorityFeePerGas > maxFeePerGas) maxPriorityFeePerGas = maxFeePerGas;
+  const perGas = maxFeePerGas ?? gasPrice ?? 0n;
+  const worst = gas * perGas;
+  const feeCap = feeCapWei();
+  if (worst > feeCap) {
+    throw new Error(
+      `Blocked by local guard: the transaction could burn up to ${formatUnits(worst, 18)} native in fees (gas ${gas} x ${formatUnits(perGas, 9)} gwei), ` +
+      `above AGENTWALLET_MAX_FEE_NATIVE (${formatUnits(feeCap, 18)}). A node answering an absurd fee or gas estimate is the usual cause; ` +
+      `pass gas_limit / max_fee / priority_fee explicitly, or the operator can raise the cap.`
+    );
+  }
+
+  // Sign here, hash here, then hand the bytes to the node: the hash reported is
+  // the one computed from the signed transaction, never the node's answer.
+  const address = getLocalAddress();
+  const nonce = await account.nonceManager!.consume({ address, chainId, client: pub });
+  const request = await wallet.prepareTransactionRequest({
+    ...base, gas, nonce, chainId,
+    ...(gasPrice !== undefined ? { type: 'legacy' as const, gasPrice } : { type: 'eip1559' as const, maxFeePerGas: maxFeePerGas!, maxPriorityFeePerGas: maxPriorityFeePerGas! }),
+  } as Parameters<typeof wallet.prepareTransactionRequest>[0]);
+  const signed = await wallet.signTransaction(request as Parameters<typeof wallet.signTransaction>[0]);
+  const localHash = keccak256(signed);
+  let reported: string;
+  try {
+    reported = await pub.sendRawTransaction({ serializedTransaction: signed });
+  } catch (e) {
+    account.nonceManager!.reset({ address, chainId });
+    throw new Error(`Broadcast of transaction ${localHash} (nonce ${nonce}) failed: ${(e as Error).message.split('\n')[0]}. The transaction is signed and MAY be live if the node forwarded it before answering; check the hash on an explorer before retrying.`);
+  }
+  if (reported.toLowerCase() !== localHash.toLowerCase()) {
+    throw new Error(`Transaction ${localHash} (nonce ${nonce}) was BROADCAST, but the node answered with a different hash (${String(reported).slice(0, 80)}), so it cannot be trusted about its fate. Verify ${localHash} on an explorer before retrying.`);
+  }
 
   return {
-    tx_hash: hash,
-    from: getLocalAddress(),
+    tx_hash: localHash,
+    from: address,
     to,
     value: valueWei.toString(),
     chain_id: chainId,
     mode: 'local',
     signed_locally: true,
+    gas: gas.toString(),
+    max_fee_per_gas: (maxFeePerGas ?? gasPrice ?? 0n).toString(),
+    worst_case_fee: formatUnits(worst, 18),
   };
 }
 

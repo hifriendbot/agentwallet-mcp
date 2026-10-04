@@ -39,7 +39,7 @@ Run `wallet_mode` at any time and the server will tell you which one you are in,
 
 Use `AGENTWALLET_KEYFILE=/path/to/key` instead if you would rather keep the key out of your shell config (one or the other: the server refuses to start when both are set). The key is read once, never written to disk, never logged, and never included in an error message.
 
-`AGENTWALLET_RPC_<chainId>` (or `AGENTWALLET_RPC_URL` for all chains) points at an endpoint you trust. Without it a public RPC is used, and a public RPC can see which addresses you ask about.
+`AGENTWALLET_RPC_<chainId>` (or `AGENTWALLET_RPC_URL` for all chains) points at an endpoint you trust (https; plain http only on localhost). Without it a public RPC is used, and a public RPC can see which addresses you ask about. Decimals for a token outside the registry come from that RPC and are accepted only up to 18; pin anything else with `AGENTWALLET_TOKEN_DECIMALS`.
 
 `AGENTWALLET_MAX_TX_NATIVE` is a per-transaction ceiling in native units (ETH, MATIC and so on). In hosted mode the server enforces limits; in local mode there is no server, so these guards are the only ones there are. Set them.
 
@@ -330,6 +330,7 @@ Which guards apply depends on who holds the key.
 **Local mode** (you hold the key): there is no server in the signing path, so the server-side limits and pause above cannot see or stop a locally signed transaction, and nobody (including us) can freeze a local wallet. Your protection is the per-transaction caps enforced inside your own process before anything is signed. Set them before you fund the wallet; an unset cap means no limit.
 
 - `AGENTWALLET_MAX_TX_NATIVE`: ceiling per transaction in native units (ETH, MATIC, and so on)
+- `AGENTWALLET_MAX_FEE_NATIVE`: the most one transaction may burn in fees, gas x max fee per gas, in native units (default `0.01`). The value cap alone did not bound fees: a node answering an absurd tip or gas estimate could take the whole balance as priority fee on a cap-compliant transfer. Caller-supplied `gas_limit` / `max_fee` / `priority_fee` are honoured and then bounded by this cap
 - `AGENTWALLET_MAX_TX_TOKEN`: ceiling per ERC-20 transfer or approval, in human units of the token
 - `AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS`: set to `1` to let calldata the token cap cannot price reach a token contract or Permit2 (refused by default while the cap is set)
 - `AGENTWALLET_TOKEN_DECIMALS`: pin decimals for tokens outside the registry (`8453:0x<token>=6,<mint>=9`); a pin is used for amounts and caps instead of asking the RPC

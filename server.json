@@ -6,12 +6,12 @@
     "url": "https://github.com/hifriendbot/agentwallet-mcp",
     "source": "github"
   },
-  "version": "1.13.10",
+  "version": "1.13.11",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "agentwallet-mcp",
-      "version": "1.13.10",
+      "version": "1.13.11",
       "transport": {
         "type": "stdio"
       },
@@ -201,6 +201,13 @@
         {
           "name": "AGENTWALLET_LEGACY_PAYWALL_ORIGINS",
           "description": "Comma-separated https origins whose legacy-shaped 402 may be paid by an on-chain transfer proved by hash (the API host always may)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_MAX_FEE_NATIVE",
+          "description": "Local mode: the most a transaction may burn in fees (gas x max fee per gas), in native units; default 0.01",
           "isRequired": false,
           "format": "string",
           "isSecret": false

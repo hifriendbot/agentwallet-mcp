@@ -14,6 +14,7 @@
  * from a trusted source and the declared value is only ever used to detect a
  * mismatch and refuse.
  */
+import { wrappedNativeAddress } from './wrapped-native.js';
 
 export interface X402AcceptLike {
   maxAmountRequired: string;
@@ -276,6 +277,10 @@ export function lookupTrustedDecimals(chainId: number, token: string): number | 
   if (!token) return null;
   const pinned = pinnedDecimals(chainId, token);
   if (pinned !== null) return pinned;
+  // Every chain's wrapped native coin is 18 decimals (WETH9 clones; the local
+  // guard asserts it). The registry carried WETH for Base only, so mainnet WETH
+  // was priced by the RPC, which could say 36 (2026-10-04 round 4).
+  if (wrappedNativeAddress(chainId)?.toLowerCase() === token.toLowerCase()) return 18;
   const spl = TRUSTED_SPL_DECIMALS[token];
   if (typeof spl === 'number') return spl;
   const forChain = TRUSTED_DECIMALS[chainId];

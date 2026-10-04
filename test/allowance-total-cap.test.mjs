@@ -129,8 +129,10 @@ console.log('\nAGENTWALLET_TOKEN_DECIMALS pins decimals ahead of the RPC\n');
   const token = nextToken();
   decimals = 36; // the RPC lies: 36 decimals makes a 1-token cap 10^36 base units
   const transfer = encodeFunctionData({ abi: ABI, functionName: 'transfer', args: [SPENDER, 500000000000000000000000000000000000n] }); // 5e35
-  await passedGuard('control: with no pin the RPC answer prices the cap and the transfer passes',
-    token, transfer);
+  // Until 1.13.10 the RPC's 36 priced the cap and this 5e35 transfer passed; since 1.13.11 an RPC answer above 18
+  // is not trusted at all and the cap falls back to 0 decimals, so the same transfer refuses even without a pin.
+  await refused('control: with no pin an RPC answer of 36 is not trusted and the transfer refuses at 0 decimals',
+    token, transfer, /evaluated at 0 decimals/);
 
   const pinned = nextToken();
   process.env.AGENTWALLET_TOKEN_DECIMALS = `${CHAIN}:${pinned}=6`;
