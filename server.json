@@ -6,12 +6,12 @@
     "url": "https://github.com/hifriendbot/agentwallet-mcp",
     "source": "github"
   },
-  "version": "1.13.9",
+  "version": "1.13.10",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "agentwallet-mcp",
-      "version": "1.13.9",
+      "version": "1.13.10",
       "transport": {
         "type": "stdio"
       },
@@ -31,11 +31,39 @@
           "isSecret": true
         },
         {
+          "name": "AGENTWALLET_API_URL",
+          "description": "Hosted mode: the API base (default https://hifriendbot.com/wp-json/agentwallet/v1); must be https, or http on localhost",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_WALLET_ID",
+          "description": "Hosted mode: wallet id that pays hosted billing 402s automatically (POST /wallets, /sign, /send only); unset means never",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_DASHBOARD_URL",
+          "description": "Hosted mode: dashboard link shown in tool text",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
           "name": "AGENTWALLET_PRIVATE_KEY",
           "description": "Local (self-custody) mode: 0x-prefixed EVM private key; signing then happens in this process",
           "isRequired": false,
           "format": "string",
           "isSecret": true
+        },
+        {
+          "name": "AGENTWALLET_KEYFILE",
+          "description": "Local mode: path of a file holding the EVM private key (instead of AGENTWALLET_PRIVATE_KEY; not both)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
         },
         {
           "name": "AGENTWALLET_SOLANA_KEY",
@@ -45,8 +73,43 @@
           "isSecret": true
         },
         {
-          "name": "AGENTWALLET_MAX_AUTOPAY",
-          "description": "Per-payment x402 ceiling in stablecoin units (default 1); the agent cannot raise it",
+          "name": "AGENTWALLET_SOLANA_KEYFILE",
+          "description": "Local mode for Solana: path of a key file (instead of AGENTWALLET_SOLANA_KEY; not both)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_RPC_URL",
+          "description": "Local mode: one EVM RPC for every chain",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_RPC_<chainId>",
+          "description": "Local mode: EVM RPC per chain, e.g. AGENTWALLET_RPC_8453; eth_chainId is checked",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_SOLANA_RPC",
+          "description": "Local mode: one Solana RPC for every cluster",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_SOLANA_RPC_<chainId>",
+          "description": "Local mode: Solana RPC per cluster (900 mainnet, 901 devnet, 902 testnet); the genesis hash is checked",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_CHAIN_ID",
+          "description": "Local mode: default EVM chain when a call names none (default 8453)",
           "isRequired": false,
           "format": "string",
           "isSecret": false
@@ -66,15 +129,78 @@
           "isSecret": false
         },
         {
-          "name": "AGENTWALLET_TOKEN_DECIMALS",
-          "description": "Optional: pin decimals for tokens outside the registry, e.g. 8453:0x<token>=6,<mint>=9; used for amounts and caps instead of the RPC's answer",
+          "name": "AGENTWALLET_MAX_TX_SOL",
+          "description": "Local mode: per-transaction ceiling in SOL (also charged for a recipient token account the send creates)",
           "isRequired": false,
           "format": "string",
           "isSecret": false
         },
         {
-          "name": "AGENTWALLET_MAX_TX_SOL",
-          "description": "Local mode: per-transaction ceiling in SOL",
+          "name": "AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS",
+          "description": "Local mode: 1 lets calldata the token cap cannot price reach a token contract (refused by default)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_TOKEN_DECIMALS",
+          "description": "Pin decimals for tokens outside the registry, e.g. 8453:0x<token>=6,<mint>=9; used for amounts and caps instead of the RPC answer",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_MAX_AUTOPAY",
+          "description": "Per-payment x402 ceiling in stablecoin units (default 1); the agent cannot raise it",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_MAX_AUTOPAY_PER_HOUR",
+          "description": "Hosted mode: how many internal 402 auto-payments an hour (default 20; 0 disables)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_AUTOPAY_ASSETS",
+          "description": "Assets pay_x402 may pay in beyond registry stablecoins, e.g. 8453:native,0x<token>",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_X402_MAX_TIMEOUT",
+          "description": "Longest x402 authorization window in seconds (default 3600; 60 to 31536000)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_APPROVALS",
+          "description": "Hosted mode: 0 disables emailing the wallet owner for an over-cap payment",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_PERMIT2_AUTO_APPROVE",
+          "description": "Hosted mode: 1 approves exactly an upto payment maximum to Permit2 for registry stablecoins",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_TOKEN_RISK",
+          "description": "0 skips the GoPlus lookup approve_token performs",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_LEGACY_PAYWALL_ORIGINS",
+          "description": "Comma-separated https origins whose legacy-shaped 402 may be paid by an on-chain transfer proved by hash (the API host always may)",
           "isRequired": false,
           "format": "string",
           "isSecret": false

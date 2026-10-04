@@ -40,7 +40,7 @@ await blocked(
 // must not be able to widen the ceiling.
 await blocked(
   'caller-supplied decimals cannot widen the cap',
-  '1000000000000', 18, /evaluated at 6 decimals/
+  '1000000000000', 18, /evaluated at 6 decimals|has 6 decimals; refusing/ // since 1.13.10 the decimals mismatch itself refuses first
 );
 
 console.log(`\nspl-cap: ${passed} passed`);

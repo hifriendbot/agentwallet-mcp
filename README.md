@@ -37,7 +37,7 @@ Run `wallet_mode` at any time and the server will tell you which one you are in,
 }
 ```
 
-Use `AGENTWALLET_KEYFILE=/path/to/key` instead if you would rather keep the key out of your shell config. The key is read once, never written to disk, never logged, and never included in an error message.
+Use `AGENTWALLET_KEYFILE=/path/to/key` instead if you would rather keep the key out of your shell config (one or the other: the server refuses to start when both are set). The key is read once, never written to disk, never logged, and never included in an error message.
 
 `AGENTWALLET_RPC_<chainId>` (or `AGENTWALLET_RPC_URL` for all chains) points at an endpoint you trust. Without it a public RPC is used, and a public RPC can see which addresses you ask about.
 
@@ -69,7 +69,7 @@ Local signing uses [viem](https://viem.sh) for EVM and `@solana/web3.js` for Sol
 `npm audit` reports no advisories as of 1.13.5; the overrides in package.json keep two advisories under `@solana/web3.js`'s jayson closed. Earlier releases carried advisories inside `@modelcontextprotocol/sdk`'s HTTP transport dependencies. This server speaks stdio, so that code never loads, and the SDK is not something this package can patch. Run the audit yourself. Publishing a tree you can inspect is the point.
 
 <p align="center">
-  <img src="assets/demo.svg" alt="AgentWallet demo, AI agent pays x402 invoice automatically" width="800">
+  <img src="https://raw.githubusercontent.com/hifriendbot/agentwallet-mcp/main/assets/demo.svg" alt="AgentWallet demo, AI agent pays x402 invoice automatically" width="800">
 </p>
 
 ## Features
@@ -118,7 +118,7 @@ Add to your config:
 }
 ```
 
-> `AGENTWALLET_WALLET_ID` is optional. Set it to enable x402 auto-pay: when you exceed the free tier without a credit card, the MCP server automatically pays for operations with USDC from this wallet.
+> `AGENTWALLET_WALLET_ID` is optional. Set it to enable x402 auto-pay: when you exceed the free tier without a credit card, the MCP server automatically pays for operations with USDC from this wallet. Only the metered routes (creating a wallet, signing, sending) are paid this way, at most `AGENTWALLET_MAX_AUTOPAY_PER_HOUR` times an hour (default 20), and every automatic payment is reported in the tool result under `autopay_payment`. A 402 on any other route is reported, never paid.
 >
 > **Auto-pay safety cap.** `AGENTWALLET_MAX_AUTOPAY` (optional, default `1`) is the most one x402 payment may authorize, in stablecoin units: `1` means one dollar. It prices registry stablecoins only (USDC, USDT, USDbC, DAI on the supported chains, USDC and USDT on Solana). A requirement in the chain's native asset or in any other token is refused, because "1" measured in ETH is a few thousand dollars; list such assets in `AGENTWALLET_AUTOPAY_ASSETS` (comma-separated addresses or mints, or the word `native`) to allow them, and the cap then applies in that asset's own units. Any requirement above the cap is rejected instead of paid, so a malformed or tampered payment requirement cannot drain the wallet. This automatic path settles `exact` requirements only; an `upto` offer from the API is refused before any wallet call, because paying a usage maximum upfront is not what the offer means (use `pay_x402`, which signs a Permit2 authorization for it). The cap is the operator's ceiling: a `max_payment` argument can lower it for one call but never raise it. Raise the variable itself if you genuinely need larger automatic payments (for example `"5"` for up to 5 USDC per call).
 
@@ -337,8 +337,10 @@ Which guards apply depends on who holds the key.
 - `AGENTWALLET_MAX_AUTOPAY`: ceiling per x402 auto-payment in stablecoin units (default `1`); `AGENTWALLET_AUTOPAY_ASSETS` opts native or non-stable assets in; `AGENTWALLET_X402_MAX_TIMEOUT` bounds how long a signed authorization stays valid (default 3600 seconds)
 - `AGENTWALLET_SOLANA_RPC_<chainId>` (or `AGENTWALLET_SOLANA_RPC` for all clusters): the RPC's genesis hash is checked against the chain id before anything is sent, and an EVM RPC's `eth_chainId` likewise, so one URL cannot silently serve a different network than the one requested
 - `AGENTWALLET_TOKEN_RISK=0`: skip the GoPlus lookup `approve_token` performs (a third-party call that reveals which token you are about to approve)
+- `AGENTWALLET_CHAIN_ID`: the EVM chain used when a call names none (default 8453)
+- `AGENTWALLET_LEGACY_PAYWALL_ORIGINS`: comma-separated https origins whose legacy-shaped 402 may be settled by an on-chain transfer proved by hash; every other host gets a signed authorization
 
-All cap variables are validated at startup; a typo stops the server rather than reading as "no limit". `wallet_mode` reports every guard, including the token cap and whether unknown token calls are allowed. Node.js 22.19 or newer is required.
+Every `AGENTWALLET_*` variable is validated at startup: a malformed cap stops the server rather than reading as "no limit", and an unrecognised name (a misspelled cap) stops it too. `wallet_mode` reports every guard with its parsed value. Tool arguments are strict: an unknown argument name (a typo in `max_payment`) is an error, never silently ignored. `pay_x402` signs one live authorization per resource; a second, different requirement for the same resource is refused until the first expires unless `fresh_authorization` is passed. Node.js 22.19 or newer is required.
 
 **Either mode**, for x402 paywalls you run through the hosted API:
 

@@ -130,9 +130,10 @@ const { localSplTransfer } = await import('../build/local-solana.js');
 try {
   ataMode = 'prefunded';
   await refused('a pre-funded system account at the token-account address is created into (stops at the blockhash)', () => localSplTransfer(MINT, WALLET, '1', 6, 900), /not served|blockhash/i);
-  ok('the rent shortfall, not the full rent, was charged to the SOL cap', () => { assert.deepStrictEqual(rentSizes, [165]); });
-  ataMode = 'prefunded'; process.env.AGENTWALLET_MAX_TX_SOL = '0.0015'; // full rent 0.00204 would exceed this; the shortfall 0.00115 does not
-  await refused('the shortfall fits a cap the full rent would not', () => localSplTransfer(MINT, WALLET, '1', 6, 900), /not served|blockhash/i);
+  ok('the rent was asked for the real account size', () => { assert.deepStrictEqual(rentSizes, [165]); });
+  // Since 1.13.10 the full rent is charged even for a pre-funded address: the node's lamports claim is not trusted (round 4).
+  ataMode = 'prefunded'; process.env.AGENTWALLET_MAX_TX_SOL = '0.0015';
+  await refused('the full rent is charged against the cap even when the node says the address is pre-funded', () => localSplTransfer(MINT, WALLET, '1', 6, 900), /exceeds AGENTWALLET_MAX_TX_SOL/);
   delete process.env.AGENTWALLET_MAX_TX_SOL;
   ataMode = 'foreign';
   await refused('an address occupied by another program still refuses', () => localSplTransfer(MINT, WALLET, '1', 6, 900), /occupied by an account owned by Stake/);

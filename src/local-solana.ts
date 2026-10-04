@@ -20,7 +20,6 @@ import {
   SystemProgram,
   Transaction,
   TransactionInstruction,
-  sendAndConfirmTransaction,
   LAMPORTS_PER_SOL,
 } from '@solana/web3.js';
 import bs58 from 'bs58';
@@ -193,7 +192,10 @@ function assertWithinSolCap(lamports: bigint) {
  * exploited: for a mint with d decimals, a ceiling evaluated at 6 is 10**(6-d)
  * times too permissive, and SPL mints with 0 to 5 decimals are common.
  */
-const splDecimalsCache = new Map<string, number>();
+/* The cap and the instruction read the mint's decimals through ONE call now:
+   a cached cap-side read and an uncached instruction-side read let a hostile
+   RPC answer 6 to one and 18 to the other, which scaled the cap by 10^12
+   while the instruction carried the real byte (2026-10-04 round 4). */
 
 /** The mint's decimals from the chain, or null when they cannot be read. Never guesses. */
 export async function mintDecimalsStrict(mint: string, chainId: number): Promise<number | null> {
@@ -210,36 +212,13 @@ export async function mintDecimalsStrict(mint: string, chainId: number): Promise
     return null;
   }
 }
-async function resolveMintDecimals(mint: string, chainId: number): Promise<number> {
-  const known = lookupTrustedDecimals(chainId, mint);
-  if (typeof known === 'number') return known;
-
-  const cacheKey = `${chainId}:${mint}`; // the same mint address can exist on two clusters with different decimals
-  const cached = splDecimalsCache.get(cacheKey);
-  if (typeof cached === 'number') return cached;
-
-  try {
-    const conn = connection(chainId);
-    const info = await conn.getParsedAccountInfo(new PublicKey(mint));
-    const data: any = info?.value?.data;
-    const d = Number(data?.parsed?.info?.decimals);
-    if (Number.isInteger(d) && d >= 0 && d <= 36) {
-      splDecimalsCache.set(cacheKey, d);
-      return d;
-    }
-  } catch {
-    // Unreachable RPC or non-standard mint: fall through to the safe floor.
-  }
-  return 0;
-}
-
-async function assertWithinSplCap(mint: string, rawAmount: bigint, chainId = 900) {
+/** The cap is evaluated at exactly the decimals the instruction will carry; the caller passes the value it just verified against the chain. */
+function assertWithinSplCap(rawAmount: bigint, decimals: number) {
   const cap = (process.env.AGENTWALLET_MAX_TX_TOKEN || '').trim();
   if (!cap) return;
   if (!/^\d+(\.\d+)?$/.test(cap)) {
     throw new Error(`AGENTWALLET_MAX_TX_TOKEN must be a decimal number, got "${cap}".`);
   }
-  const decimals = await resolveMintDecimals(mint, chainId);
   const [whole, frac = ''] = cap.split('.');
   const capRaw = BigInt(whole + frac.padEnd(decimals, '0').slice(0, decimals));
   if (rawAmount > capRaw) {
@@ -249,6 +228,38 @@ async function assertWithinSplCap(mint: string, rawAmount: bigint, chainId = 900
       `Raise the cap deliberately if this is intended.`
     );
   }
+}
+
+const CONFIRM_TIMEOUT_MS = 90_000;
+
+/**
+ * Sign, broadcast and confirm. The signature reported is the one computed
+ * here, never the node's answer (a node that returned a different string had
+ * the agent confirming and reporting a signature that was not this
+ * transaction, round 4); anything that fails after the broadcast says so and
+ * carries the signature, so an agent does not retry a transfer that went out.
+ */
+async function sendSigned(conn: Connection, tx: Transaction, payer: Keypair): Promise<string> {
+  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash();
+  tx.recentBlockhash = blockhash;
+  tx.feePayer = payer.publicKey;
+  tx.sign(payer);
+  if (!tx.signature) throw new Error('The transaction could not be signed.');
+  const local = bs58.encode(tx.signature);
+  const reported = await conn.sendRawTransaction(tx.serialize());
+  const after = (what: string) => new Error(`Transaction ${local} was BROADCAST but ${what}. Check it on an explorer before retrying: a retry is a second transfer.`);
+  if (reported !== local) throw after(`the RPC answered with a different signature (${String(reported).slice(0, 90)}), so the node cannot be trusted about its fate`);
+  const confirm = conn.confirmTransaction({ signature: local, blockhash, lastValidBlockHeight }, 'confirmed');
+  const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(after(`was not confirmed within ${CONFIRM_TIMEOUT_MS / 1000} s`)), CONFIRM_TIMEOUT_MS).unref());
+  let result: Awaited<typeof confirm>;
+  try {
+    result = await Promise.race([confirm, timeout]);
+  } catch (e) {
+    if (e instanceof Error && /was BROADCAST/.test(e.message)) throw e;
+    throw after(`confirmation failed: ${e instanceof Error ? e.message : JSON.stringify(e)}`);
+  }
+  if (result.value.err) throw after(`it failed on chain: ${JSON.stringify(result.value.err)}`);
+  return local;
 }
 
 /* ── Reads ───────────────────────────────────────────────────────── */
@@ -390,7 +401,7 @@ export async function localSolTransfer(to: string, lamports: string, chainId = 9
     })
   );
 
-  const signature = await sendAndConfirmTransaction(conn, tx, [payer]);
+  const signature = await sendSigned(conn, tx, payer);
   return {
     signature,
     from: payer.publicKey.toBase58(),
@@ -465,20 +476,21 @@ export async function localSplTransfer(
   // The cluster is verified before the cap reads decimals from it, so the
   // decimals cache is never filled from a node serving another chain.
   await assertCluster(conn, chainId);
-  await assertWithinSplCap(mintStr, BigInt(rawAmount), chainId);
+  // The caller scaled the amount by `decimals`. That value must be the mint's
+  // real one: substituting the real value into the instruction (as 1.13.0
+  // did) let a wrong guess through, because the amount had already been
+  // scaled by the guess and TransferChecked only sees the real byte
+  // (2026-10-04 audit). A mismatch refuses. Read ONCE, and the cap below is
+  // evaluated at this same value (round 4).
+  const real = await mintDecimalsStrict(mintStr, chainId);
+  if (real === null) throw new Error(`Could not read the decimals of mint ${mintStr} from the chain; refusing to guess the scale of the amount.`);
+  if (decimals !== real) throw new Error(`decimals ${decimals} was passed but mint ${mintStr} has ${real} decimals; refusing to scale the amount by the wrong factor.`);
+  assertWithinSplCap(BigInt(rawAmount), real);
   const payer = getSolanaKeypair();
   const mint = new PublicKey(mintStr);
   const recipient = new PublicKey(to);
   await assertRecipientIsWallet(conn, recipient);
   const { tokenProgram, ataSize } = await mintLayout(conn, mint);
-  // The caller scaled the amount by `decimals`. That value must be the mint's
-  // real one: substituting the real value into the instruction (as 1.13.0
-  // did) let a wrong guess through, because the amount had already been
-  // scaled by the guess and TransferChecked only sees the real byte
-  // (2026-10-04 audit). A mismatch refuses.
-  const real = await mintDecimalsStrict(mintStr, chainId);
-  if (real === null) throw new Error(`Could not read the decimals of mint ${mintStr} from the chain; refusing to guess the scale of the amount.`);
-  if (decimals !== real) throw new Error(`decimals ${decimals} was passed but mint ${mintStr} has ${real} decimals; refusing to scale the amount by the wrong factor.`);
 
   const sourceAta = associatedTokenAddress(payer.publicKey, mint, tokenProgram);
   const destAta = associatedTokenAddress(recipient, mint, tokenProgram);
@@ -499,16 +511,19 @@ export async function localSplTransfer(
     // outflow the SOL cap must see (0.002 SOL a time adds up over many sends).
     // Rent follows the account's real size, which for Token-2022 is above 165;
     // SOL already sitting at the address reduces what the payer tops up.
-    const rent = await conn.getMinimumBalanceForRentExemption(ataSize);
-    const shortfall = Math.max(0, rent - (destInfo?.lamports ?? 0));
-    assertWithinSolCap(BigInt(shortfall));
+    // The node's rent figure is floored at the cluster constant and the SOL the
+    // node says already sits at the address is not credited: both are numbers a
+    // lying RPC used to zero so the create went out under the cap (round 4).
+    const claimed = Number(await conn.getMinimumBalanceForRentExemption(ataSize));
+    const rent = Math.max(Number.isFinite(claimed) ? Math.trunc(claimed) : 0, (128 + ataSize) * 6960);
+    assertWithinSolCap(BigInt(rent));
     tx.add(createAtaIdempotentIx(payer.publicKey, destAta, recipient, mint, tokenProgram));
   }
   tx.add(
     transferCheckedIx(tokenProgram, sourceAta, mint, destAta, payer.publicKey, BigInt(rawAmount), decimals)
   );
 
-  const signature = await sendAndConfirmTransaction(conn, tx, [payer]);
+  const signature = await sendSigned(conn, tx, payer);
   return {
     signature,
     from: payer.publicKey.toBase58(),

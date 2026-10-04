@@ -81,16 +81,27 @@ function anyLocalMode(): boolean {
 
 // ─── Configuration ──────────────────────────────────────────────
 
-const API_BASE = process.env.AGENTWALLET_API_URL || 'https://hifriendbot.com/wp-json/agentwallet/v1';
-const API_USER = process.env.AGENTWALLET_USER || '';
-const API_PASS = process.env.AGENTWALLET_PASS || '';  // WordPress application password
-const X402_WALLET_ID = process.env.AGENTWALLET_WALLET_ID || '';  // Wallet ID for x402 auto-pay
-const DASHBOARD_URL = process.env.AGENTWALLET_DASHBOARD_URL || 'https://hifriendbot.com/wallet/';
+const API_BASE = (process.env.AGENTWALLET_API_URL || 'https://hifriendbot.com/wp-json/agentwallet/v1').trim().replace(/\/+$/, '');
+const API_USER = (process.env.AGENTWALLET_USER || '').trim();
+const API_PASS = (process.env.AGENTWALLET_PASS || '').trim();  // WordPress application password
+const X402_WALLET_ID = (process.env.AGENTWALLET_WALLET_ID || '').trim();  // Wallet ID for x402 auto-pay
+const DASHBOARD_URL = (process.env.AGENTWALLET_DASHBOARD_URL || 'https://hifriendbot.com/wallet/').trim();
 
 // Basic credentials and 402 auto-pay decisions ride on this URL, so it must be
-// https, or loopback for a local test server. Anything else is refused at start.
-if (/^http:/i.test(API_BASE) && !/^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?(\/|$)/i.test(API_BASE)) {
-  throw new Error(`AGENTWALLET_API_URL must be https (got ${API_BASE}); plain http is allowed only for localhost.`);
+// https, or loopback for a local test server. The value is parsed, not
+// pattern-matched: a leading space defeated the old regex while fetch still
+// sent the credentials in plaintext (2026-10-04 round 4).
+{
+  let u: URL;
+  try { u = new URL(API_BASE); } catch { throw new Error(`AGENTWALLET_API_URL is not a URL: "${API_BASE}".`); }
+  const loopback = u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '[::1]';
+  if (u.username || u.password) throw new Error('AGENTWALLET_API_URL must not carry credentials; use AGENTWALLET_USER and AGENTWALLET_PASS.');
+  if (u.protocol !== 'https:' && !(u.protocol === 'http:' && loopback)) {
+    throw new Error(`AGENTWALLET_API_URL must be https (got ${u.protocol}//${u.host}); plain http is allowed only for localhost.`);
+  }
+  if (API_USER.includes(':')) throw new Error('AGENTWALLET_USER must not contain ":" (the Basic auth separator).');
+  if ((API_USER === '') !== (API_PASS === '')) console.error('AgentWallet MCP: warning, only one of AGENTWALLET_USER / AGENTWALLET_PASS is set; hosted calls will carry no credentials.');
+  if (X402_WALLET_ID && !/^\d+$/.test(X402_WALLET_ID)) throw new Error(`AGENTWALLET_WALLET_ID must be a wallet id (digits only), got "${X402_WALLET_ID}".`);
 }
 
 // ─── API Helper ─────────────────────────────────────────────────
@@ -390,7 +401,7 @@ function autopayRouteAllowed(path: string, method: string): boolean {
   return method === 'POST' && /^\/wallets(\/\d+\/(sign|send))?(\?|$)/.test(path);
 }
 
-const AUTOPAY_PER_HOUR = (() => { const n = Number(process.env.AGENTWALLET_MAX_AUTOPAY_PER_HOUR ?? '20'); return Number.isInteger(n) && n >= 0 ? n : 20; })();
+const AUTOPAY_PER_HOUR = (() => { const raw = (process.env.AGENTWALLET_MAX_AUTOPAY_PER_HOUR ?? '20').trim(); return /^\d+$/.test(raw) ? Number(raw) : 20; })(); // validated in validateGuardEnv
 const autopayLog: number[] = [];
 
 /** Read a body no larger than maxChars, refusing early on a declared length and mid-stream on a real one. */
@@ -682,7 +693,8 @@ const PAYWALL_MAX_CHARS = 4 * 1024 * 1024; // a paywall's answer, before and aft
    and the client's log (2026-10-04 audit). */
 function redactRpcSecrets(err: unknown): string {
   const e = err as { shortMessage?: string; details?: string; message?: string };
-  let msg = e?.shortMessage ? [e.shortMessage, e.details].filter(Boolean).join(' ') : String(e?.message ?? err);
+  // A rejection that is not an Error (web3.js rejects with a raw {InstructionError} object) used to read "[object Object]".
+  let msg = e?.shortMessage ? [e.shortMessage, e.details].filter(Boolean).join(' ') : (e?.message !== undefined ? String(e.message) : (err && typeof err === 'object' ? JSON.stringify(err) : String(err)));
   msg = msg.split(/\r?\n/).filter(l => !/^\s*(URL|Request body|Request Arguments|Raw Call Arguments)\s*:/i.test(l)).join('\n').trim();
   return msg.replace(/[a-z][a-z0-9+.-]*:\/\/[^\s"'<>)]+/gi, (u) => redactUrl(u)); // brackets stay in: IPv6 hosts
 }
@@ -728,6 +740,42 @@ function validateGuardEnv(): void {
   if (t && (!/^\d+$/.test(t) || Number(t) < 60 || Number(t) > 31_536_000)) {
     throw new Error(`AGENTWALLET_X402_MAX_TIMEOUT must be a whole number of seconds between 60 and 31536000, got "${t}".`);
   }
+  const perHour = process.env.AGENTWALLET_MAX_AUTOPAY_PER_HOUR;
+  if (perHour !== undefined && !/^\d+$/.test(perHour.trim())) {
+    throw new Error(`AGENTWALLET_MAX_AUTOPAY_PER_HOUR must be a whole number (0 disables internal auto-pay), got "${perHour}".`);
+  }
+  for (const o of (process.env.AGENTWALLET_LEGACY_PAYWALL_ORIGINS || '').split(',').map(x => x.trim()).filter(Boolean)) {
+    let u: URL | null = null;
+    try { u = new URL(o); } catch { u = null; }
+    if (!u || u.protocol !== 'https:' || u.origin !== o.replace(/\/+$/, '')) {
+      throw new Error(`AGENTWALLET_LEGACY_PAYWALL_ORIGINS entry "${o}" is not an https origin (scheme and host only, like https://shop.example).`);
+    }
+  }
+  // Two sources for one key family is ambiguous; refuse rather than pick one silently.
+  if ((process.env.AGENTWALLET_PRIVATE_KEY || '').trim() && (process.env.AGENTWALLET_KEYFILE || '').trim()) {
+    throw new Error('Both AGENTWALLET_PRIVATE_KEY and AGENTWALLET_KEYFILE are set; keep one.');
+  }
+  if ((process.env.AGENTWALLET_SOLANA_KEY || '').trim() && (process.env.AGENTWALLET_SOLANA_KEYFILE || '').trim()) {
+    throw new Error('Both AGENTWALLET_SOLANA_KEY and AGENTWALLET_SOLANA_KEYFILE are set; keep one.');
+  }
+  // An unrecognised AGENTWALLET_* name is almost always a misspelled cap, which
+  // would run uncapped without a word (round 4). Refuse to start instead.
+  for (const k of Object.keys(process.env)) {
+    if (!k.startsWith('AGENTWALLET_')) continue;
+    if (KNOWN_ENV.has(k) || /^AGENTWALLET_(RPC|SOLANA_RPC)_\d+$/.test(k)) continue;
+    throw new Error(`Unknown environment variable ${k}. AgentWallet refuses to start on an unrecognised AGENTWALLET_* name so that a misspelled cap cannot run uncapped. Known names: ${[...KNOWN_ENV].join(', ')}, AGENTWALLET_RPC_<chainId>, AGENTWALLET_SOLANA_RPC_<chainId>.`);
+  }
+}
+const KNOWN_ENV = new Set(["AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS","AGENTWALLET_API_URL","AGENTWALLET_APPROVALS","AGENTWALLET_AUTOPAY_ASSETS","AGENTWALLET_CHAIN_ID","AGENTWALLET_DASHBOARD_URL","AGENTWALLET_KEYFILE","AGENTWALLET_LEGACY_PAYWALL_ORIGINS","AGENTWALLET_MAX_AUTOPAY","AGENTWALLET_MAX_AUTOPAY_PER_HOUR","AGENTWALLET_MAX_TX_NATIVE","AGENTWALLET_MAX_TX_SOL","AGENTWALLET_MAX_TX_TOKEN","AGENTWALLET_PASS","AGENTWALLET_PERMIT2_AUTO_APPROVE","AGENTWALLET_PRIVATE_KEY","AGENTWALLET_RPC_URL","AGENTWALLET_SOLANA_KEY","AGENTWALLET_SOLANA_KEYFILE","AGENTWALLET_SOLANA_RPC","AGENTWALLET_TOKEN_DECIMALS","AGENTWALLET_TOKEN_RISK","AGENTWALLET_USER","AGENTWALLET_WALLET_ID","AGENTWALLET_X402_MAX_TIMEOUT"]);
+
+/**
+ * Register a tool whose arguments are strict: an unknown key (max_payemnt for
+ * max_payment) is an error that names it, not a silently dropped guard. The
+ * advertised schema always said additionalProperties: false; now the runtime
+ * agrees (round 4).
+ */
+function tool<S extends z.ZodRawShape>(name: string, description: string, shape: S, cb: (args: z.infer<z.ZodObject<S>>, extra: unknown) => unknown) {
+  return server.registerTool(name, { description, inputSchema: z.object(shape).strict() }, cb as never);
 }
 
 // ─── EVM Helpers ──────────────────────────────────────────────────
@@ -817,11 +865,11 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.13.9',
+    version: '1.13.10',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()
-      ? 'This server runs in LOCAL (self-custody) mode: the operator supplied the key, signing happens in this process, and the only spend guards are the AGENTWALLET_MAX_TX_* environment caps. There is no server-side pause, daily limit or approval email; pause_wallet, unpause_wallet and delete_wallet are refused.'
+      ? 'This server runs in LOCAL (self-custody) mode: the operator supplied the key, signing happens in this process, and the only spend guards are the environment caps (AGENTWALLET_MAX_TX_NATIVE / _TOKEN / _SOL per transaction, AGENTWALLET_MAX_AUTOPAY and AGENTWALLET_AUTOPAY_ASSETS for x402, AGENTWALLET_X402_MAX_TIMEOUT for authorization windows). There is no server-side pause, daily limit or approval email; pause_wallet, unpause_wallet and delete_wallet are refused.'
       : 'Private keys are encrypted server-side and never exposed: agents sign and broadcast transactions without ever touching raw keys.'}
 
 ## Getting Started
@@ -877,9 +925,7 @@ Create paywalls to charge other agents for accessing your resources:
 
 ## Wallet Security
 - ${anyLocalMode() ? 'pause_wallet does not exist in local mode: revoke the key (rotate it and move the funds) if the process is compromised.' : 'Use pause_wallet to immediately freeze a wallet if compromised. No transactions can be signed while paused.'}
-- Use unpause_wallet to resume operations.
-- Use delete_wallet to permanently disable a wallet.
-- ${anyLocalMode() ? 'Spend limits are the AGENTWALLET_MAX_TX_NATIVE / _TOKEN / _SOL / _AUTOPAY caps the operator set; run wallet_mode to see them. Unset means no limit.' : 'Wallets have server-enforced spending limits.'}
+${anyLocalMode() ? '' : '- Use unpause_wallet to resume operations.\n- Use delete_wallet to permanently disable a wallet.\n'}- ${anyLocalMode() ? 'Spend limits are the AGENTWALLET_MAX_TX_NATIVE / _TOKEN / _SOL caps the operator set (unset means no limit) and AGENTWALLET_MAX_AUTOPAY for x402 (default 1); run wallet_mode to see them.' : 'Wallets have server-enforced spending limits.'}
 
 ## Tool Selection Guide
 | Goal | Tool |
@@ -902,7 +948,7 @@ Create paywalls to charge other agents for accessing your resources:
 
 // ─── Tool: create_wallet ─────────────────────────────────────────
 
-server.tool(
+tool(
   'create_wallet',
   'Create a new EVM or Solana wallet. Returns the wallet ID and address. ' +
     (anyLocalMode() ? 'In local mode this reports the key already configured; no wallet is created remotely.' : 'Private key is encrypted server-side and never exposed.'),
@@ -918,7 +964,7 @@ server.tool(
 
 // ─── Tool: list_wallets ──────────────────────────────────────────
 
-server.tool(
+tool(
   'list_wallets',
   'List all wallets owned by the authenticated user. ' +
     'Returns wallet IDs, addresses, labels, chain IDs, and status.',
@@ -931,7 +977,7 @@ server.tool(
 
 // ─── Tool: get_wallet ────────────────────────────────────────────
 
-server.tool(
+tool(
   'get_wallet',
   'Get details for a specific wallet by ID. ' +
     'Returns address, label, chain, spending limits, and pause status.',
@@ -946,7 +992,7 @@ server.tool(
 
 // ─── Tool: get_balance ───────────────────────────────────────────
 
-server.tool(
+tool(
   'get_balance',
   'Get the native token balance for a wallet on a specific chain. ' +
     'Returns balance in both wei (or lamports for Solana) and human-readable format.',
@@ -963,7 +1009,7 @@ server.tool(
 
 // ─── Tool: sign_transaction ──────────────────────────────────────
 
-server.tool(
+tool(
   'sign_transaction',
   'Sign a transaction with a wallet\'s private key. ' +
     'For EVM: returns signed raw transaction hex. For Solana: returns base64 signed transaction. ' +
@@ -1011,7 +1057,7 @@ server.tool(
 
 // ─── Tool: send_transaction ──────────────────────────────────────
 
-server.tool(
+tool(
   'send_transaction',
   'Sign and broadcast a transaction. ' +
     'Returns the transaction hash (EVM) or signature (Solana) on success. ' +
@@ -1059,7 +1105,7 @@ server.tool(
 
 // ─── Tool: transfer ─────────────────────────────────────────────
 
-server.tool(
+tool(
   'transfer',
   'Send native tokens (ETH, AVAX, BNB, POL, PLS, SOL) to an address. ' +
     'Specify the amount in human-readable format (e.g. "0.1" for 0.1 ETH). ' +
@@ -1101,7 +1147,7 @@ server.tool(
 
 // ─── Tool: get_token_balance ────────────────────────────────────
 
-server.tool(
+tool(
   'get_token_balance',
   'Get the ERC-20 or SPL token balance for a wallet on a specific chain. ' +
     'Returns the raw balance and human-readable balance. ' +
@@ -1153,7 +1199,7 @@ server.tool(
 
 // ─── Tool: transfer_token ───────────────────────────────────────
 
-server.tool(
+tool(
   'transfer_token',
   'Send ERC-20 tokens (EVM) or SPL tokens (Solana) to an address. ' +
     'Specify the amount in human-readable format (e.g. "100" for 100 USDC). ' +
@@ -1211,7 +1257,7 @@ server.tool(
 
 // ─── Tool: call_contract ────────────────────────────────────────
 
-server.tool(
+tool(
   'call_contract',
   'Execute a read-only call against a smart contract (eth_call). ' +
     'Returns the raw hex result. Does not cost gas or modify state. ' +
@@ -1232,7 +1278,7 @@ server.tool(
 
 // ─── Tool: approve_token ────────────────────────────────────────
 
-server.tool(
+tool(
   'approve_token',
   'Approve a spender contract to transfer ERC-20 tokens on your behalf. ' +
     'Required before interacting with any DeFi protocol (DEXs, lending, etc.). ' +
@@ -1284,7 +1330,7 @@ server.tool(
 
 // ─── Tool: get_allowance ────────────────────────────────────────
 
-server.tool(
+tool(
   'get_allowance',
   'Check how many ERC-20 tokens a spender is approved to transfer. ' +
     'Returns the allowance in both raw and human-readable format. ' +
@@ -1332,7 +1378,7 @@ server.tool(
 
 // ─── Tool: wrap_eth ─────────────────────────────────────────────
 
-server.tool(
+tool(
   'wrap_eth',
   'Wrap native tokens (ETH, AVAX, BNB, POL, PLS) into their wrapped ERC-20 version (WETH, WAVAX, etc.). ' +
     'Required for most DeFi protocols that use ERC-20 tokens instead of raw native tokens. ' +
@@ -1372,7 +1418,7 @@ server.tool(
 
 // ─── Tool: unwrap_eth ───────────────────────────────────────────
 
-server.tool(
+tool(
   'unwrap_eth',
   'Unwrap wrapped tokens (WETH, WAVAX, WBNB, etc.) back to native tokens. ' +
     'Specify amount in human-readable format (e.g. "0.5" for 0.5 WETH).',
@@ -1437,7 +1483,7 @@ function decodeAbiString(hex: string): string {
   }
 }
 
-server.tool(
+tool(
   'get_token_info',
   'Get the name, symbol, and decimals of any ERC-20 token by its contract address. ' +
     'Useful for discovering token details before transfers or approvals.',
@@ -1590,7 +1636,7 @@ async function signPermit2(walletId: number, chainId: number, auth: UptoPermit2A
 
 // ─── Tool: pay_x402 ─────────────────────────────────────────────
 
-server.tool(
+tool(
   'pay_x402',
   'Handle an x402 payment flow. Fetches a URL, and if the server returns HTTP 402 Payment Required, ' +
     'parses the payment requirements (v1 body or v2 PAYMENT-REQUIRED header), signs an EIP-3009 ' +
@@ -1630,6 +1676,9 @@ server.tool(
     ),
   },
   async ({ url, wallet_id, method, headers: headersJson, body: reqBody, max_payment, prefer_chain, request_approval, approval_id, fresh_authorization }) => {
+    if (max_payment !== undefined && !/^\d+(\.\d+)?$/.test(String(max_payment).trim())) {
+      throw new Error(`max_payment must be a decimal number of stablecoin units, got "${serverText(max_payment)}"; nothing was fetched.`);
+    }
     // Build request headers
     const reqHeaders: Record<string, string> = { Accept: 'application/json' };
     if (headersJson) {
@@ -2052,7 +2101,7 @@ server.tool(
 
 // ─── Tool: check_approval ───────────────────────────────────────
 
-server.tool(
+tool(
   'check_approval',
   'Status of a payment approval created when pay_x402 exceeded the cap on a hosted wallet. ' +
     'Returns pending, approved, denied or expired. Once approved, call pay_x402 again with approval_id.',
@@ -2062,7 +2111,7 @@ server.tool(
 
 // ─── Tool: approve_permit2 ──────────────────────────────────────
 
-server.tool(
+tool(
   'approve_permit2',
   'One-time ERC-20 approval of a token to the Permit2 contract, needed before paying x402 "upto" endpoints with that token. ' +
     'A normal on-chain transaction (needs gas). By default approves the maximum, the ecosystem norm, so it never has to be repeated; ' +
@@ -2088,7 +2137,7 @@ server.tool(
 
 // ─── Tool: check_token_risk ─────────────────────────────────────
 
-server.tool(
+tool(
   'check_token_risk',
   'Assess an ERC-20 token before approving or swapping it: honeypot, taxes, owner powers, verified source, ' +
     'holder concentration, DEX liquidity. Uses GoPlus Security (free, no key) with an on-chain fallback. ' +
@@ -2102,7 +2151,7 @@ server.tool(
 
 // ─── Tool: get_usage ─────────────────────────────────────────────
 
-server.tool(
+tool(
   'get_usage',
   'Get the current month\'s usage statistics. ' +
     'Returns operations count, tier info, remaining quota, and fees.',
@@ -2115,7 +2164,7 @@ server.tool(
 
 // ─── Tool: buy_verification_credits ─────────────────────────────
 
-server.tool(
+tool(
   'buy_verification_credits',
   'Buy x402 verification credits with USDC on-chain. ' +
     'Paywall owners need credits to process verifications beyond the free tier (1,000/month) ' +
@@ -2133,7 +2182,7 @@ server.tool(
 
 // ─── Tool: pause_wallet ──────────────────────────────────────────
 
-server.tool(
+tool(
   'pause_wallet',
   'Emergency pause a wallet. No transactions can be signed while paused.',
   {
@@ -2147,7 +2196,7 @@ server.tool(
 
 // ─── Tool: unpause_wallet ────────────────────────────────────────
 
-server.tool(
+tool(
   'unpause_wallet',
   'Resume a paused wallet so transactions can be signed again.',
   {
@@ -2161,7 +2210,7 @@ server.tool(
 
 // ─── Tool: get_chains ────────────────────────────────────────────
 
-server.tool(
+tool(
   'get_chains',
   'List all supported chains (EVM + Solana) with their chain IDs, native tokens, ' +
     'stablecoins, and RPC configuration status.',
@@ -2174,7 +2223,7 @@ server.tool(
 
 // ─── Tool: delete_wallet ─────────────────────────────────────────
 
-server.tool(
+tool(
   'delete_wallet',
   'Delete (soft-delete) a wallet. The wallet will no longer appear in listings ' +
     'and cannot be used for transactions. The wallet is read first and the delete names its address, ' +
@@ -2195,7 +2244,7 @@ server.tool(
 
 // ─── Tool: create_paywall ────────────────────────────────────────
 
-server.tool(
+tool(
   'create_paywall',
   'Create an x402 paywall that charges agents/clients for accessing a resource. ' +
     'Returns a public access URL that returns HTTP 402 until paid. ' +
@@ -2243,7 +2292,7 @@ server.tool(
 
 // ─── Tool: list_paywalls ────────────────────────────────────────
 
-server.tool(
+tool(
   'list_paywalls',
   'List all your x402 paywalls. Returns paywall IDs, names, pricing, ' +
     'access URLs, payment counts, and revenue totals.',
@@ -2259,7 +2308,7 @@ server.tool(
 
 // ─── Tool: get_paywall ──────────────────────────────────────────
 
-server.tool(
+tool(
   'get_paywall',
   'Get details for a specific x402 paywall by ID. ' +
     'Returns pricing, access URL, payment stats, and configuration.',
@@ -2274,7 +2323,7 @@ server.tool(
 
 // ─── Tool: update_paywall ───────────────────────────────────────
 
-server.tool(
+tool(
   'update_paywall',
   'Update an x402 paywall configuration. ' +
     'Can change price, resource URL, active status, or any other field.',
@@ -2315,7 +2364,7 @@ server.tool(
 
 // ─── Tool: delete_paywall ───────────────────────────────────────
 
-server.tool(
+tool(
   'delete_paywall',
   'Delete an x402 paywall. The access URL will return 404 after deletion.',
   {
@@ -2329,7 +2378,7 @@ server.tool(
 
 // ─── Tool: get_paywall_payments ─────────────────────────────────
 
-server.tool(
+tool(
   'get_paywall_payments',
   'Get payment history for a specific x402 paywall. ' +
     'Returns verified payments with TX hashes, payer addresses, amounts, and timestamps.',
@@ -2346,7 +2395,7 @@ server.tool(
 
 // ─── Tool: get_x402_revenue ─────────────────────────────────────
 
-server.tool(
+tool(
   'get_x402_revenue',
   'Get aggregate x402 revenue statistics across all your paywalls. ' +
     'Returns total payments and revenue broken down by chain and token.',
@@ -2359,7 +2408,7 @@ server.tool(
 
 // ─── Tool: wallet_mode ──────────────────────────────────────────
 
-server.tool(
+tool(
   'wallet_mode',
   'Report whether this server is signing locally (self-custody, the private key never leaves this machine) ' +
     'or through the hosted AgentWallet API (custodial). Use this to verify custody before moving funds.',
@@ -2373,8 +2422,13 @@ server.tool(
         api_base: redactUrl(API_BASE),
         client_guards: {
           autopay_cap_usd: autopayEnvCap(),
+          internal_autopay_armed: Boolean(X402_WALLET_ID),
+          max_autopay_per_hour: AUTOPAY_PER_HOUR,
           autopay_assets: (process.env.AGENTWALLET_AUTOPAY_ASSETS || '').trim() || 'registry stablecoins only',
           x402_max_timeout_seconds: maxAuthWindowSeconds(),
+          approvals: process.env.AGENTWALLET_APPROVALS !== '0',
+          permit2_auto_approve: process.env.AGENTWALLET_PERMIT2_AUTO_APPROVE === '1',
+          legacy_paywall_origins: (process.env.AGENTWALLET_LEGACY_PAYWALL_ORIGINS || '').trim() || 'none (API host only)',
           note: 'These bound pay_x402 on hosted wallets too; the hosted signer adds its own pause, daily limit and approval checks.',
         },
         to_self_custody:
@@ -2387,12 +2441,18 @@ server.tool(
       mode: 'local',
       custody: 'self',
       signing: 'Signed in this process. Keys are never sent to AgentWallet or anyone else.',
-      max_autopay: process.env.AGENTWALLET_MAX_AUTOPAY || '1',
-      autopay_assets: process.env.AGENTWALLET_AUTOPAY_ASSETS || 'registry stablecoins only',
+      max_autopay: autopayEnvCap(),
+      max_autopay_per_hour: AUTOPAY_PER_HOUR,
+      internal_autopay_armed: false, // internal auto-pay never runs in local mode
+      autopay_assets: (process.env.AGENTWALLET_AUTOPAY_ASSETS || '').trim() || 'registry stablecoins only',
       x402_max_timeout_seconds: maxAuthWindowSeconds(),
-      per_tx_cap_token: process.env.AGENTWALLET_MAX_TX_TOKEN || 'not set (ERC-20 and SPL transfers are uncapped)',
+      per_tx_cap_token: (process.env.AGENTWALLET_MAX_TX_TOKEN || '').trim() || 'not set (ERC-20 and SPL transfers are uncapped)',
       allow_unknown_token_calls: process.env.AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS === '1',
       token_decimals_pins: parseDecimalPins(process.env.AGENTWALLET_TOKEN_DECIMALS).size,
+      token_risk_lookup: process.env.AGENTWALLET_TOKEN_RISK !== '0',
+      permit2_auto_approve: process.env.AGENTWALLET_PERMIT2_AUTO_APPROVE === '1',
+      legacy_paywall_origins: (process.env.AGENTWALLET_LEGACY_PAYWALL_ORIGINS || '').trim() || 'none (API host only)',
+      default_chain_id: (process.env.AGENTWALLET_CHAIN_ID || '').trim() || '8453',
     };
 
     if (isLocalMode()) {
@@ -2403,7 +2463,7 @@ server.tool(
       report.evm = {
         address: getLocalAddress(),
         rpc_endpoint: redactUrl(rpc),
-        per_tx_cap_native: process.env.AGENTWALLET_MAX_TX_NATIVE || 'not set',
+        per_tx_cap_native: (process.env.AGENTWALLET_MAX_TX_NATIVE || '').trim() || 'not set',
       };
     } else {
       report.evm = 'no local EVM key. EVM operations are refused, not sent to the hosted signer.';
@@ -2415,8 +2475,8 @@ server.tool(
       report.solana = {
         address: getSolanaAddress(),
         rpc_endpoint: redactUrl(rpc),
-        per_tx_cap_sol: process.env.AGENTWALLET_MAX_TX_SOL || 'not set',
-        per_tx_cap_token: process.env.AGENTWALLET_MAX_TX_TOKEN || 'not set (SPL transfers are uncapped; AGENTWALLET_MAX_TX_SOL does not cover them)',
+        per_tx_cap_sol: (process.env.AGENTWALLET_MAX_TX_SOL || '').trim() || 'not set',
+        per_tx_cap_token: (process.env.AGENTWALLET_MAX_TX_TOKEN || '').trim() || 'not set (SPL transfers are uncapped; AGENTWALLET_MAX_TX_SOL does not cover them)',
       };
     } else {
       report.solana = 'no local Solana key. Solana operations are refused, not sent to the hosted signer.';
@@ -2428,7 +2488,7 @@ server.tool(
 
 // ─── Tool: export_wallet_key ────────────────────────────────────
 
-server.tool(
+tool(
   'export_wallet_key',
   'Explain how to export the private key of a hosted (custodial) AgentWallet so it can be moved ' +
     'to self-custody or any other wallet. Export itself is deliberately human-gated and is not ' +
