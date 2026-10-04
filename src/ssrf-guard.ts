@@ -207,6 +207,10 @@ export async function resolvePublicUrl(url: string): Promise<{ target: URL; addr
 
   const addresses: ValidatedAddress[] = [];
   for (const a of answers) {
+    // Only a canonical IP string is judged; anything else from a resolver is
+    // refused rather than passed through isPrivateAddress, which cannot
+    // classify a non-canonical spelling and would answer "public".
+    if (isIP(a.address) === 0) throw new Error(`Resolver returned a non-canonical address for "${bare}"; refusing.`);
     if (isPrivateAddress(a.address)) {
       throw new Error('URL resolves to a private/internal address. Only public URLs are allowed.');
     }
@@ -340,6 +344,8 @@ export function headersForRedirect(
  * take the wallet process down. Wire bytes are capped separately on the Agent.
  */
 export const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+/** Deadline applied when the caller passes no AbortSignal. */
+export const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
 
 /** Header safeFetch adds to every response: the URL the body actually came from, after redirects. */
 export const FINAL_URL_HEADER = 'x-agw-final-url';
@@ -416,7 +422,8 @@ async function readBounded(stream: unknown, limit: number): Promise<ArrayBuffer>
  */
 export async function safeFetch(url: string, options: RequestInit = {}, maxHops = 3): Promise<Response> {
   let current = url;
-  let opts = options;
+  // A caller that forgets a signal still gets a deadline; a silent server must not hold the process.
+  let opts: RequestInit = options.signal ? options : { ...options, signal: AbortSignal.timeout(DEFAULT_FETCH_TIMEOUT_MS) };
 
   for (let hop = 0; hop <= maxHops; hop++) {
     const { addresses } = await resolvePublicUrl(current);

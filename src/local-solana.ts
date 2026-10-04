@@ -66,6 +66,7 @@ function parseSolanaKey(raw: string): Keypair {
     return Keypair.fromSecretKey(Uint8Array.from(buf.subarray(0, 64)));
   }
 
+  if (text.length > 256) throw new Error('Solana key text is too long to be a key.'); // base58 decoding is quadratic; cap before decoding
   const decoded = bs58.decode(text);
   if (decoded.length !== 64) {
     throw new Error(`Base58 Solana key must decode to 64 bytes, got ${decoded.length}.`);
@@ -194,6 +195,21 @@ function assertWithinSolCap(lamports: bigint) {
  */
 const splDecimalsCache = new Map<string, number>();
 
+/** The mint's decimals from the chain, or null when they cannot be read. Never guesses. */
+export async function mintDecimalsStrict(mint: string, chainId: number): Promise<number | null> {
+  const known = lookupTrustedDecimals(chainId, mint);
+  if (typeof known === 'number') return known;
+  try {
+    const conn = connection(chainId);
+    await assertCluster(conn, chainId);
+    const info = await conn.getParsedAccountInfo(new PublicKey(mint));
+    const data: any = info?.value?.data;
+    const d = Number(data?.parsed?.info?.decimals);
+    return Number.isInteger(d) && d >= 0 && d <= 36 ? d : null;
+  } catch {
+    return null;
+  }
+}
 async function resolveMintDecimals(mint: string, chainId: number): Promise<number> {
   const known = lookupTrustedDecimals(chainId, mint);
   if (typeof known === 'number') return known;
@@ -445,26 +461,33 @@ export async function localSplTransfer(
   decimals: number,
   chainId = 900
 ): Promise<LocalSolResult> {
-  // Checked before any RPC round trip: a blocked transfer should cost nothing
-  // and should not announce itself to the RPC provider first.
-  await assertWithinSplCap(mintStr, BigInt(rawAmount), chainId);
-
   const conn = connection(chainId);
+  // The cluster is verified before the cap reads decimals from it, so the
+  // decimals cache is never filled from a node serving another chain.
   await assertCluster(conn, chainId);
+  await assertWithinSplCap(mintStr, BigInt(rawAmount), chainId);
   const payer = getSolanaKeypair();
   const mint = new PublicKey(mintStr);
   const recipient = new PublicKey(to);
   await assertRecipientIsWallet(conn, recipient);
   const { tokenProgram, ataSize } = await mintLayout(conn, mint);
-  // The instruction's decimals byte is the mint's real value, not whatever the
-  // caller passed; TransferChecked would reject a wrong one on-chain anyway.
-  decimals = await resolveMintDecimals(mintStr, chainId);
+  // The caller scaled the amount by `decimals`. That value must be the mint's
+  // real one: substituting the real value into the instruction (as 1.13.0
+  // did) let a wrong guess through, because the amount had already been
+  // scaled by the guess and TransferChecked only sees the real byte
+  // (2026-10-04 audit). A mismatch refuses.
+  const real = await mintDecimalsStrict(mintStr, chainId);
+  if (real === null) throw new Error(`Could not read the decimals of mint ${mintStr} from the chain; refusing to guess the scale of the amount.`);
+  if (decimals !== real) throw new Error(`decimals ${decimals} was passed but mint ${mintStr} has ${real} decimals; refusing to scale the amount by the wrong factor.`);
 
   const sourceAta = associatedTokenAddress(payer.publicKey, mint, tokenProgram);
   const destAta = associatedTokenAddress(recipient, mint, tokenProgram);
 
   const tx = new Transaction();
   const destInfo = await conn.getAccountInfo(destAta);
+  if (destInfo && !destInfo.owner.equals(tokenProgram)) {
+    throw new Error(`Refusing to send: the recipient's token account address ${destAta.toBase58()} is already occupied by an account the token program does not own, so no token account can be created there.`);
+  }
   if (!destInfo) {
     // Creating the recipient's token account costs the payer rent in SOL, an
     // outflow the SOL cap must see (0.002 SOL a time adds up over many sends).
@@ -519,6 +542,14 @@ async function assertRecipientIsWallet(conn: Connection, recipient: PublicKey): 
       throw new Error(`Refusing to send to ${recipient.toBase58()}: it is a token account, not a wallet. Pass the owner's wallet address instead.`);
     }
     throw new Error(`Refusing to send to ${recipient.toBase58()}: it is an account owned by the SPL token program, not a wallet.`);
+  }
+  // Everything else that exists must be a plain system account: a program's
+  // data or buffer account, an address lookup table, a stake or vote account
+  // is owned by its program and nothing can ever sign for it as a wallet
+  // (2026-10-04 audit). A program-derived vault that holds tokens is still
+  // system-owned, so this costs nothing legitimate.
+  if (!info.owner.equals(SystemProgram.programId)) {
+    throw new Error(`Refusing to send to ${recipient.toBase58()}: it is owned by program ${info.owner.toBase58()}, not a wallet. Pass a wallet address.`);
   }
 }
 

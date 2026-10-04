@@ -30,7 +30,11 @@ import {
   approvalRefusal,
   type ApprovalRow,
   authorizationResource,
+  resolveNetworkChainId,
+  normalizeRawAmount,
+  parseAutopayAssets,
 } from './x402-payment.js';
+import { createHash } from 'node:crypto';
 import {
   isLocalMode,
   getLocalAddress,
@@ -64,6 +68,7 @@ import {
   localSolTransfer,
   localSplTransfer,
   resolveSolanaRpc,
+  mintDecimalsStrict,
 } from './local-solana.js';
 
 /** True when either chain family is running non-custodially. */
@@ -151,7 +156,7 @@ async function routeLocally(
   const qs = new URLSearchParams(rawQs);
 
   // POST /wallets/{id}/send
-  if (method === 'POST' && /^\/wallets\/[^/]*\/send$/.test(rawPath)) {
+  if (method === 'POST' && /^\/wallets\/[^/]+\/send$/.test(rawPath)) {
     const chainId = localChainId(body, qs);
     const solanaOp = SOLANA_CHAIN_IDS.has(chainId) || Boolean(body?.token_mint);
 
@@ -303,7 +308,12 @@ async function api(path: string, method = 'GET', body?: Record<string, unknown>,
      single choke point every funds operation already passes through means no
      tool can quietly stay custodial because someone forgot to update it. */
   if (anyLocalMode()) {
-    const handled = await routeLocally(path, method, body);
+    let handled: unknown;
+    try {
+      handled = await routeLocally(path, method, body);
+    } catch (e) {
+      throw new Error(redactRpcSecrets(e)); // viem puts the RPC URL, key and all, in its messages
+    }
     if (handled !== NOT_HANDLED) return handled;
   }
 
@@ -317,17 +327,34 @@ async function api(path: string, method = 'GET', body?: Record<string, unknown>,
     headers['Authorization'] = 'Basic ' + Buffer.from(`${API_USER}:${API_PASS}`).toString('base64');
   }
 
-  const options: RequestInit = { method, headers };
+  // The API host has no reason to send a wallet operation elsewhere: a
+  // redirect is refused instead of followed, so a request body is never
+  // replayed to another origin and another origin's answer is never returned
+  // as the API's (2026-10-04 audit).
+  const options: RequestInit = { method, headers, redirect: 'manual' };
   if (body && method !== 'GET') {
     options.body = JSON.stringify(body);
   }
 
   const res = await fetch(url, options);
-  const data = await res.json();
+  if (res.status >= 300 && res.status < 400) {
+    throw new Error(`The AgentWallet API host answered ${path} with a redirect (HTTP ${res.status}); refusing to follow it.`);
+  }
+  const text = await res.text();
+  if (text.length > API_MAX_RESPONSE_CHARS) throw new Error(`The AgentWallet API host returned an oversized response (${text.length} characters); refusing to parse it.`);
+  let data: unknown;
+  try { data = JSON.parse(text); } catch { throw new Error(`The AgentWallet API host returned a non-JSON response (HTTP ${res.status}).`); }
 
-  // Handle 402 Payment Required — auto-pay if a wallet or a local key is configured
-  if (res.status === 402 && (X402_WALLET_ID || anyLocalMode()) && !extraHeaders?.['X-PAYMENT'] && !extraHeaders?.['X-AGW-SKIP-X402']) {
-    return handleX402Payment(data as X402Response, path, method, body);
+  // A 402 from the API host is paid automatically only for a HOSTED wallet the
+  // operator named with AGENTWALLET_WALLET_ID. In local mode the host is not a
+  // custodian and must never be able to make the local key sign: a 402 is
+  // returned as an error and the agent can call pay_x402 explicitly, which
+  // reports what it does (2026-10-04 audit).
+  if (res.status === 402 && !extraHeaders?.['X-PAYMENT'] && !extraHeaders?.['X-AGW-SKIP-X402']) {
+    if (anyLocalMode()) {
+      throw new Error(`The AgentWallet API host asked for payment on ${path}; nothing is paid automatically in local mode. If you trust it, call pay_x402 with that URL so the payment is explicit and reported.`);
+    }
+    if (X402_WALLET_ID) return handleX402Payment(data as X402Response, path, method, body);
   }
 
   if (!res.ok) {
@@ -533,6 +560,7 @@ function isValidAddress(address: string): boolean {
 const FORBIDDEN_REQUEST_HEADERS = new Set(['host', 'content-length', 'transfer-encoding', 'connection', 'upgrade', 'expect', 'te', 'trailer', 'keep-alive']);
 
 /** Authorizations signed in this process, keyed by endpoint and requirement, kept until they expire. */
+const signingInFlight = new Map<string, Promise<void>>();
 const signedPayments = new Map<string, {
   headerName: string; paymentHeader: string; txHash: string | null;
   authorization: Eip3009Authorization | null; uptoAuth: UptoPermit2Authorization | null; payer: string | null; until: number;
@@ -555,6 +583,17 @@ function redactUrl(u: string): string {
     return p.pathname !== '/' || p.search ? `${p.origin}/…` : p.origin;
   } catch { return u; }
 }
+const API_MAX_RESPONSE_CHARS = 8 * 1024 * 1024;
+/* Error text from the local signing path with every URL reduced to its origin
+   and viem's "URL:" / "Request body:" lines dropped: an RPC endpoint carries
+   its API key in the path or query, and a tool result is the agent's context
+   and the client's log (2026-10-04 audit). */
+function redactRpcSecrets(err: unknown): string {
+  const e = err as { shortMessage?: string; details?: string; message?: string };
+  let msg = e?.shortMessage ? [e.shortMessage, e.details].filter(Boolean).join(' ') : String(e?.message ?? err);
+  msg = msg.split(/\r?\n/).filter(l => !/^\s*(URL|Request body|Request Arguments|Raw Call Arguments)\s*:/i.test(l)).join('\n').trim();
+  return msg.replace(/[a-z][a-z0-9+.-]*:\/\/[^\s"'<>)\]]+/gi, (u) => redactUrl(u));
+}
 
 /**
  * Decimals to scale a human amount by. Always the token's own value (registry,
@@ -564,11 +603,11 @@ function redactUrl(u: string): string {
 async function verifiedDecimals(chainId: number, token: string, given?: number): Promise<number> {
   let trusted: number | null = null;
   if (isSolanaChain(chainId)) {
-    trusted = lookupTrustedDecimals(chainId, token);
-    if (trusted === null) {
-      if (given === undefined) throw new Error(`Decimals for mint ${token} are not in the registry; pass decimals explicitly.`);
-      return given; // the token program verifies it on-chain (TransferChecked)
-    }
+    // The mint itself says how many decimals it has; a caller's value only
+    // ever confirms it (2026-10-04 audit: the substituted byte could not catch
+    // an amount already scaled by a wrong guess).
+    trusted = await mintDecimalsStrict(token, chainId);
+    if (trusted === null) throw new Error(`Could not read the decimals of mint ${token} from the chain; refusing to guess the scale of the amount.`);
   } else {
     trusted = await resolveTrustedDecimals(chainId, token);
   }
@@ -582,13 +621,20 @@ async function verifiedDecimals(chainId: number, token: string, given?: number):
 function validateGuardEnv(): void {
   parseDecimalPins(process.env.AGENTWALLET_TOKEN_DECIMALS); // throws on a malformed pin
   for (const name of ['AGENTWALLET_MAX_TX_NATIVE', 'AGENTWALLET_MAX_TX_TOKEN', 'AGENTWALLET_MAX_TX_SOL', 'AGENTWALLET_MAX_AUTOPAY']) {
-    const v = (process.env[name] || '').trim();
+    const raw = process.env[name];
+    const v = (raw || '').trim();
+    // Set but blank is a typo, not "no cap": refuse to start rather than run uncapped.
+    if (raw !== undefined && v === '') throw new Error(`${name} is set but blank. Set it to a number or unset it.`);
     if (v && !/^\d+(\.\d+)?$/.test(v)) throw new Error(`${name} must be a decimal number, got "${v}".`);
   }
-  for (const e of (process.env.AGENTWALLET_AUTOPAY_ASSETS || '').split(',').map(s => s.trim()).filter(Boolean)) {
-    if (e !== 'native' && !/^0x[0-9a-fA-F]{40}$/.test(e) && !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(e)) {
-      throw new Error(`AGENTWALLET_AUTOPAY_ASSETS entry "${e}" is not "native", an EVM address or an SPL mint.`);
+  for (const e of parseAutopayAssets(process.env.AGENTWALLET_AUTOPAY_ASSETS)) {
+    if (e.asset !== 'native' && !/^0x[0-9a-f]{40}$/.test(e.asset) && !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(e.asset)) {
+      throw new Error(`AGENTWALLET_AUTOPAY_ASSETS entry "${e.asset}" is not "native", an EVM address or an SPL mint (optionally prefixed "chainId:").`);
     }
+  }
+  const t = (process.env.AGENTWALLET_X402_MAX_TIMEOUT || '').trim();
+  if (t && (!/^\d+$/.test(t) || Number(t) < 60 || Number(t) > 31_536_000)) {
+    throw new Error(`AGENTWALLET_X402_MAX_TIMEOUT must be a whole number of seconds between 60 and 31536000, got "${t}".`);
   }
 }
 
@@ -645,46 +691,13 @@ function encodeUint256(value: string): string {
 
 // ─── x402 Network Mapping ──────────────────────────────────────
 
-const X402_NETWORKS: Record<string, number> = {
-  'ethereum': 1,
-  'base': 8453,
-  'base-sepolia': 84532,
-  'polygon': 137,
-  'arbitrum': 42161,
-  'optimism': 10,
-  'bsc': 56,
-  'avalanche': 43114,
-  'zora': 7777777,
-  'pulsechain': 369,
-  'solana': 900,
-  'solana-devnet': 901,
-};
-
-// Solana genesis hash prefixes for CAIP-2
-const SOLANA_GENESIS: Record<number, string> = {
-  900: '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp',  // mainnet-beta
-  901: 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1',  // devnet
-};
-
 /**
- * Resolve an x402 network identifier to a chain ID.
- * Supports plain names ("base"), CAIP-2 format ("eip155:8453"), and raw chain IDs ("8453").
+ * Resolve an x402 network identifier to a chain ID: plain names ("base"),
+ * CAIP-2 ("eip155:8453", "solana:<genesis prefix>") and raw ids ("8453").
+ * The table and the parsing live in x402-payment.ts so they can be tested.
  */
 function resolveChainId(network: string): number | null {
-  const lower = network.toLowerCase();
-  if (X402_NETWORKS[lower]) return X402_NETWORKS[lower];
-  const caipMatch = network.match(/^eip155:(\d+)$/);
-  if (caipMatch) return parseInt(caipMatch[1], 10);
-  // Solana CAIP-2: solana:<genesis_prefix>
-  const solanaMatch = network.match(/^solana:(.+)$/);
-  if (solanaMatch) {
-    for (const [chainId, genesis] of Object.entries(SOLANA_GENESIS)) {
-      if (solanaMatch[1] === genesis) return parseInt(chainId, 10);
-    }
-  }
-  const num = parseInt(network, 10);
-  if (!isNaN(num) && num > 0) return num;
-  return null;
+  return resolveNetworkChainId(network);
 }
 
 // ─── Server ──────────────────────────────────────────────────────
@@ -708,7 +721,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.13.4',
+    version: '1.13.5',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()
@@ -1434,6 +1447,13 @@ async function resolveTokenDomain(chainId: number, asset: string, extra?: X402Re
   return { name, version };
 }
 
+/** Text an endpoint wrote, bounded so it cannot flood the agent's context. */
+function serverText(s: unknown): string | null {
+  if (s === undefined || s === null) return null;
+  const t = String(s);
+  return t.length > 300 ? t.slice(0, 300) + '…' : t;
+}
+
 /** Sign the authorization with whichever custody mode is active (local key, or the hosted signer). */
 async function signAuthorization(
   walletId: number, chainId: number, asset: string, domain: { name: string; version: string }, auth: Eip3009Authorization, approvalId?: string | null,
@@ -1470,8 +1490,8 @@ server.tool(
     'parses the payment requirements (v1 body or v2 PAYMENT-REQUIRED header), signs an EIP-3009 ' +
     'TransferWithAuthorization for the "exact" scheme (no gas, nothing broadcast by the payer), and retries ' +
     'the request with the payment header. AgentWallet paywalls are paid by on-chain transfer instead. ' +
-    'The "upto" scheme is refused, never approximated. Returns the final response and the settlement ' +
-    'receipt. Supports the x402 open payment standard (https://x402.org). Set max_payment to cap spend.',
+    'The "upto" scheme is settled with a Permit2 authorization bounded by the cap. Returns the final response and the settlement ' +
+    'receipt. Supports the x402 open payment standard (https://x402.org). max_payment can only lower the operator\'s cap for one call.',
   {
     url: z.string().url().describe('The URL to access (will handle 402 payment if required)'),
     wallet_id: z.number().int().describe('Wallet ID to pay from'),
@@ -1484,10 +1504,8 @@ server.tool(
     body: z.string().optional().describe('Optional request body for POST/PUT requests'),
     max_payment: z.string().optional().describe(
       'Maximum payment in human-readable format (e.g. "1.00" for 1 USDC). ' +
-        'Rejects payments above this amount. If omitted, a default cap of ' +
-        'AGENTWALLET_MAX_AUTOPAY (default "1") is applied, so an untrusted 402 ' +
-        'endpoint can never authorize an unbounded payment. Set this explicitly ' +
-        'to allow a larger single payment.',
+        'Lowers the operator\'s AGENTWALLET_MAX_AUTOPAY ceiling (default "1") for this one call; ' +
+        'it can never raise it, and a value above the ceiling is ignored and reported as max_payment_ignored.',
     ),
     prefer_chain: z.number().int().optional().describe(
       'Preferred chain ID if the server accepts payment on multiple chains ' +
@@ -1594,10 +1612,7 @@ server.tool(
     const option = picked.option;
     const chainId = picked.chainId;
     const isUpto = option.scheme === 'upto';
-    const rawAmount = requiredAmount(option);
-    if (!/^\d+$/.test(rawAmount)) {
-      throw new Error(`x402: invalid amount "${rawAmount}" in the payment requirements (expected integer base units).`);
-    }
+    const rawAmount = normalizeRawAmount(requiredAmount(option)); // "0010000" and "10000" are one amount
 
     // Decimals come from the registry or the token contract, NEVER from the 402
     // body. The endpoint controls what it declares, so trusting it would let a
@@ -1669,8 +1684,8 @@ server.tool(
           ...overCap,
           error: `Payment of ${amount} ${tokenLabel} exceeds the ${effectiveMax} cap (from ${capSource}).` +
             (max_payment ? '' : ' No max_payment was provided, so the default cap was applied.') +
-            (anyLocalMode() ? ' Local mode has no approval channel: raise max_payment, AGENTWALLET_MAX_AUTOPAY or AGENTWALLET_MAX_TX_TOKEN yourself.'
-                            : ' Pass request_approval=true to email the wallet owner for a one-time approval, or raise the cap.'),
+            (anyLocalMode() ? ' Local mode has no approval channel; the caps are the operator\'s and only the operator can change them. Do not edit the environment or config to raise them.'
+                            : ' Pass request_approval=true to email the wallet owner for a one-time approval; the cap itself is the operator\'s to change.'),
         });
       }
     }
@@ -1694,9 +1709,21 @@ server.tool(
     // The resource is the whole URL including its query: /buy?id=1 and /buy?id=2
     // are different purchases, and reusing the first signature for the second
     // would report a payment the second resource never received.
-    const cacheKey = [wallet_id, chainId, tokenAddress.toLowerCase(), option.payTo.toLowerCase(), rawAmount, option.scheme, authorizationResource(url)].join('|');
+    // The method and body are part of what was bought: POST {item:A} and
+    // POST {item:B} to one URL are two purchases. Concurrent calls for one key
+    // wait for the first signature instead of each signing a nonce.
+    const bodyDigest = createHash('sha256').update(reqBody ?? '').digest('hex').slice(0, 16);
+    const cacheKey = [wallet_id, chainId, tokenAddress.toLowerCase(), option.payTo.toLowerCase(), rawAmount, option.scheme, authorizationResource(url), (method || 'GET').toUpperCase(), bodyDigest].join('|');
+    const inFlight = signingInFlight.get(cacheKey);
+    if (inFlight && !fresh_authorization) await inFlight;
     const cachedAuth = fresh_authorization ? undefined : signedPayments.get(cacheKey);
     for (const [k, v] of signedPayments) if (v.until <= Date.now()) signedPayments.delete(k);
+    let releaseSigning: () => void = () => {};
+    if (!(cachedAuth && cachedAuth.until > Date.now())) {
+      const mine = new Promise<void>(r => { releaseSigning = r; });
+      // Released when the signature is cached, or after 30 s if this call throws first, so a failure never wedges the key.
+      signingInFlight.set(cacheKey, Promise.race([mine, new Promise<void>(r => setTimeout(r, 30_000).unref())]));
+    }
 
     if (cachedAuth && cachedAuth.until > Date.now()) {
       // Same endpoint, same requirement, still inside the window: re-send the
@@ -1710,7 +1737,8 @@ server.tool(
       const allowance = decodeUint(await ethCallHex(chainId, tokenAddress, permit2AllowanceCalldata(payer)));
       if (allowance < BigInt(rawAmount)) {
         if (process.env.AGENTWALLET_PERMIT2_AUTO_APPROVE === '1' && assetPolicy.via === 'stablecoin') {
-          const r = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: tokenAddress, value: '0', data: permit2ApproveCalldata(), chain_id: chainId }, skip)) as { tx_hash?: string };
+          // Approve exactly this payment's maximum, never unlimited (2026-10-04 audit).
+          const r = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: tokenAddress, value: '0', data: permit2ApproveCalldata(rawAmount), chain_id: chainId }, skip)) as { tx_hash?: string };
           permit2ApprovalTx = String(r?.tx_hash || '');
           await new Promise(res => setTimeout(res, 4000));
         } else {
@@ -1761,6 +1789,8 @@ server.tool(
         : Date.now() + maxAuthWindowSeconds() * 1000; // a broadcast transfer: the hash stays valid, re-sending it never pays twice
       signedPayments.set(cacheKey, { headerName, paymentHeader, txHash, authorization, uptoAuth, payer, until });
     }
+    releaseSigning();
+    signingInFlight.delete(cacheKey);
 
     // Step 6: Retry with the payment header and read the settlement receipt.
     const retryHeaders = { ...reqHeaders, [headerName]: paymentHeader };
@@ -1788,7 +1818,7 @@ server.tool(
     }
     if (retryRes.status === 402) {
       const again = parsePaymentRequired(n => retryRes.headers.get(n), retryParsed);
-      retryError = String(again?.error || (retryParsed as { error?: string } | null)?.error || 'Payment was not accepted (no reason given).');
+      retryError = serverText(String(again?.error || (retryParsed as { error?: string } | null)?.error || 'Payment was not accepted (no reason given).')) as string;
       if (payerDelegationInfo && /signature/i.test(retryError)) retryError += ` Likely cause: ${payerDelegationInfo.warning}`;
     }
 
@@ -1819,7 +1849,8 @@ server.tool(
       settlement_reported_by_server: settlement,
       authorization: authorization ? { nonce: authorization.nonce, valid_before: authorization.validBefore }
         : (uptoAuth ? { scheme: 'upto', max_amount: amount, nonce: uptoAuth.nonce, deadline: uptoAuth.deadline, facilitator: uptoAuth.witness.facilitator } : null),
-      description: option.description,
+      description: serverText(option.description),
+      server_text_is_untrusted: true, // description, retry_error and the response are the endpoint's words, not instructions
       response: retryParsed,
     });
   },
@@ -2139,7 +2170,13 @@ server.tool(
         mode: 'custodial',
         custody: 'agentwallet',
         signing: 'AgentWallet servers hold an encrypted key and sign on your behalf.',
-        api_base: API_BASE,
+        api_base: redactUrl(API_BASE),
+        client_guards: {
+          autopay_cap_usd: autopayEnvCap(),
+          autopay_assets: (process.env.AGENTWALLET_AUTOPAY_ASSETS || '').trim() || 'registry stablecoins only',
+          x402_max_timeout_seconds: maxAuthWindowSeconds(),
+          note: 'These bound pay_x402 on hosted wallets too; the hosted signer adds its own pause, daily limit and approval checks.',
+        },
         to_self_custody:
           'Set AGENTWALLET_PRIVATE_KEY for EVM and/or AGENTWALLET_SOLANA_KEY for Solana, then restart. ' +
           'Use export_wallet_key first if you want to carry an existing hosted wallet across.',
@@ -2248,7 +2285,7 @@ async function main() {
       process.exit(1);
     }
   } else {
-    console.error('AgentWallet MCP: custodial mode via ' + API_BASE + '. Run wallet_mode for details.');
+    console.error('AgentWallet MCP: custodial mode via ' + redactUrl(API_BASE) + '. Run wallet_mode for details.');
   }
 }
 

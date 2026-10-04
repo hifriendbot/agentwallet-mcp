@@ -60,6 +60,10 @@ const rpc = http.createServer((req, res) => {
       res.end(JSON.stringify({ jsonrpc: '2.0', id, ...payload }));
     };
     if (method === 'getGenesisHash') return send({ result: MAINNET_GENESIS });
+    // Since 1.13.5 the send reads the mint's decimals (jsonParsed) and refuses a caller mismatch; every test mint here has 0 decimals.
+    if (method === 'getAccountInfo' && params[1]?.encoding === 'jsonParsed' && ACCOUNTS[params[0]]) {
+      return send({ result: { context: { slot: 1 }, value: { ...ACCOUNTS[params[0]], data: { program: 'spl-token', parsed: { type: 'mint', info: { decimals: 0, supply: '1', isInitialized: true, mintAuthority: null, freezeAuthority: null } }, space: 82 } } } });
+    }
     if (method === 'getAccountInfo') return send({ result: { context: { slot: 1 }, value: ACCOUNTS[params[0]] ?? null } });
     if (method === 'getMinimumBalanceForRentExemption') { rentSizes.push(params[0]); return send({ result: rentFor(params[0]) }); }
     send({ error: { code: -32601, message: `mock: ${method} not served` } });

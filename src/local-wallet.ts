@@ -67,6 +67,7 @@ function loadKeyMaterial(): string | null {
   return null;
 }
 
+const SECP256K1_N = BigInt('0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141');
 function normalizeKey(raw: string): Hex {
   const hex = raw.startsWith('0x') ? raw.slice(2) : raw;
   if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
@@ -74,6 +75,12 @@ function normalizeKey(raw: string): Hex {
       'Invalid private key. Expected 64 hex characters, with or without a 0x prefix. ' +
       'The value itself is never logged.'
     );
+  }
+  // Checked here with a fixed message: the curve library's own range error
+  // prints the offending value in decimal (2026-10-04 audit).
+  const n = BigInt('0x' + hex);
+  if (n === 0n || n >= SECP256K1_N) {
+    throw new Error('Invalid private key: the value is outside the secp256k1 range. The value itself is never logged.');
   }
   return `0x${hex}` as Hex;
 }
@@ -91,8 +98,8 @@ export function getLocalAccount() {
   if (keyLoadError) throw new Error(keyLoadError);
 
   const raw = loadKeyMaterial();
+  if (keyLoadError) throw new Error(keyLoadError); // the keyfile's own reason, before the generic line
   if (!raw) throw new Error('Local signing mode is not configured.');
-  if (keyLoadError) throw new Error(keyLoadError);
 
   cachedAccount = privateKeyToAccount(normalizeKey(raw));
   return cachedAccount;
@@ -182,8 +189,8 @@ function assertWithinNativeCap(valueWei: bigint) {
   const capWei = BigInt(whole + frac.padEnd(18, '0').slice(0, 18));
   if (valueWei > capWei) {
     throw new Error(
-      `Blocked by local guard: transaction value exceeds AGENTWALLET_MAX_TX_NATIVE (${cap}). ` +
-      `Raise the cap deliberately if this is intended.`
+      `Blocked by local guard: transaction value exceeds AGENTWALLET_MAX_TX_NATIVE (${cap}), a cap only the operator can change. ` +
+      `Do not edit the environment or config to raise it.`
     );
   }
 }
@@ -296,33 +303,22 @@ async function probeTokenDecimals(chainId: number, token: Address): Promise<Deci
   const cached = decimalsCache.get(key);
   if (typeof cached === 'number') return cached;
 
-  let onChain: number | bigint;
+  // The raw JSON-RPC envelope is classified here rather than through viem's
+  // readContract: viem maps error code -32603 ("Internal error", what an
+  // overloaded node or a proxy answers) and an empty envelope to "the contract
+  // reverted", which is the one answer this guard treats as evidence of a
+  // non-token (2026-10-04 audit). Only an explicit revert counts as that.
+  let result: unknown;
   try {
     const { pub } = clients(chainId);
-    onChain = await pub.readContract({
-      address: token,
-      abi: ERC20_ABI,
-      functionName: 'decimals',
-    }) as number | bigint;
+    result = await pub.request({ method: 'eth_call', params: [{ to: token, data: DECIMALS_SELECTOR }, 'latest'] } as never);
   } catch (err) {
-    // viem wraps every readContract failure in ContractFunctionExecutionError;
-    // the cause says whether the contract itself declined (revert, empty
-    // return: not an ERC-20) or the answer never arrived (RPC down, timeout,
-    // malformed response). Only the first is evidence of anything.
-    const declined = err instanceof BaseError && err.walk(
-      (e) => e instanceof ContractFunctionZeroDataError
-        || e instanceof ContractFunctionRevertedError
-        || e instanceof ExecutionRevertedError // nodes that report a revert as -32000 rather than 3
-    ) !== null;
-    if (declined) return 'not-a-token';
-    // A decode failure on non-empty data means the contract answered
-    // decimals() with something that is not a uint8: a token, just a broken one.
-    const decodeFailed = err instanceof BaseError && err.walk(
-      (e) => e instanceof AbiDecodingDataSizeTooSmallError || e instanceof AbiDecodingDataSizeInvalidError
-    ) !== null;
-    return decodeFailed ? 'unusable' : 'unreachable';
+    return classifyDecimalsError(err);
   }
-  const d = Number(onChain);
+  if (result === '0x') return 'not-a-token'; // answered with nothing: no decimals() here
+  if (typeof result !== 'string' || !/^0x([0-9a-fA-F]{2})+$/.test(result)) return 'unreachable'; // not an answer at all
+  if (result.length !== 66) return 'unusable'; // answered, but not one uint8 word
+  const d = Number(BigInt(result));
   // Reject nonsense rather than trusting it; an out-of-range value would
   // widen the ceiling exactly like the old assumption did.
   if (Number.isInteger(d) && d >= 0 && d <= 36) {
@@ -330,6 +326,18 @@ async function probeTokenDecimals(chainId: number, token: Address): Promise<Deci
     return d;
   }
   return 'unusable';
+}
+
+const DECIMALS_SELECTOR = '0x313ce567';
+/** An eth_call failure is a revert only when the node says so; every other failure is "could not ask". */
+export function classifyDecimalsError(err: unknown): DecimalsProbe {
+  const e = err as { code?: unknown; data?: unknown; message?: string; details?: string; shortMessage?: string };
+  const code = typeof e?.code === 'number' ? e.code : NaN;
+  const text = [e?.message, e?.details, e?.shortMessage].filter(Boolean).join(' ');
+  const hasRevertData = typeof e?.data === 'string' && /^0x[0-9a-fA-F]*$/.test(e.data);
+  if (code === 3) return 'not-a-token'; // the JSON-RPC "execution error" code
+  if ((code === -32000 || code === -32603 || code === -32015) && (/revert/i.test(text) || hasRevertData)) return 'not-a-token';
+  return 'unreachable';
 }
 
 /**
@@ -341,8 +349,16 @@ async function resolveTokenDecimals(chainId: number, token: Address): Promise<nu
   return typeof probe === 'number' ? probe : 0;
 }
 
-/** Canonical Permit2, the same address on every EVM chain it is deployed to. */
+/** Canonical Permit2, plus the chains that run a different deployment. */
 const PERMIT2 = '0x000000000022d473030f116ddee9f6b43ac78ba3';
+const PERMIT2_BY_CHAIN: Record<number, string> = { 324: '0x0000000000225e31d15943971f47ad3022f714fa' }; // zkSync Era
+export function permit2AddressFor(chainId: number): string { return PERMIT2_BY_CHAIN[chainId] || PERMIT2; }
+/* Permit2's own function selectors. Calldata with one of these aimed at a
+   contract that declines decimals() is a Permit2 call on a deployment this
+   table does not know, and is refused rather than let through as "a router"
+   (2026-10-04 audit). approve, permit (2 shapes), transferFrom (2), lockdown,
+   permitTransferFrom (2), permitWitnessTransferFrom (2), invalidateNonces/UnorderedNonces. */
+const PERMIT2_SELECTORS = new Set(['87517c45', '2b67b570', '2a2d80d1', '36c78516', '0d58b1db', 'cc53287f', '30f28b7a', 'edd9444b', '137c29fe', 'fe8ec1a7', '3ff9dcb1', '0d58b1db']);
 
 /**
  * Calls the token cap knows how to price: which calldata word holds the
@@ -391,7 +407,7 @@ async function assertWithinTokenCap(chainId: number, to: Address, data: Hex, val
 
   const hex = data.slice(2);
   const selector = hex.slice(0, 8).toLowerCase();
-  const isPermit2 = to.toLowerCase() === PERMIT2;
+  const isPermit2 = to.toLowerCase() === PERMIT2 || to.toLowerCase() === permit2AddressFor(chainId);
   const layout = CAP_LAYOUTS[selector];
   const isWrappedNative = to.toLowerCase() === wrappedNativeAddress(chainId);
   const priced = layout
@@ -413,7 +429,13 @@ async function assertWithinTokenCap(chainId: number, to: Address, data: Hex, val
         `Blocked by local guard: calldata selector 0x${selector} refused rather than let through uncapped: ${why}. ` +
         `Use transfer, transferFrom, approve, increaseAllowance, Permit2 approve, ` +
         `or deposit/withdraw on the chain's wrapped-native contract, ` +
-        `or set AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS=1 to allow it deliberately.`
+        `or ask the operator, who alone can set AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS=1.`
+      );
+    }
+    if (PERMIT2_SELECTORS.has(selector)) {
+      throw new Error(
+        `Blocked by local guard: calldata selector 0x${selector} is a Permit2 function aimed at ${to}, which is not the Permit2 deployment this guard knows for chain ${chainId}; ` +
+        `refused rather than let through uncapped. Only the operator can allow it (AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS=1).`
       );
     }
     return; // an ordinary contract call; it can only pull what an existing approval allows (see the note above)
@@ -448,8 +470,8 @@ async function assertWithinTokenCap(chainId: number, to: Address, data: Hex, val
   if (amount > capRaw) {
     throw new Error(
       `Blocked by local guard: ${layout.what} of ${amount} base units exceeds ` +
-      `AGENTWALLET_MAX_TX_TOKEN (${cap}, evaluated at ${decimals} decimals). ` +
-      `Raise the cap deliberately if this is intended.`
+      `AGENTWALLET_MAX_TX_TOKEN (${cap}, evaluated at ${decimals} decimals), a cap only the operator can change. ` +
+      `Do not edit the environment or config to raise it.`
     );
   }
 
@@ -477,7 +499,7 @@ async function assertWithinTokenCap(chainId: number, to: Address, data: Hex, val
       throw new Error(
         `Blocked by local guard: ${layout.what} of ${amount} base units would leave a standing allowance of ${total} base units ` +
         `for ${spender}, above AGENTWALLET_MAX_TX_TOKEN (${cap}, evaluated at ${decimals} decimals). ` +
-        `Use approve with an absolute amount, or raise the cap deliberately.`
+        `Use approve with an absolute amount; the cap itself is the operator's to change.`
       );
     }
   }

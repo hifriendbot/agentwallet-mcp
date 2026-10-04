@@ -66,7 +66,7 @@ Set either key, or both. They are independent: run EVM locally and Solana hosted
 
 Local signing uses [viem](https://viem.sh) for EVM and `@solana/web3.js` for Solana, plus `bs58` for key parsing. SPL instructions are built by hand rather than with `@solana/spl-token`, because that package pulls in `bigint-buffer`, which carries a high severity buffer overflow advisory. A wallet has no business shipping that to save a dozen lines of instruction encoding.
 
-`npm audit` currently reports issues inside `@modelcontextprotocol/sdk`'s HTTP transport dependencies. This server speaks stdio, so that code never loads, and the SDK is not something this package can patch. Run the audit yourself. Publishing a tree you can inspect is the point.
+`npm audit` reports no advisories as of 1.13.5; the overrides in package.json keep two advisories under `@solana/web3.js`'s jayson closed. Earlier releases carried advisories inside `@modelcontextprotocol/sdk`'s HTTP transport dependencies. This server speaks stdio, so that code never loads, and the SDK is not something this package can patch. Run the audit yourself. Publishing a tree you can inspect is the point.
 
 <p align="center">
   <img src="assets/demo.svg" alt="AgentWallet demo, AI agent pays x402 invoice automatically" width="800">

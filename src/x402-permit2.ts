@@ -70,7 +70,7 @@ export function buildUptoAuthorization(
   if (!/^\d+$/.test(amount)) throw new Error(`x402 upto: invalid amount "${amount}" (expected integer base units).`);
   if (!/^0x[0-9a-fA-F]{40}$/.test(req.payTo)) throw new Error(`x402 upto: payTo is not an EVM address: "${req.payTo}".`);
   const requested = Number.isFinite(req.maxTimeoutSeconds) && (req.maxTimeoutSeconds as number) > 0 ? Math.floor(req.maxTimeoutSeconds as number) : 300;
-  const timeout = Math.min(requested, maxAuthWindowSeconds()); // see buildAuthorization
+  const timeout = Math.max(Math.min(requested, maxAuthWindowSeconds()), Math.min(60, maxAuthWindowSeconds())); // see buildAuthorization
   return {
     from: from as `0x${string}`,
     permitted: { token: req.asset as `0x${string}`, amount },
@@ -108,9 +108,10 @@ export function permit2AllowanceCalldata(owner: string): `0x${string}` {
   return ('0xdd62ed3e' + pad(owner) + pad(PERMIT2_ADDRESS)) as `0x${string}`;
 }
 
-/** approve(Permit2, max) calldata: the one-time step upto needs. */
-export function permit2ApproveCalldata(): `0x${string}` {
-  return ('0x095ea7b3' + pad(PERMIT2_ADDRESS) + 'f'.repeat(64)) as `0x${string}`;
+/** approve(Permit2, amount) calldata; unlimited only when no amount is given. */
+export function permit2ApproveCalldata(amountRaw?: string): `0x${string}` {
+  const word = amountRaw === undefined ? 'f'.repeat(64) : BigInt(amountRaw).toString(16).padStart(64, '0');
+  return ('0x095ea7b3' + pad(PERMIT2_ADDRESS) + word) as `0x${string}`;
 }
 
 export function decodeUint(hex: string): bigint {

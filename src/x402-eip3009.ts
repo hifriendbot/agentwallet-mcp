@@ -103,6 +103,9 @@ export function createNonce(): `0x${string}` {
 const DEFAULT_TIMEOUT_SECONDS = 300;
 
 /** Authorization window mirrors the reference client: valid from 10 minutes ago until maxTimeoutSeconds from now. */
+/** Shortest validity window signed, whatever the server asks for. */
+export const MIN_WINDOW_SECONDS = 60;
+
 export function buildAuthorization(
   from: string,
   req: X402Requirement,
@@ -117,7 +120,9 @@ export function buildAuthorization(
   // asking for years would otherwise hold one until the wallet is refilled.
   const requested = Number.isFinite(req.maxTimeoutSeconds) && (req.maxTimeoutSeconds as number) > 0
     ? Math.floor(req.maxTimeoutSeconds as number) : DEFAULT_TIMEOUT_SECONDS;
-  const timeout = Math.min(requested, maxAuthWindowSeconds());
+  // Floor as well as cap: a server asking for a 2-second window would make
+  // every retry sign a fresh nonce it can also settle (2026-10-04 audit).
+  const timeout = Math.max(Math.min(requested, maxAuthWindowSeconds()), Math.min(MIN_WINDOW_SECONDS, maxAuthWindowSeconds()));
   return {
     from: from as `0x${string}`,
     to: req.payTo as `0x${string}`,

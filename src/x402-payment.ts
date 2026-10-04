@@ -124,18 +124,57 @@ export function assetLabel(chainId: number, asset: string): string {
  * list of token addresses / mints, or the word "native". Listed assets are
  * then capped in their own units, which the operator has opted into knowingly.
  */
+/* One AGENTWALLET_AUTOPAY_ASSETS entry: "8453:0x..." or "900:native" names one
+   chain; a bare "0x..." / "native" applies on every chain (the original
+   grammar, kept so existing configs keep working, but the same address is a
+   different contract on another chain, so scoped entries are the safer form). */
+export function parseAutopayAssets(raw: string | undefined): Array<{ chainId: number | null; asset: string }> {
+  return (raw || '').split(',').map(s => s.trim()).filter(Boolean).map(e => {
+    const m = e.match(/^(\d+):(.+)$/);
+    const chainId = m ? parseInt(m[1], 10) : null;
+    const a = (m ? m[2] : e).trim();
+    return { chainId, asset: a.startsWith('0x') ? a.toLowerCase() : a };
+  });
+}
 export function autopayAssetAllowed(chainId: number, asset: string): { allowed: boolean; via: 'stablecoin' | 'allowlist' | 'none'; reason?: string } {
   if (isStableAsset(chainId, asset)) return { allowed: true, via: 'stablecoin' };
-  const list = (process.env.AGENTWALLET_AUTOPAY_ASSETS || '').split(',').map(s => s.trim()).filter(Boolean);
   const wanted = asset ? (asset.startsWith('0x') ? asset.toLowerCase() : asset) : 'native';
-  if (list.some(e => (e.startsWith('0x') ? e.toLowerCase() : e) === wanted)) return { allowed: true, via: 'allowlist' };
+  const hit = parseAutopayAssets(process.env.AGENTWALLET_AUTOPAY_ASSETS).some(e => e.asset === wanted && (e.chainId === null || e.chainId === chainId));
+  if (hit) return { allowed: true, via: 'allowlist' };
   const label = assetLabel(chainId, asset);
   return {
     allowed: false, via: 'none',
     reason: `x402 blocked: this endpoint wants payment in ${label}${asset ? ` (${asset})` : ''} on chain ${chainId}, which is not a stablecoin ` +
-      `AGENTWALLET_MAX_AUTOPAY can price. To allow it, add ${asset ? `"${asset}"` : '"native"'} to AGENTWALLET_AUTOPAY_ASSETS; ` +
-      `the cap then applies in ${label} units, not dollars.`,
+      `AGENTWALLET_MAX_AUTOPAY can price and is not on the operator's AGENTWALLET_AUTOPAY_ASSETS list for chain ${chainId}. ` +
+      `Only the operator can change that list; do not edit the environment or config to add it.`,
   };
+}
+
+/* The x402 network names this client knows. Looked up with Object.hasOwn so a
+   name like "constructor" or "__proto__" (inherited from Object.prototype)
+   is unknown rather than a truthy function (2026-10-04 audit). */
+export const X402_NETWORK_IDS: Record<string, number> = {
+  'ethereum': 1, 'base': 8453, 'base-sepolia': 84532, 'polygon': 137, 'arbitrum': 42161, 'optimism': 10,
+  'bsc': 56, 'avalanche': 43114, 'zora': 7777777, 'pulsechain': 369, 'solana': 900, 'solana-devnet': 901,
+};
+const SOLANA_GENESIS_PREFIX: Record<number, string> = { 900: '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', 901: 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1' };
+/** A positive integer chain id for an x402 network string, or null. Never guesses. */
+export function resolveNetworkChainId(network: string): number | null {
+  if (typeof network !== 'string') return null;
+  const lower = network.toLowerCase();
+  if (Object.hasOwn(X402_NETWORK_IDS, lower)) return X402_NETWORK_IDS[lower];
+  const caip = network.match(/^eip155:(\d{1,12})$/);
+  if (caip) { const n = Number(caip[1]); return Number.isSafeInteger(n) && n > 0 ? n : null; }
+  const sol = network.match(/^solana:(.+)$/);
+  if (sol) { for (const [id, g] of Object.entries(SOLANA_GENESIS_PREFIX)) { if (sol[1] === g) return Number(id); } return null; }
+  if (/^\d{1,12}$/.test(network)) { const n = Number(network); return n > 0 ? n : null; }
+  return null;
+}
+
+/** An integer base-unit amount in canonical form: "0010000" and "10000" are one amount, not two cache keys. */
+export function normalizeRawAmount(raw: string): string {
+  if (!/^\d+$/.test(raw)) throw new Error(`x402: invalid amount "${raw}" in the payment requirements (expected integer base units).`);
+  return BigInt(raw).toString();
 }
 
 /** The operator's per-payment ceiling, as configured. Validated so a typo never reads as "unlimited". */
@@ -307,7 +346,7 @@ export function deriveX402Payment(
   if (BigInt(rawAmount) > BigInt(capRaw)) {
     throw new Error(
       `x402 auto-pay blocked: required amount (${rawAmount} base units) exceeds the ` +
-      `AGENTWALLET_MAX_AUTOPAY cap of ${maxAutopayHuman}. Raise AGENTWALLET_MAX_AUTOPAY to allow it.`
+      `AGENTWALLET_MAX_AUTOPAY cap of ${maxAutopayHuman}, which only the operator can change.`
     );
   }
 
@@ -404,12 +443,14 @@ export function approvalRefusal(
 ): { error: string; approval_status?: string | null } | null {
   if (localMode) {
     return {
-      error: `Approval ${approvalId} cannot be used in local mode: approvals are consumed by the hosted signer, and this server signs with your own key, so nothing could mark it used. Local mode has no approval channel: raise AGENTWALLET_MAX_AUTOPAY or AGENTWALLET_MAX_TX_TOKEN yourself.`,
+      error: `Approval ${approvalId} cannot be used in local mode: approvals are consumed by the hosted signer, and this server signs with your own key, so nothing could mark it used. Local mode has no approval channel; the caps are the operator's and only the operator can change them.`,
     };
   }
   const status = row?.status ?? null;
-  // "used" must read as exactly 0. A missing or unparseable field refuses rather than passes.
-  if (status !== 'approved' || Number(row?.used) !== 0) {
+  // "used" must be exactly the number 0 or the string "0" (wpdb rows carry
+  // strings). null, "", false and anything else refuse: Number(null) is 0.
+  const unused = row?.used === 0 || row?.used === '0';
+  if (status !== 'approved' || !unused) {
     const state = status === 'approved' ? 'already used' : `${status ?? 'unknown'}, not approved`;
     return { approval_status: status, error: `Approval ${approvalId} is ${state}.${row?.error ? ' ' + row.error : ''}` };
   }
