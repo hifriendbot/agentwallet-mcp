@@ -276,6 +276,11 @@ export function sanitizeRequired(req: X402PaymentRequired): X402PaymentRequired 
     const o = a as Record<string, unknown>;
     const scheme = str(o.scheme), network = str(o.network), payTo = lowerIfAllCaps(str(o.payTo));
     if (scheme === undefined || network === undefined || payTo === undefined) continue;
+    // Entries that can never be paid are dropped here, so their junk never reaches an error message (round 6).
+    if (!/^0x[0-9a-fA-F]{40}$/.test(payTo) && !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(payTo)) continue;
+    if (typeof o.asset === 'string' && o.asset !== '' && !/^0x[0-9a-fA-F]{40}$/.test(o.asset) && !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(o.asset)) continue;
+    const amountField = str(o.maxAmountRequired) ?? str(o.amount);
+    if (amountField !== undefined && !/^\d{1,78}$/.test(amountField)) continue;
     const extraIn = (o.extra && typeof o.extra === 'object' && !Array.isArray(o.extra)) ? o.extra as Record<string, unknown> : undefined;
     const extra: Record<string, unknown> | undefined = extraIn ? { ...extraIn } : undefined;
     if (extra) for (const k of ['token', 'name', 'version', 'facilitatorAddress', 'spender', 'permit2']) { if (k in extra && typeof extra[k] !== 'string') delete extra[k]; }

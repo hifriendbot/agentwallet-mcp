@@ -184,7 +184,7 @@ export function resolveNetworkChainId(network: string): number | null {
 
 /** An integer base-unit amount in canonical form: "0010000" and "10000" are one amount, not two cache keys. */
 export function normalizeRawAmount(raw: string): string {
-  if (!/^\d+$/.test(raw)) throw new Error(`x402: invalid amount "${raw}" in the payment requirements (expected integer base units).`);
+  if (!/^\d+$/.test(raw)) throw new Error(`x402: invalid amount "${String(raw).slice(0, 80)}" in the payment requirements (expected integer base units).`);
   return BigInt(raw).toString();
 }
 
@@ -474,8 +474,9 @@ export function approvalRefusal(
   // strings). null, "", false and anything else refuse: Number(null) is 0.
   const unused = row?.used === 0 || row?.used === '0';
   if (status !== 'approved' || !unused) {
-    const state = status === 'approved' ? 'already used' : `${status ?? 'unknown'}, not approved`;
-    return { approval_status: status, error: `Approval ${approvalId} is ${state}.${row?.error ? ' ' + row.error : ''}` };
+    const bound = (v: unknown) => { const t = String(v ?? ''); return t.length > 120 ? t.slice(0, 120) + '…' : t; };
+    const state = status === 'approved' ? 'already used' : `${bound(status ?? 'unknown')}, not approved`;
+    return { approval_status: status === null || status === undefined ? null : bound(status), error: `Approval ${approvalId} is ${state}.${row?.error ? ' ' + bound(row.error) : ''}` };
   }
   const value = String(row?.value ?? '');
   const covers = Number(row?.wallet_id) === want.walletId

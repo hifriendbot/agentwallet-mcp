@@ -201,7 +201,7 @@ export async function resolvePublicUrl(url: string): Promise<{ target: URL; addr
   try {
     answers = await dnsLookup(bare, { all: true });
   } catch {
-    throw new Error(`Could not resolve host "${bare}".`);
+    throw new Error(`Could not resolve host "${String(bare).slice(0, 80)}".`);
   }
   if (!answers.length) throw new Error(`Could not resolve host "${bare}".`);
 

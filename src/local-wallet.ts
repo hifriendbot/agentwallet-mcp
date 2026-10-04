@@ -249,7 +249,7 @@ export async function localTokenBalance(chainId: number, token: Address) {
   const d = Number(decimalsRaw);
   const safe = Number.isInteger(d) && d >= 0 && d <= 36 ? d : null;
   return {
-    address, chain_id: chainId, token, symbol,
+    address, chain_id: chainId, token, symbol: String(symbol).replace(/[\u0000-\u001f\u007f-\u009f]/g, '').slice(0, 64), // the same 64-char display bound get_token_info applies (round 6)
     decimals: safe,
     balance_raw: raw.toString(),
     balance: safe === null ? null : formatUnits(raw, safe),
@@ -754,7 +754,9 @@ export async function localEthCall(chainId: number, to: Address, data: Hex): Pro
   await assertRpcServesChain(chainId);
   const client = createPublicClient({ transport: http(resolveRpcUrl(chainId)) });
   const r = await client.call({ to, data });
-  return { result: r.data ?? '0x' };
+  const out = r.data ?? '0x';
+  if (!/^0x([0-9a-fA-F]{2})*$/.test(out)) throw new Error('The RPC node answered eth_call with data that is not hex; refusing to pass it on.');
+  return { result: out };
 }
 
 /** Read-only eth_getCode against the local RPC, same shape as the hosted /eth-get-code route. */
