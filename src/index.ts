@@ -55,7 +55,7 @@ import {
   localSignMessage,
   resolveRpcUrl,
 } from './local-wallet.js';
-import { localSignAuthorization, localEthCall, localGetCode, localSignPermit2Upto, probeTokenDecimals } from './local-wallet.js';
+import { localSignAuthorization, localEthCall, localGetCode, localSignPermit2Upto, probeTokenDecimals, assertRpcServesChain } from './local-wallet.js';
 import { WRAPPED_NATIVE } from './wrapped-native.js';
 import {
   buildUptoAuthorization, uptoPayload, permit2AllowanceCalldata, permit2ApproveCalldata, decodeUint, permit2Address,
@@ -931,7 +931,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.13.13',
+    version: '1.13.14',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()
@@ -1558,6 +1558,8 @@ tool(
     chain_id: z.number().int().describe('Chain ID'),
   },
   async ({ token, chain_id }) => {
+    // A node serving another chain used to be swallowed by the three catch() calls below into name "Unknown" (round 6); it is an error.
+    if (isLocalMode() && !isSolanaChain(chain_id)) await assertRpcServesChain(chain_id);
     if (isSolanaChain(chain_id)) {
       throw new Error('get_token_info is not supported on Solana. Use Solana token metadata programs to query SPL token details.');
     }
@@ -2128,7 +2130,8 @@ tool(
     let claimedAboveMax = false;
     if (claimedStr && /^\d+(\.\d+)?$/.test(claimedStr)) {
       try {
-        claimedAboveMax = (/^\d+$/.test(claimedStr) && BigInt(claimedStr) > BigInt(rawAmount)) || BigInt(parseUnits(claimedStr, trustedDecimals)) > BigInt(rawAmount);
+        // An integer claim is read as base units, a decimal one as human units; reading an integer both ways flagged every honest base-unit claim (round 6).
+        claimedAboveMax = /^\d+$/.test(claimedStr) ? BigInt(claimedStr) > BigInt(rawAmount) : BigInt(parseUnits(claimedStr, trustedDecimals)) > BigInt(rawAmount);
       } catch { claimedAboveMax = false; }
     }
     if (retryCrossOrigin) {
