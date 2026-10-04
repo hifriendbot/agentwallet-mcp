@@ -34,6 +34,7 @@ import {
   normalizeRawAmount,
   parseAutopayAssets,
   assetSupportsExact,
+  approvalResourceUrl,
 } from './x402-payment.js';
 import { createHash } from 'node:crypto';
 import {
@@ -322,6 +323,7 @@ async function api(path: string, method = 'GET', body?: Record<string, unknown>,
   const url = `${API_BASE}${path}`;
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
+    'Accept-Encoding': 'identity', // a 500 KB gzip body inflated to 500 MB before the size check (round 3)
     ...extraHeaders,
   };
 
@@ -342,10 +344,10 @@ async function api(path: string, method = 'GET', body?: Record<string, unknown>,
   if (res.status >= 300 && res.status < 400) {
     throw new Error(`The AgentWallet API host answered ${path} with a redirect (HTTP ${res.status}); refusing to follow it.`);
   }
-  const text = await res.text();
-  if (text.length > API_MAX_RESPONSE_CHARS) throw new Error(`The AgentWallet API host returned an oversized response (${text.length} characters); refusing to parse it.`);
+  const text = await readBounded(res, API_MAX_RESPONSE_CHARS, 'The AgentWallet API host');
   let data: unknown;
   try { data = JSON.parse(text); } catch { throw new Error(`The AgentWallet API host returned a non-JSON response (HTTP ${res.status}).`); }
+  data = boundHostData(data, 0); // strings, arrays and depth bounded; the host writes none of the agent's instructions
 
   // A 402 from the API host is paid automatically only for a HOSTED wallet the
   // operator named with AGENTWALLET_WALLET_ID. In local mode the host is not a
@@ -356,15 +358,76 @@ async function api(path: string, method = 'GET', body?: Record<string, unknown>,
     if (anyLocalMode()) {
       throw new Error(`The AgentWallet API host asked for payment on ${path}; nothing is paid automatically in local mode. If you trust it, call pay_x402 with that URL so the payment is explicit and reported.`);
     }
-    if (X402_WALLET_ID) return handleX402Payment(data as X402Response, path, method, body);
+    if (X402_WALLET_ID) {
+      // Only the routes the hosted billing meters (create, sign, send) are paid for
+      // silently; a 402 on a read or anything else is reported, never paid (round 3).
+      if (!autopayRouteAllowed(path, method)) {
+        throw new Error(`The AgentWallet API host asked for payment on ${method} ${path}, a route the hosted billing does not meter; nothing was paid. If you trust it, call pay_x402 with that URL so the payment is explicit and reported.`);
+      }
+      return handleX402Payment(data as X402Response, path, method, body);
+    }
   }
 
   if (!res.ok) {
-    const error = (data as { error?: string }).error || `HTTP ${res.status}`;
+    const error = serverText((data as { error?: unknown }).error) || `HTTP ${res.status}`;
     throw new Error(error);
   }
 
+  // A send that comes back without a hash was not sent, whatever the body says
+  // ("Transfer complete. 5 ETH sent." with no tx_hash, round 3).
+  if (method === 'POST' && /^\/wallets\/[^/]+\/send(\?|$)/.test(path) && data && typeof data === 'object') {
+    const d = data as { tx_hash?: unknown; signature?: unknown };
+    if (!looksLikeTxHash(d.tx_hash) && !(typeof d.signature === 'string' && /^[1-9A-HJ-NP-Za-km-z]{43,120}$/.test(d.signature))) {
+      throw new Error('The AgentWallet API host answered the send without a transaction hash or signature; treating it as not sent.');
+    }
+  }
+  if (data && typeof data === 'object' && !Array.isArray(data)) (data as Record<string, unknown>).server_text_is_untrusted = true;
   return data;
+}
+
+/** Internal auto-pay covers the metered wallet operations only. */
+function autopayRouteAllowed(path: string, method: string): boolean {
+  return method === 'POST' && /^\/wallets(\/\d+\/(sign|send))?(\?|$)/.test(path);
+}
+
+const AUTOPAY_PER_HOUR = (() => { const n = Number(process.env.AGENTWALLET_MAX_AUTOPAY_PER_HOUR ?? '20'); return Number.isInteger(n) && n >= 0 ? n : 20; })();
+const autopayLog: number[] = [];
+
+/** Read a body no larger than maxChars, refusing early on a declared length and mid-stream on a real one. */
+async function readBounded(res: Response, maxChars: number, who: string): Promise<string> {
+  const declared = Number(res.headers.get('content-length') || 0);
+  if (declared > maxChars) throw new Error(`${who} declared a ${declared}-byte body; refusing to read more than ${maxChars}.`);
+  if (!res.body) return '';
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > maxChars) {
+      await reader.cancel().catch(() => {});
+      throw new Error(`${who} sent more than ${maxChars} bytes; refusing to read further.`);
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+const HOST_MAX_DEPTH = 32;
+const HOST_MAX_STRING = 4000;
+const HOST_MAX_ARRAY = 1000;
+/** Host JSON with every string, array and nesting level bounded (an 8 KB body of nested arrays became a 32 MB result, round 3). */
+function boundHostData(v: unknown, depth: number): unknown {
+  if (depth > HOST_MAX_DEPTH) throw new Error(`The AgentWallet API host returned JSON nested deeper than ${HOST_MAX_DEPTH} levels; refusing it.`);
+  if (typeof v === 'string') return v.length > HOST_MAX_STRING ? v.slice(0, HOST_MAX_STRING) + ' [truncated by agentwallet-mcp]' : v;
+  if (Array.isArray(v)) return v.slice(0, HOST_MAX_ARRAY).map(x => boundHostData(x, depth + 1));
+  if (v && typeof v === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, x] of Object.entries(v)) out[k.slice(0, 200)] = boundHostData(x, depth + 1);
+    return out;
+  }
+  return v;
 }
 
 /**
@@ -475,6 +538,14 @@ async function handleX402Payment(
     : nativeDecimals(chainId); // native asset: 18 on EVM (wei), 9 on Solana (lamports)
   const { tokenAddress, rawAmount, decimals } = deriveX402Payment(accept, maxAutopay, trustedDecimals);
 
+  // A hostile or broken host that answers 402 on every call must not drain the
+  // wallet one cap at a time: at most AUTOPAY_PER_HOUR payments an hour (round 3).
+  const hourAgo = Date.now() - 3_600_000;
+  while (autopayLog.length && autopayLog[0] < hourAgo) autopayLog.shift();
+  if (autopayLog.length >= AUTOPAY_PER_HOUR) {
+    throw new Error(`x402 auto-pay: ${autopayLog.length} automatic payments were already made in the last hour (AGENTWALLET_MAX_AUTOPAY_PER_HOUR=${AUTOPAY_PER_HOUR}); refusing another. Original error: ${serverText(x402Data.error)}`);
+  }
+
   // Send payment using our wallet (with X-AGW-SKIP-X402 to prevent recursion)
   let txHash: string;
   try {
@@ -501,12 +572,19 @@ async function handleX402Payment(
       txHash = sendResult.tx_hash || sendResult.signature || '';
     }
   } catch (e) {
-    throw new Error(`x402 auto-pay failed: ${(e as Error).message}. Original error: ${x402Data.error}`);
+    throw new Error(`x402 auto-pay failed: ${(e as Error).message}. Original error: ${serverText(x402Data.error)}`);
   }
 
   if (!txHash) {
     throw new Error('x402 auto-pay: no transaction hash returned.');
   }
+  autopayLog.push(Date.now());
+  const autopayNotice = {
+    amount: formatUnits(rawAmount, decimals), token: assetLabel(chainId, tokenAddress), pay_to: payTo, chain_id: chainId, tx_hash: txHash,
+    route: `${originalMethod} ${originalPath}`,
+    note: 'Paid automatically from the hosted wallet named by AGENTWALLET_WALLET_ID because the API host answered 402 on this operation.',
+  };
+  console.error(`[agentwallet] auto-paid ${autopayNotice.amount} ${autopayNotice.token} to ${payTo} on chain ${chainId} for ${originalMethod} ${originalPath} (tx ${txHash})`);
 
   // Build X-PAYMENT header (base64-encoded JSON proof)
   const proof = {
@@ -521,8 +599,11 @@ async function handleX402Payment(
   const waitMs = isSolanaChain(chainId) ? 8000 : 3000;
   await new Promise(resolve => setTimeout(resolve, waitMs));
 
-  // Retry original request with payment proof
-  return api(originalPath, originalMethod, originalBody, { 'X-PAYMENT': paymentHeader });
+  // Retry original request with payment proof; the payment rides along in the result,
+  // which used to say nothing about it (round 3).
+  const paid = await api(originalPath, originalMethod, originalBody, { 'X-PAYMENT': paymentHeader });
+  if (paid && typeof paid === 'object' && !Array.isArray(paid)) return { ...(paid as Record<string, unknown>), autopay_payment: autopayNotice };
+  return { result: paid, autopay_payment: autopayNotice };
 }
 
 /**
@@ -535,8 +616,12 @@ function buildErc20TransferData(to: string, amount: string): string {
   return '0xa9059cbb' + addressPadded + amountHex;
 }
 
+const RESULT_MAX_CHARS = 1_000_000;
 function jsonResponse(data: unknown) {
-  return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
+  let text: string;
+  try { text = JSON.stringify(data, null, 2); } catch (e) { text = JSON.stringify({ error: 'The result could not be serialised: ' + (e as Error).message }); }
+  if (text.length > RESULT_MAX_CHARS) text = text.slice(0, RESULT_MAX_CHARS) + `\n... [result truncated at ${RESULT_MAX_CHARS} characters by agentwallet-mcp]`;
+  return { content: [{ type: 'text' as const, text }] };
 }
 
 // ─── Solana Helpers ───────────────────────────────────────────────
@@ -567,6 +652,8 @@ const signingInFlight = new Map<string, Promise<void>>();
 const signedPayments = new Map<string, {
   headerName: string; paymentHeader: string; txHash: string | null;
   authorization: Eip3009Authorization | null; uptoAuth: UptoPermit2Authorization | null; payer: string | null; until: number;
+  resource: string; // wallet|chain|resource|method|body: one live authorization per resource unless fresh_authorization (round 3)
+  amount: string; signedAt: number;
 }>();
 
 function looksLikeTxHash(v: unknown): v is string {
@@ -588,6 +675,7 @@ function redactUrl(u: string): string {
 }
 const API_MAX_RESPONSE_CHARS = 8 * 1024 * 1024;
 const API_TIMEOUT_MS = 60_000; // a hosted hop that hangs must not hold a signing gate open
+const PAYWALL_MAX_CHARS = 4 * 1024 * 1024; // a paywall's answer, before and after payment
 /* Error text from the local signing path with every URL reduced to its origin
    and viem's "URL:" / "Request body:" lines dropped: an RPC endpoint carries
    its API key in the path or query, and a tool result is the agent's context
@@ -664,11 +752,15 @@ function parseUnits(amount: string, decimals: number): string {
  * Format raw units to human-readable string given decimals.
  */
 function formatUnits(raw: string, decimals: number): string {
+  // decimals 300000 from a host once held the whole server for 36 s in the regex below (round 3)
+  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 36) throw new Error(`decimals must be an integer from 0 to 36, got ${String(decimals)}.`);
   const padded = raw.padStart(decimals + 1, '0');
   const whole = padded.slice(0, padded.length - decimals) || '0';
   const frac = padded.slice(padded.length - decimals);
-  // Trim trailing zeros but keep at least one decimal
-  const trimmed = frac.replace(/0+$/, '') || '0';
+  // Trim trailing zeros but keep at least one decimal (a loop, not /0+$/, which backtracks quadratically)
+  let end = frac.length;
+  while (end > 0 && frac[end - 1] === '0') end--;
+  const trimmed = frac.slice(0, end) || '0';
   return decimals === 0 ? whole : `${whole}.${trimmed}`; // a 0-decimal amount has no fraction, so it round-trips through parseUnits
 }
 
@@ -725,7 +817,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.13.7',
+    version: '1.13.8',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()
@@ -1041,7 +1133,7 @@ server.tool(
     // The response's own decimals (local mode reads them from the contract) win
     // over the caller's guess; a guess of 18 used to reformat a 1 USDC balance
     // as 0.000000000001. When nothing supplies them, resolve them ourselves.
-    let trusted: number | null = typeof data.decimals === 'number' ? data.decimals : null;
+    let trusted: number | null = (typeof data.decimals === 'number' && Number.isInteger(data.decimals) && data.decimals >= 0 && data.decimals <= 36) ? data.decimals : null;
     if (trusted === null) {
       if (typeof decimals === 'number') trusted = decimals;
       else if (!isSolanaChain(chain_id)) trusted = await resolveTrustedDecimals(chain_id, token);
@@ -1052,7 +1144,7 @@ server.tool(
 
     return jsonResponse({
       ...data,
-      balance: data.balance ?? formatUnits(data.balance_raw || '0', trusted),
+      balance: /^\d+$/.test(String(data.balance_raw ?? '')) ? formatUnits(String(data.balance_raw), trusted) : serverText(data.balance), // computed here, not the host's word
       decimals: trusted,
       ...(warning ? { warning } : {}),
     });
@@ -1596,7 +1688,7 @@ server.tool(
         error: `The endpoint redirected to another origin (${new URL(servedFrom).origin}) before asking for payment. Call pay_x402 with that URL directly if you trust it.`,
         final_url: servedFrom });
     }
-    const initialText = await initialRes.text();
+    const initialText = await readBounded(initialRes, PAYWALL_MAX_CHARS, 'The endpoint');
     let initialBody: unknown = null;
     try { initialBody = JSON.parse(initialText); } catch { initialBody = null; }
     const paymentInfo = parsePaymentRequired(n => initialRes.headers.get(n), initialBody);
@@ -1657,6 +1749,10 @@ server.tool(
     // "exact" requirement in a token with no EIP-3009 can never settle, so it
     // is refused before an approval could be consumed for it.
     const legacyReceipt = isLegacyAgentWalletAccept(option) && legacyReceiptAllowed(servedFrom, API_BASE, process.env.AGENTWALLET_LEGACY_PAYWALL_ORIGINS);
+    // Only a signed authorization (EIP-3009 "exact" or Permit2 "upto") is bound to an
+    // approval by the hosted signer; a broadcast transfer (native coin, Solana, an
+    // AgentWallet receipt paywall) is not, so an approval must never lift the cap for one.
+    const willSign = isUpto || (!isSolanaChain(chainId) && Boolean(tokenAddress) && !legacyReceipt);
     if (!isUpto && !isSolanaChain(chainId) && tokenAddress && !legacyReceipt && !assetSupportsExact(chainId, tokenAddress)) {
       return jsonResponse({
         status: 402, payment_required: true, payment_made: false,
@@ -1664,6 +1760,19 @@ server.tool(
         error: `${tokenLabel} on chain ${chainId} does not implement EIP-3009, so an "exact" x402 payment in it cannot settle; nothing was signed. The endpoint would need an "upto" option or a USDC requirement.`,
       });
     }
+
+    // Step 3d: The reuse key. It is computed before the cap so that an
+    // authorization already signed for exactly this purchase is re-sent even when
+    // the cap or approval that admitted it is no longer available (an approval is
+    // consumed by the signature, so a retry after a dropped paid request used to
+    // dead-end on "already used", round 3). The body counts only when it is sent.
+    const METHOD = (method || 'GET').toUpperCase();
+    const bodyDigest = createHash('sha256').update(METHOD !== 'GET' && reqBody ? reqBody : '').digest('hex').slice(0, 16);
+    const walletKey = anyLocalMode() ? 'local' : String(wallet_id); // the local signer has one key whatever wallet_id says
+    const resourceTag = [walletKey, chainId, authorizationResource(url), METHOD, bodyDigest].join('|');
+    const cacheKey = [walletKey, chainId, tokenAddress.toLowerCase(), option.payTo.toLowerCase(), rawAmount, option.scheme, resourceTag].join('|');
+    for (const [k, v] of signedPayments) if (v.until <= Date.now()) signedPayments.delete(k);
+    const alreadySigned = !fresh_authorization && (signedPayments.get(cacheKey)?.until ?? 0) > Date.now();
 
     // Step 4: Hard per-payment cap, ALWAYS applied. If the caller omits max_payment
     // we fall back to AGENTWALLET_MAX_AUTOPAY (default "1"). Above the cap a hosted
@@ -1674,7 +1783,7 @@ server.tool(
     // above it is ignored and reported, because the agent is what the cap bounds.
     const { cap: effectiveMax, source: capSource, clamped } = effectiveAutopayCap(max_payment);
     let approvalUsed: string | null = null;
-    if (!isWithinCap(rawAmount, trustedDecimals, effectiveMax)) {
+    if (!alreadySigned && !isWithinCap(rawAmount, trustedDecimals, effectiveMax)) {
       const overCap = {
         status: 402, payment_required: true, payment_made: false,
         required_amount: amount, max_allowed: effectiveMax, cap_source: capSource, token: tokenLabel,
@@ -1683,9 +1792,12 @@ server.tool(
       };
       const wantApproval = request_approval ?? (process.env.AGENTWALLET_APPROVALS !== '0');
       if (approval_id) {
+        if (!willSign) {
+          return jsonResponse({ ...overCap, approval_id, error: `Approval ${approval_id} cannot cover this payment: it is a broadcast transfer (native coin, Solana, or an AgentWallet receipt paywall), which the hosted signer does not bind to an approval, so the same id would lift the cap on every call. Approvals cover EIP-3009 "exact" and Permit2 "upto" authorizations only.` });
+        }
         // Local mode refuses before any lookup: only the hosted signer can consume
         // an approval, so here the same id would lift the cap on every call.
-        const want = { walletId: wallet_id, chainId, asset: tokenAddress, payTo: option.payTo, rawAmount };
+        const want = { walletId: wallet_id, chainId, asset: tokenAddress, payTo: option.payTo, rawAmount, scheme: option.scheme };
         const local = anyLocalMode();
         const a = local ? null : (await api(`/approvals/${encodeURIComponent(approval_id)}`, 'GET', undefined, skip)) as ApprovalRow;
         const refusal = approvalRefusal(approval_id, a, want, local);
@@ -1693,10 +1805,10 @@ server.tool(
           return jsonResponse({ ...overCap, approval_id, ...refusal });
         }
         approvalUsed = String(approval_id);
-      } else if (wantApproval && !anyLocalMode()) {
+      } else if (wantApproval && !anyLocalMode() && willSign) {
         const created = (await api('/approvals', 'POST', {
           wallet_id, chain_id: chainId, scheme: option.scheme, asset: tokenAddress, pay_to: option.payTo, value: rawAmount,
-          amount_human: amount, token_name: tokenLabel, url,
+          amount_human: amount, token_name: tokenLabel, url: approvalResourceUrl(url),
         }, skip)) as { success?: boolean; id?: number; expires_at?: string; error?: string };
         if (!created?.id) {
           return jsonResponse({ ...overCap, error: `Payment of ${amount} ${tokenLabel} exceeds the ${effectiveMax} cap and the approval request failed: ${created?.error || 'unknown error'}.` });
@@ -1722,7 +1834,7 @@ server.tool(
     // usage; the payer broadcasts nothing and pays no gas for either. AgentWallet's
     // own paywalls (verified by receipt), native-asset requests and Solana still use
     // a broadcast transfer proved by hash.
-    const standardExact = !isUpto && !isSolanaChain(chainId) && Boolean(tokenAddress) && !legacyReceipt;
+    const standardExact = !isUpto && willSign;
     let headerName = 'X-PAYMENT';
     let paymentHeader = '';
     let txHash: string | null = null;
@@ -1739,13 +1851,35 @@ server.tool(
     // The method and body are part of what was bought: POST {item:A} and
     // POST {item:B} to one URL are two purchases. Concurrent calls for one key
     // wait for the first signature instead of each signing a nonce.
-    const bodyDigest = createHash('sha256').update(reqBody ?? '').digest('hex').slice(0, 16);
-    const cacheKey = [wallet_id, chainId, tokenAddress.toLowerCase(), option.payTo.toLowerCase(), rawAmount, option.scheme, authorizationResource(url), (method || 'GET').toUpperCase(), bodyDigest].join('|');
-    const inFlight = signingInFlight.get(cacheKey);
-    if (inFlight && !fresh_authorization) await inFlight;
+    // (bodyDigest and cacheKey were computed in Step 3d, before the cap.)
+    // A mutex, not a one-shot wait: when the first signer fails nothing is cached,
+    // and every waiter used to proceed at once and sign its own nonce (round 3).
+    // The resource is a second mutex key: parallel calls whose requirements differ
+    // (a paywall varying the amount per answer) would otherwise sign side by side
+    // before any of them could see the other's live authorization.
+    const resourceLock = 'resource|' + resourceTag;
+    while (!fresh_authorization && (signingInFlight.get(cacheKey) || signingInFlight.get(resourceLock))) {
+      await (signingInFlight.get(cacheKey) || signingInFlight.get(resourceLock));
+    }
     const cachedAuth = fresh_authorization ? undefined : signedPayments.get(cacheKey);
-    for (const [k, v] of signedPayments) if (v.until <= Date.now()) signedPayments.delete(k);
+    if (!(cachedAuth && cachedAuth.until > Date.now()) && !fresh_authorization) {
+      // One live authorization per resource. A paywall that answers every call with
+      // a slightly different requirement (amount 999999, 999998, ...) used to harvest
+      // a cap-sized nonce per call (round 3); the second distinct requirement for the
+      // same purchase is refused until the first expires or fresh_authorization is passed.
+      const other = [...signedPayments.entries()].find(([k, v]) => k !== cacheKey && v.resource === resourceTag && v.until > Date.now());
+      if (other) {
+        const [, live] = other;
+        return jsonResponse({
+          status: 402, payment_required: true, payment_made: false,
+          error: `This resource already holds a live authorization signed ${Math.round((Date.now() - live.signedAt) / 1000)} s ago for ${live.amount} ${tokenLabel} (the endpoint's requirement changed between answers: amount, recipient, asset or scheme). It is re-sent by calling pay_x402 again with the same arguments once the endpoint asks for the same requirement; to sign a second authorization for this resource pass fresh_authorization=true.`,
+          live_authorization: { amount: live.amount, valid_until: new Date(live.until).toISOString(), payer: live.payer },
+          requested_amount: amount, token: tokenLabel, pay_to: option.payTo, chain_id: chainId,
+        });
+      }
+    }
     let releaseSigning: () => void = () => {};
+    let mineLock: Promise<void> | null = null;
     if (!(cachedAuth && cachedAuth.until > Date.now())) {
       const mine = new Promise<void>(r => { releaseSigning = r; });
       // Released in the finally below, whatever path this call takes. A timer
@@ -1753,6 +1887,7 @@ server.tool(
       // a second call signed a second nonce (2026-10-04 round 2); every
       // network hop inside the gate carries its own timeout instead.
       signingInFlight.set(cacheKey, mine);
+      if (!fresh_authorization) { signingInFlight.set(resourceLock, mine); mineLock = mine; }
     }
 
     try {
@@ -1818,11 +1953,15 @@ server.tool(
         const until = authorization ? Number(authorization.validBefore) * 1000
           : uptoAuth ? Number(uptoAuth.deadline) * 1000
           : Date.now() + maxAuthWindowSeconds() * 1000; // a broadcast transfer: the hash stays valid, re-sending it never pays twice
-        signedPayments.set(cacheKey, { headerName, paymentHeader, txHash, authorization, uptoAuth, payer, until });
+        signedPayments.set(cacheKey, { headerName, paymentHeader, txHash, authorization, uptoAuth, payer, until, resource: resourceTag, amount, signedAt: Date.now() });
+        // A receipt on stderr the moment a signature exists, so a result the transport
+        // drops (a client crash, an oversized frame) is still auditable (round 3).
+        console.error(`[agentwallet] x402 authorization sent: ${amount} ${tokenLabel} to ${option.payTo} on chain ${chainId} for ${authorizationResource(url)} (${authorization ? 'nonce ' + authorization.nonce : uptoAuth ? 'permit2 nonce ' + uptoAuth.nonce : 'tx ' + txHash})`);
       }
     } finally {
       releaseSigning();
       signingInFlight.delete(cacheKey);
+      if (signingInFlight.get(resourceLock) === mineLock) signingInFlight.delete(resourceLock);
     }
 
     // Step 6: Retry with the payment header and read the settlement receipt.
@@ -1848,7 +1987,7 @@ server.tool(
         tx_hash: txHash ?? null, amount, token: tokenLabel, pay_to: option.payTo, chain_id: chainId,
       });
     }
-    const retryText = await retryRes.text();
+    const retryText = await readBounded(retryRes, PAYWALL_MAX_CHARS, 'The endpoint');
     let retryParsed: unknown;
     try { retryParsed = JSON.parse(retryText); } catch { retryParsed = retryText; }
     const settlement = parseSettlement(n => retryRes.headers.get(n));
@@ -2321,8 +2460,11 @@ server.tool(
 
 async function main() {
   validateGuardEnv();
-  const transport = new StdioServerTransport();
+  // 64 MB frames before the SDK closes the transport (default 10 MB); errors are logged, not swallowed (round 3).
+  const transport = new StdioServerTransport(process.stdin, process.stdout, { maxBufferSize: 64 * 1024 * 1024 });
+  process.stdout.on('error', (e: NodeJS.ErrnoException) => { if (e.code === 'EPIPE') process.exit(0); console.error('[agentwallet] stdout error: ' + e.message); });
   await server.connect(transport);
+  server.server.onerror = (e) => console.error('[agentwallet] transport error: ' + (e as Error).message);
 
   /* stderr, so it never corrupts the stdio JSON-RPC stream. Announcing custody
      at startup means an operator sees which mode they are in without asking. */

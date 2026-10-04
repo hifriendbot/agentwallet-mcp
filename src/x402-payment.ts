@@ -408,6 +408,7 @@ export function isWithinCap(
 /** The row GET /approvals/{id} answers with. Numbers arrive as strings from the server. */
 export interface ApprovalRow {
   status?: string;
+  scheme?: string;
   used?: number | string;
   wallet_id?: number | string;
   chain_id?: number | string;
@@ -423,6 +424,13 @@ export interface ApprovalWant {
   asset: string;
   payTo: string;
   rawAmount: string;
+  scheme?: string; // "exact" or "upto": an approval for one must not be spent on the other (round 3)
+}
+
+/** The url stored with an approval request: origin and path only, never userinfo or a query (round 3). */
+export function approvalResourceUrl(url: string): string {
+  const u = new URL(url);
+  return u.origin + u.pathname;
 }
 
 /**
@@ -469,10 +477,11 @@ export function approvalRefusal(
     && Number(row?.chain_id) === want.chainId
     && String(row?.asset ?? '').toLowerCase() === want.asset.toLowerCase()
     && String(row?.pay_to ?? '').toLowerCase() === want.payTo.toLowerCase()
+    && (!want.scheme || !row?.scheme || String(row.scheme) === want.scheme)
     && /^\d+$/.test(value) && /^\d+$/.test(want.rawAmount)
     && BigInt(value) >= BigInt(want.rawAmount);
   if (!covers) {
-    return { error: 'Approval does not cover this payment (wallet, asset, recipient, chain or amount differ).' };
+    return { error: 'Approval does not cover this payment (wallet, asset, recipient, chain, scheme or amount differ).' };
   }
   return null;
 }

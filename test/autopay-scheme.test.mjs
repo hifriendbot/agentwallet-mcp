@@ -26,12 +26,15 @@ const api = createServer((req, res) => {
   req.on('data', (c) => (body += c));
   req.on('end', () => {
     const json = (code, obj) => { res.statusCode = code; res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(obj)); };
+    // Since 1.13.8 only the metered routes (POST /wallets, /sign, /send) are auto-paid: the
+    // 402 is raised on the send itself; the payment transfer carries X-AGW-SKIP-X402.
     if (req.method === 'POST' && req.url === '/wallets/1/send') {
-      sends.push(JSON.parse(body));
-      return json(200, { tx_hash: '0x' + 'ab'.repeat(32) });
+      if (req.headers['x-agw-skip-x402']) { sends.push(JSON.parse(body)); return json(200, { tx_hash: '0x' + 'ab'.repeat(32) }); }
+      if (req.headers['x-payment']) { paidRetries++; return json(200, { tx_hash: '0x' + 'cd'.repeat(32), paid: true }); }
+      return json(402, { x402Version: 1, error: 'Payment Required', accepts: [offer] });
     }
     if (req.url.startsWith('/wallets/1/balance')) {
-      if (req.headers['x-payment']) { paidRetries++; return json(200, { balance: '1', paid: true }); }
+      balance402s++;
       return json(402, { x402Version: 1, error: 'Payment Required', accepts: [offer] });
     }
     json(404, { error: `mock: ${req.method} ${req.url} not served` });
@@ -41,7 +44,8 @@ await new Promise((r) => api.listen(0, '127.0.0.1', r));
 const API_URL = `http://127.0.0.1:${api.address().port}`;
 
 /** Drive the server over stdio, hosted mode, against the loopback API. */
-function getBalance() {
+let balance402s = 0;
+function getBalance(tool = 'transfer') {
   return new Promise((resolve, reject) => {
     const env = { ...process.env };
     for (const k of Object.keys(env)) if (k.startsWith('AGENTWALLET_')) delete env[k];
@@ -55,7 +59,9 @@ function getBalance() {
     const send = (msg) => child.stdin.write(JSON.stringify(msg) + '\n');
     send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'test', version: '1' } } });
     send({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} });
-    send({ jsonrpc: '2.0', id: 100, method: 'tools/call', params: { name: 'get_balance', arguments: { wallet_id: 1, chain_id: 8453 } } });
+    send({ jsonrpc: '2.0', id: 100, method: 'tools/call', params: tool === 'get_balance'
+      ? { name: 'get_balance', arguments: { wallet_id: 1, chain_id: 8453 } }
+      : { name: 'transfer', arguments: { wallet_id: 1, chain_id: 8453, to: PAY_TO, amount: '0.001' } } });
     const timer = setInterval(() => {
       const responses = out.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
       const r = responses.find((x) => x.id === 100);
@@ -87,8 +93,20 @@ offer = { scheme: 'exact', network: 'base', asset: USDC_BASE, payTo: PAY_TO, max
   assert.equal(sends[0].to.toLowerCase(), USDC_BASE.toLowerCase());
   assert.equal(paidRetries, 1, 'the request is retried once with the payment proof');
   assert.match(text, /"paid":\s*true/, `unexpected tool text: ${text.slice(0, 300)}`);
+  assert.match(text, /"autopay_payment"/, `the result must report the automatic payment: ${text.slice(0, 300)}`);
+  assert.match(text, /"amount": "1(\.0)?"/, `the reported amount: ${text.slice(0, 400)}`);
   passed++;
-  console.log('  ok - control: an exact offer still settles and the original request is retried with proof');
+  console.log('  ok - control: an exact offer still settles, the original request is retried with proof, and the payment is reported');
+}
+
+{
+  const before = sends.length;
+  const text = await getBalance('get_balance');
+  assert.equal(balance402s, 1, 'the read was attempted once');
+  assert.equal(sends.length, before, `a 402 on a read must not be paid; sends were ${JSON.stringify(sends.slice(before))}`);
+  assert.match(text, /a route the hosted billing does not meter; nothing was paid/, `unexpected tool text: ${text.slice(0, 300)}`);
+  passed++;
+  console.log('  ok - a 402 on a read route (get_balance) is reported, never paid (round 3)');
 }
 
 offer = { scheme: 'exact', network: 'base', asset: USDC_BASE, payTo: PAY_TO, maxAmountRequired: '5000000', requiredDecimals: 6 };

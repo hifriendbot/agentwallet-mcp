@@ -33,6 +33,7 @@ import {
   type Hex,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
+import { nonceManager } from 'viem/nonce';
 import { lookupTrustedDecimals, maxAuthWindowSeconds } from './x402-payment.js';
 import { wrappedNativeAddress } from './wrapped-native.js';
 import { typedDataFor, type Eip3009Authorization } from './x402-eip3009.js';
@@ -101,7 +102,9 @@ export function getLocalAccount() {
   if (keyLoadError) throw new Error(keyLoadError); // the keyfile's own reason, before the generic line
   if (!raw) throw new Error('Local signing mode is not configured.');
 
-  cachedAccount = privateKeyToAccount(normalizeKey(raw));
+  // The nonce manager hands parallel sends consecutive nonces; without it every
+  // concurrent send read the same pending nonce and all but one failed (round 3).
+  cachedAccount = privateKeyToAccount(normalizeKey(raw), { nonceManager });
   return cachedAccount;
 }
 
