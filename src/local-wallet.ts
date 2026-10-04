@@ -334,7 +334,7 @@ export function classifyDecimalsError(err: unknown): DecimalsProbe {
   const e = err as { code?: unknown; data?: unknown; message?: string; details?: string; shortMessage?: string };
   const code = typeof e?.code === 'number' ? e.code : NaN;
   const text = [e?.message, e?.details, e?.shortMessage].filter(Boolean).join(' ');
-  const hasRevertData = typeof e?.data === 'string' && /^0x[0-9a-fA-F]*$/.test(e.data);
+  const hasRevertData = typeof e?.data === 'string' && /^0x[0-9a-fA-F]+$/.test(e.data); // "0x" alone is not revert data
   if (code === 3) return 'not-a-token'; // the JSON-RPC "execution error" code
   if ((code === -32000 || code === -32603 || code === -32015) && (/revert/i.test(text) || hasRevertData)) return 'not-a-token';
   return 'unreachable';
@@ -358,7 +358,12 @@ export function permit2AddressFor(chainId: number): string { return PERMIT2_BY_C
    table does not know, and is refused rather than let through as "a router"
    (2026-10-04 audit). approve, permit (2 shapes), transferFrom (2), lockdown,
    permitTransferFrom (2), permitWitnessTransferFrom (2), invalidateNonces/UnorderedNonces. */
-const PERMIT2_SELECTORS = new Set(['87517c45', '2b67b570', '2a2d80d1', '36c78516', '0d58b1db', 'cc53287f', '30f28b7a', 'edd9444b', '137c29fe', 'fe8ec1a7', '3ff9dcb1', '0d58b1db']);
+const PERMIT2_SELECTORS = new Set(['87517c45', '2b67b570', '2a2d80d1', '36c78516', '0d58b1db', 'cc53287f', '30f28b7a', 'edd9444b', '137c29fe', 'fe8ec1a7', '3ff9dcb1', '65d9723c']);
+/* ERC-721 / ERC-1155 approvals and transfers. A collection declines decimals()
+   and so read as "not a token" to the cap, which let setApprovalForAll to an
+   attacker through uncapped (2026-10-04 round 2, verified on a live
+   collection). Nothing prices an NFT, so these are refused outright. */
+const NFT_SELECTORS = new Set(['a22cb465', '42842e0e', 'b88d4fde', 'f242432a', '2eb2c2d6']);
 
 /**
  * Calls the token cap knows how to price: which calldata word holds the
@@ -430,6 +435,12 @@ async function assertWithinTokenCap(chainId: number, to: Address, data: Hex, val
         `Use transfer, transferFrom, approve, increaseAllowance, Permit2 approve, ` +
         `or deposit/withdraw on the chain's wrapped-native contract, ` +
         `or ask the operator, who alone can set AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS=1.`
+      );
+    }
+    if (NFT_SELECTORS.has(selector)) {
+      throw new Error(
+        `Blocked by local guard: calldata selector 0x${selector} is an NFT approval or transfer (ERC-721/1155) aimed at ${to}; AGENTWALLET_MAX_TX_TOKEN cannot price it, ` +
+        `so it is refused rather than let through uncapped. Only the operator can allow it (AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS=1).`
       );
     }
     if (PERMIT2_SELECTORS.has(selector)) {

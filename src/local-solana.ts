@@ -485,15 +485,23 @@ export async function localSplTransfer(
 
   const tx = new Transaction();
   const destInfo = await conn.getAccountInfo(destAta);
-  if (destInfo && !destInfo.owner.equals(tokenProgram)) {
-    throw new Error(`Refusing to send: the recipient's token account address ${destAta.toBase58()} is already occupied by an account the token program does not own, so no token account can be created there.`);
+  // The associated-account program creates into an address that already holds
+  // plain SOL (system-owned, no data): it tops up the rent, allocates and
+  // assigns. Only an address holding something else cannot become the token
+  // account (2026-10-04 round 2; the 1.13.5 refusal of any occupant let anyone
+  // block a recipient for the price of the rent-exempt minimum).
+  const prefunded = destInfo !== null && destInfo.owner.equals(SystemProgram.programId) && destInfo.data.length === 0;
+  if (destInfo && !destInfo.owner.equals(tokenProgram) && !prefunded) {
+    throw new Error(`Refusing to send: the recipient's token account address ${destAta.toBase58()} is occupied by an account owned by ${destInfo.owner.toBase58()}, so no token account can be created there.`);
   }
-  if (!destInfo) {
+  if (!destInfo || prefunded) {
     // Creating the recipient's token account costs the payer rent in SOL, an
     // outflow the SOL cap must see (0.002 SOL a time adds up over many sends).
-    // Rent follows the account's real size, which for Token-2022 is above 165.
+    // Rent follows the account's real size, which for Token-2022 is above 165;
+    // SOL already sitting at the address reduces what the payer tops up.
     const rent = await conn.getMinimumBalanceForRentExemption(ataSize);
-    assertWithinSolCap(BigInt(rent));
+    const shortfall = Math.max(0, rent - (destInfo?.lamports ?? 0));
+    assertWithinSolCap(BigInt(shortfall));
     tx.add(createAtaIdempotentIx(payer.publicKey, destAta, recipient, mint, tokenProgram));
   }
   tx.add(
@@ -543,11 +551,12 @@ async function assertRecipientIsWallet(conn: Connection, recipient: PublicKey): 
     }
     throw new Error(`Refusing to send to ${recipient.toBase58()}: it is an account owned by the SPL token program, not a wallet.`);
   }
-  // Everything else that exists must be a plain system account: a program's
-  // data or buffer account, an address lookup table, a stake or vote account
-  // is owned by its program and nothing can ever sign for it as a wallet
-  // (2026-10-04 audit). A program-derived vault that holds tokens is still
-  // system-owned, so this costs nothing legitimate.
+  // Everything else that exists must be system-owned: a program's data or
+  // buffer account, an address lookup table, a stake or vote account is owned
+  // by its program and nothing can ever sign for it as a wallet (2026-10-04
+  // audit). A program-derived vault that holds tokens is system-owned and
+  // passes; so does a durable-nonce account (system-owned, 80 bytes), whose
+  // authority can withdraw what lands there.
   if (!info.owner.equals(SystemProgram.programId)) {
     throw new Error(`Refusing to send to ${recipient.toBase58()}: it is owned by program ${info.owner.toBase58()}, not a wallet. Pass a wallet address.`);
   }

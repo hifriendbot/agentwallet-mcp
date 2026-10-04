@@ -185,7 +185,8 @@ try {
   await refused('SPL send to a program-data account is refused', () => localSplTransfer(MINT9, PROGRAM_DATA, '1', 9, 900), /owned by program BPFLoaderUpgradeab1e/);
   await refused('SPL send to an address lookup table is refused', () => localSplTransfer(MINT9, TABLE, '1', 9, 900), /owned by program AddressLookupTab1e/);
   await refused('native SOL to a program-data account is refused', () => localSolTransfer(PROGRAM_DATA, '1', 900), /owned by program/);
-  await refused('a plain account sitting at the token-account address refuses rather than sending into it', async () => { occupyAta = true; try { await localSplTransfer(MINT9, WALLET, '1', 9, 900); } finally { occupyAta = false; } }, /already occupied by an account the token program does not own/);
+  // 1.13.5 refused this; 1.13.6 corrects it: the associated-account program creates into a pre-funded system account (see audit-1136).
+  await refused('a plain SOL-holding account at the token-account address is created into (stops at the blockhash)', async () => { occupyAta = true; try { await localSplTransfer(MINT9, WALLET, '1', 9, 900); } finally { occupyAta = false; } }, /not served|blockhash/i);
   await refused('a system-owned wallet still passes the guard (stops at the blockhash the mock does not serve)', () => localSplTransfer(MINT9, WALLET, '1', 9, 900), /not served|blockhash/i);
 } finally {
   srpc.close();

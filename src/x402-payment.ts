@@ -67,15 +67,25 @@ export const TRUSTED_DECIMALS: Record<number, Record<string, number>> = {
  * would happily label 5 ETH as "5 USDC". The stable flag decides whether
  * AGENTWALLET_MAX_AUTOPAY (denominated in dollars) can price the asset at all.
  */
-export const KNOWN_ASSETS: ReadonlyArray<{ chainId: number; address: string; symbol: string; stable: boolean }> = [
+/* exact: false marks a stablecoin that does not implement EIP-3009 (checked on
+   chain 2026-10-04: USDT, DAI and USDbC have no authorizationState), so an
+   "exact" x402 requirement naming it can never settle; such assets still work
+   for "upto" through Permit2. Absent means true. */
+export function assetSupportsExact(chainId: number, asset: string): boolean {
+  const key = asset.toLowerCase();
+  const hit = KNOWN_ASSETS.find(a => a.chainId === chainId && a.address === key);
+  return hit ? hit.exact !== false : true;
+}
+export const KNOWN_ASSETS: ReadonlyArray<{ chainId: number; address: string; symbol: string; stable: boolean; exact?: boolean }> = [
   { chainId: 1, address: '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48', symbol: 'USDC', stable: true },
-  { chainId: 1, address: '0xdac17f958d2ee523a2206206994597c13d831ec7', symbol: 'USDT', stable: true },
-  { chainId: 1, address: '0x6b175474e89094c44da98b954eedeac495271d0f', symbol: 'DAI', stable: true },
+  { chainId: 1, address: '0xdac17f958d2ee523a2206206994597c13d831ec7', symbol: 'USDT', stable: true, exact: false },
+  { chainId: 1, address: '0x6b175474e89094c44da98b954eedeac495271d0f', symbol: 'DAI', stable: true, exact: false },
   { chainId: 8453, address: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', symbol: 'USDC', stable: true },
-  { chainId: 8453, address: '0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca', symbol: 'USDbC', stable: true },
+  { chainId: 8453, address: '0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca', symbol: 'USDbC', stable: true, exact: false },
   { chainId: 8453, address: '0x4200000000000000000000000000000000000006', symbol: 'WETH', stable: false },
   { chainId: 137, address: '0x3c499c542cef5e3811e1192ce70d8cc03d5c3359', symbol: 'USDC', stable: true },
-  { chainId: 137, address: '0xc2132d05d31c914a87c6611c10748aeb04b58e8f', symbol: 'USDT', stable: true },
+  { chainId: 137, address: '0xc2132d05d31c914a87c6611c10748aeb04b58e8f', symbol: 'USDT0', stable: true, exact: false },
+  { chainId: 43114, address: '0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e', symbol: 'USDC', stable: true },
   { chainId: 42161, address: '0xaf88d065e77c8cc2239327c5edb3a432268e5831', symbol: 'USDC', stable: true },
   { chainId: 10, address: '0x0b2c639c533813f4aa9d7837caf62653d097ff85', symbol: 'USDC', stable: true },
   { chainId: 900, address: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', symbol: 'USDC', stable: true },
@@ -90,7 +100,7 @@ const NATIVE_SYMBOL: Record<number, string> = {
 
 function assetKey(chainId: number, asset: string): string {
   // EVM addresses are case-insensitive hex; SPL mints are case-sensitive base58.
-  return `${chainId}:${asset.startsWith('0x') ? asset.toLowerCase() : asset}`;
+  return `${chainId}:${/^0x/i.test(asset) ? asset.toLowerCase() : asset}`;
 }
 const KNOWN_BY_KEY = new Map(KNOWN_ASSETS.map(a => [assetKey(a.chainId, a.address), a]));
 
@@ -133,12 +143,12 @@ export function parseAutopayAssets(raw: string | undefined): Array<{ chainId: nu
     const m = e.match(/^(\d+):(.+)$/);
     const chainId = m ? parseInt(m[1], 10) : null;
     const a = (m ? m[2] : e).trim();
-    return { chainId, asset: a.startsWith('0x') ? a.toLowerCase() : a };
+    return { chainId, asset: /^0x/i.test(a) ? a.toLowerCase() : a };
   });
 }
 export function autopayAssetAllowed(chainId: number, asset: string): { allowed: boolean; via: 'stablecoin' | 'allowlist' | 'none'; reason?: string } {
   if (isStableAsset(chainId, asset)) return { allowed: true, via: 'stablecoin' };
-  const wanted = asset ? (asset.startsWith('0x') ? asset.toLowerCase() : asset) : 'native';
+  const wanted = asset ? (/^0x/i.test(asset) ? asset.toLowerCase() : asset) : 'native';
   const hit = parseAutopayAssets(process.env.AGENTWALLET_AUTOPAY_ASSETS).some(e => e.asset === wanted && (e.chainId === null || e.chainId === chainId));
   if (hit) return { allowed: true, via: 'allowlist' };
   const label = assetLabel(chainId, asset);

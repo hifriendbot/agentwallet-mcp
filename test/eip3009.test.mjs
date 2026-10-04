@@ -135,7 +135,7 @@ ok('parsePaymentRequired prefers the PAYMENT-REQUIRED header, falls back to a v1
   const fromHeader = parsePaymentRequired((n) => (n === 'PAYMENT-REQUIRED' ? encoded : null), null);
   assert.deepStrictEqual(fromHeader, v2Req);
   const fromBody = parsePaymentRequired(() => null, { x402Version: 1, accepts: [v1] });
-  assert.strictEqual(fromBody.accepts[0], v1);
+  assert.deepStrictEqual(fromBody.accepts[0], v1); // a copy since 1.13.6: entries are sanitised, never the server's object
   assert.strictEqual(parsePaymentRequired(() => null, { error: 'nope' }), null);
 });
 

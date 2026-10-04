@@ -250,11 +250,54 @@ export function parsePaymentRequired(
   body: unknown,
 ): X402PaymentRequired | null {
   const fromHeader = decodeBase64Json(getHeader('PAYMENT-REQUIRED') ?? getHeader('payment-required'));
-  if (fromHeader && Array.isArray(fromHeader.accepts)) return fromHeader as unknown as X402PaymentRequired;
+  if (fromHeader && Array.isArray(fromHeader.accepts)) return sanitizeRequired(fromHeader as unknown as X402PaymentRequired);
   if (body && typeof body === 'object' && Array.isArray((body as X402PaymentRequired).accepts)) {
-    return body as X402PaymentRequired;
+    return sanitizeRequired(body as X402PaymentRequired);
   }
   return null;
+}
+
+/* Only entries shaped like requirements survive: plain objects whose scheme,
+   network and payTo are strings. A null entry, or an array where an address
+   should be, used to reach the pickers and surface a raw TypeError or a
+   coerced value (2026-10-04 round 2). Numeric amounts are kept as strings. */
+const MAX_ACCEPTS = 64; // a bound on the picker's work, well above anything a real server lists
+export function sanitizeRequired(req: X402PaymentRequired): X402PaymentRequired {
+  const str = (v: unknown) => (typeof v === 'string' ? v : typeof v === 'number' && Number.isFinite(v) ? String(v) : undefined);
+  const accepts: X402Requirement[] = [];
+  for (const a of (req.accepts as unknown[]).slice(0, MAX_ACCEPTS)) {
+    if (!a || typeof a !== 'object' || Array.isArray(a)) continue;
+    const o = a as Record<string, unknown>;
+    const scheme = str(o.scheme), network = str(o.network), payTo = str(o.payTo);
+    if (scheme === undefined || network === undefined || payTo === undefined) continue;
+    const extraIn = (o.extra && typeof o.extra === 'object' && !Array.isArray(o.extra)) ? o.extra as Record<string, unknown> : undefined;
+    const extra: Record<string, unknown> | undefined = extraIn ? { ...extraIn } : undefined;
+    if (extra) for (const k of ['token', 'name', 'version', 'facilitatorAddress', 'spender', 'permit2']) { if (k in extra && typeof extra[k] !== 'string') delete extra[k]; }
+    const out: Record<string, unknown> = { ...o, scheme, network, payTo };
+    for (const k of ['amount', 'maxAmountRequired', 'asset', 'description', 'resource', 'mimeType']) {
+      const v = str(o[k]); if (v === undefined) delete out[k]; else out[k] = v;
+    }
+    if (extra) out.extra = extra; else delete out.extra;
+    accepts.push(out as unknown as X402Requirement);
+  }
+  return { ...req, accepts };
+}
+
+/** What the paid retry proved. The server's own claim never makes a refused request "paid". */
+export function settlementVerdict(status: number, settlement: { success?: unknown } | null, crossOrigin: boolean): { payment_made: boolean; outcome: 'paid' | 'refused' | 'server_reports_failure' | 'not_delivered' } {
+  if (crossOrigin) return { payment_made: false, outcome: 'not_delivered' };
+  if (status < 200 || status >= 300) return { payment_made: false, outcome: 'refused' };
+  if (settlement && settlement.success === false) return { payment_made: false, outcome: 'server_reports_failure' };
+  return { payment_made: true, outcome: 'paid' };
+}
+
+/** The tx-hash receipt flow is for AgentWallet's own paywalls: the API host, or origins the operator lists. */
+export function legacyReceiptAllowed(finalUrl: string, apiBase: string, extraOrigins: string | undefined): boolean {
+  try {
+    const origin = new URL(finalUrl).origin;
+    if (origin === new URL(apiBase).origin) return true;
+    return (extraOrigins || '').split(',').map(s => s.trim()).filter(Boolean).some(o => { try { return new URL(o).origin === origin; } catch { return false; } });
+  } catch { return false; }
 }
 
 export function parseSettlement(getHeader: (name: string) => string | null | undefined): X402Settlement | null {
@@ -279,7 +322,7 @@ export function pickOption(
   const upto = onChain.filter(a => isUptoPayable(a));
   const payable = [...exact, ...upto];
   if (payable.length === 0) {
-    const schemes = Array.from(new Set(accepts.map(a => a.scheme))).join(', ') || 'none';
+    const schemes = Array.from(new Set(accepts.map(a => String(a.scheme).slice(0, 40)))).slice(0, 10).join(', ') || 'none';
     const reason = accepts.some(a => a.scheme === 'upto')
       ? 'This endpoint offers the x402 "upto" scheme without an extra.facilitatorAddress (or without an asset), so the ' +
         'Permit2 authorization cannot be bound to a facilitator. AgentWallet will not approximate it with an upfront transfer. ' +

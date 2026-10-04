@@ -33,6 +33,7 @@ import {
   resolveNetworkChainId,
   normalizeRawAmount,
   parseAutopayAssets,
+  assetSupportsExact,
 } from './x402-payment.js';
 import { createHash } from 'node:crypto';
 import {
@@ -49,7 +50,7 @@ import {
 import { localSignAuthorization, localEthCall, localGetCode, localSignPermit2Upto } from './local-wallet.js';
 import { WRAPPED_NATIVE } from './wrapped-native.js';
 import {
-  buildUptoAuthorization, uptoPayload, permit2AllowanceCalldata, permit2ApproveCalldata, decodeUint, PERMIT2_ADDRESS,
+  buildUptoAuthorization, uptoPayload, permit2AllowanceCalldata, permit2ApproveCalldata, decodeUint, permit2Address,
   type UptoPermit2Authorization,
 } from './x402-permit2.js';
 import { assessTokenRisk } from './token-risk.js';
@@ -58,6 +59,7 @@ import {
   parsePaymentRequired, parseSettlement, pickOption, knownTokenDomain,
   parseEip7702Delegation, erc1271ProbeCalldata, classifyErc1271Probe,
   type X402Requirement, type Eip3009Authorization, type Erc1271Support,
+  settlementVerdict, legacyReceiptAllowed,
 } from './x402-eip3009.js';
 import {
   isSolanaLocalMode,
@@ -331,7 +333,7 @@ async function api(path: string, method = 'GET', body?: Record<string, unknown>,
   // redirect is refused instead of followed, so a request body is never
   // replayed to another origin and another origin's answer is never returned
   // as the API's (2026-10-04 audit).
-  const options: RequestInit = { method, headers, redirect: 'manual' };
+  const options: RequestInit = { method, headers, redirect: 'manual', signal: AbortSignal.timeout(API_TIMEOUT_MS) };
   if (body && method !== 'GET') {
     options.body = JSON.stringify(body);
   }
@@ -557,7 +559,8 @@ function isValidAddress(address: string): boolean {
 // ─── Guard helpers ──────────────────────────────────────────────
 
 /** Request headers the caller may not set on pay_x402: Host would rename the TLS peer, the rest belong to the client. */
-const FORBIDDEN_REQUEST_HEADERS = new Set(['host', 'content-length', 'transfer-encoding', 'connection', 'upgrade', 'expect', 'te', 'trailer', 'keep-alive']);
+const FORBIDDEN_REQUEST_HEADERS = new Set(['host', 'content-length', 'transfer-encoding', 'connection', 'upgrade', 'expect', 'te', 'trailer', 'keep-alive',
+  'x-payment', 'payment-signature', 'x-payment-response', 'payment-response']); // the payment headers are the tool's own to set
 
 /** Authorizations signed in this process, keyed by endpoint and requirement, kept until they expire. */
 const signingInFlight = new Map<string, Promise<void>>();
@@ -584,6 +587,7 @@ function redactUrl(u: string): string {
   } catch { return u; }
 }
 const API_MAX_RESPONSE_CHARS = 8 * 1024 * 1024;
+const API_TIMEOUT_MS = 60_000; // a hosted hop that hangs must not hold a signing gate open
 /* Error text from the local signing path with every URL reduced to its origin
    and viem's "URL:" / "Request body:" lines dropped: an RPC endpoint carries
    its API key in the path or query, and a tool result is the agent's context
@@ -592,7 +596,7 @@ function redactRpcSecrets(err: unknown): string {
   const e = err as { shortMessage?: string; details?: string; message?: string };
   let msg = e?.shortMessage ? [e.shortMessage, e.details].filter(Boolean).join(' ') : String(e?.message ?? err);
   msg = msg.split(/\r?\n/).filter(l => !/^\s*(URL|Request body|Request Arguments|Raw Call Arguments)\s*:/i.test(l)).join('\n').trim();
-  return msg.replace(/[a-z][a-z0-9+.-]*:\/\/[^\s"'<>)\]]+/gi, (u) => redactUrl(u));
+  return msg.replace(/[a-z][a-z0-9+.-]*:\/\/[^\s"'<>)]+/gi, (u) => redactUrl(u)); // brackets stay in: IPv6 hosts
 }
 
 /**
@@ -665,7 +669,7 @@ function formatUnits(raw: string, decimals: number): string {
   const frac = padded.slice(padded.length - decimals);
   // Trim trailing zeros but keep at least one decimal
   const trimmed = frac.replace(/0+$/, '') || '0';
-  return `${whole}.${trimmed}`;
+  return decimals === 0 ? whole : `${whole}.${trimmed}`; // a 0-decimal amount has no fraction, so it round-trips through parseUnits
 }
 
 /**
@@ -721,7 +725,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.13.5',
+    version: '1.13.6',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()
@@ -1165,7 +1169,7 @@ server.tool(
     // Asset risk rides along with the approval (issue #13). It never blocks; it is the
     // caller's call. Skipped for Permit2, which only moves what a signature allows.
     let risk: unknown = null;
-    if (spender.toLowerCase() !== PERMIT2_ADDRESS.toLowerCase() && process.env.AGENTWALLET_TOKEN_RISK !== '0') {
+    if (spender.toLowerCase() !== permit2Address(chain_id).toLowerCase() && process.env.AGENTWALLET_TOKEN_RISK !== '0') {
       try { risk = await assessTokenRisk(chain_id, token, (to, data) => ethCallHex(chain_id, to, data)); } catch { risk = null; }
     }
 
@@ -1430,9 +1434,16 @@ async function ethCallHex(chainId: number, to: string, data: string): Promise<st
  * rather than guess.
  */
 async function resolveTokenDomain(chainId: number, asset: string, extra?: X402Requirement['extra']): Promise<{ name: string; version: string }> {
-  if (extra?.name && extra?.version) return { name: String(extra.name), version: String(extra.version) };
   const known = knownTokenDomain(chainId, asset);
-  if (known) return known;
+  const declared = (typeof extra?.name === 'string' && typeof extra?.version === 'string') ? { name: extra.name, version: extra.version } : null;
+  if (known) {
+    // A registry token's domain is known; a 402 declaring a different one would only yield a signature the token rejects.
+    if (declared && (declared.name !== known.name || declared.version !== known.version)) {
+      throw new Error(`x402: the endpoint declared EIP-712 domain "${serverText(declared.name)}"/"${serverText(declared.version)}" for ${asset} on chain ${chainId}, but that token's domain is "${known.name}"/"${known.version}"; refusing to sign under a domain the token would reject.`);
+    }
+    return known;
+  }
+  if (declared) return declared;
   let name = '', version = '';
   try {
     name = decodeAbiString(await ethCallHex(chainId, asset, '0x06fdde03'));    // name()
@@ -1473,7 +1484,7 @@ async function signAuthorization(
 /** Sign a Permit2 upto authorization with whichever custody mode is active. */
 async function signPermit2(walletId: number, chainId: number, auth: UptoPermit2Authorization, approvalId?: string | null): Promise<string> {
   const r = (await api(`/wallets/${walletId}/x402/permit2`, 'POST', {
-    chain_id: chainId, asset: auth.permitted.token, amount: auth.permitted.amount, spender: auth.spender, permit2: PERMIT2_ADDRESS,
+    chain_id: chainId, asset: auth.permitted.token, amount: auth.permitted.amount, spender: auth.spender, permit2: permit2Address(chainId),
     nonce: auth.nonce, deadline: auth.deadline, to: auth.witness.to, facilitator: auth.witness.facilitator, valid_after: auth.witness.validAfter,
     ...(approvalId ? { approval_id: approvalId } : {}),
   }, { 'X-AGW-SKIP-X402': 'true' })) as { signature?: string; error?: string };
@@ -1606,7 +1617,8 @@ server.tool(
         payment_required: true,
         payment_made: false,
         error: picked.reason,
-        offered: accepts.map(a => ({ scheme: a.scheme, network: a.network, amount: requiredAmount(a), asset: a.asset ?? a.extra?.token ?? null })),
+        offered: accepts.slice(0, 10).map(a => ({ scheme: serverText(a.scheme), network: serverText(a.network), amount: serverText(requiredAmount(a)), asset: serverText(a.asset ?? a.extra?.token ?? null) })),
+        server_text_is_untrusted: true,
       });
     }
     const option = picked.option;
@@ -1638,6 +1650,21 @@ server.tool(
       });
     }
 
+    // Step 3c: The tx-hash receipt flow (an on-chain transfer, final the moment
+    // it is broadcast) is only for AgentWallet's own paywalls: the API host or
+    // the origins in AGENTWALLET_LEGACY_PAYWALL_ORIGINS. Any other host sending
+    // the legacy shape gets the standard flow (2026-10-04 round 2). And an
+    // "exact" requirement in a token with no EIP-3009 can never settle, so it
+    // is refused before an approval could be consumed for it.
+    const legacyReceipt = isLegacyAgentWalletAccept(option) && legacyReceiptAllowed(servedFrom, API_BASE, process.env.AGENTWALLET_LEGACY_PAYWALL_ORIGINS);
+    if (!isUpto && !isSolanaChain(chainId) && tokenAddress && !legacyReceipt && !assetSupportsExact(chainId, tokenAddress)) {
+      return jsonResponse({
+        status: 402, payment_required: true, payment_made: false,
+        required_amount: amount, token: tokenLabel, token_address: tokenAddress, network: option.network, chain_id: chainId, pay_to: option.payTo,
+        error: `${tokenLabel} on chain ${chainId} does not implement EIP-3009, so an "exact" x402 payment in it cannot settle; nothing was signed. The endpoint would need an "upto" option or a USDC requirement.`,
+      });
+    }
+
     // Step 4: Hard per-payment cap, ALWAYS applied. If the caller omits max_payment
     // we fall back to AGENTWALLET_MAX_AUTOPAY (default "1"). Above the cap a hosted
     // wallet can ask its owner instead of refusing: an approval is created, the
@@ -1652,7 +1679,7 @@ server.tool(
         status: 402, payment_required: true, payment_made: false,
         required_amount: amount, max_allowed: effectiveMax, cap_source: capSource, token: tokenLabel,
         ...(clamped ? { max_payment_ignored: `max_payment ${max_payment} exceeds the operator ceiling AGENTWALLET_MAX_AUTOPAY=${effectiveMax}; only the operator can raise it.` } : {}),
-        network: option.network, chain_id: chainId, pay_to: option.payTo, description: option.description,
+        network: option.network, chain_id: chainId, pay_to: option.payTo, description: serverText(option.description), server_text_is_untrusted: true,
       };
       const wantApproval = request_approval ?? (process.env.AGENTWALLET_APPROVALS !== '0');
       if (approval_id) {
@@ -1695,7 +1722,7 @@ server.tool(
     // usage; the payer broadcasts nothing and pays no gas for either. AgentWallet's
     // own paywalls (verified by receipt), native-asset requests and Solana still use
     // a broadcast transfer proved by hash.
-    const standardExact = !isUpto && !isSolanaChain(chainId) && Boolean(tokenAddress) && !isLegacyAgentWalletAccept(option);
+    const standardExact = !isUpto && !isSolanaChain(chainId) && Boolean(tokenAddress) && !legacyReceipt;
     let headerName = 'X-PAYMENT';
     let paymentHeader = '';
     let txHash: string | null = null;
@@ -1721,76 +1748,82 @@ server.tool(
     let releaseSigning: () => void = () => {};
     if (!(cachedAuth && cachedAuth.until > Date.now())) {
       const mine = new Promise<void>(r => { releaseSigning = r; });
-      // Released when the signature is cached, or after 30 s if this call throws first, so a failure never wedges the key.
-      signingInFlight.set(cacheKey, Promise.race([mine, new Promise<void>(r => setTimeout(r, 30_000).unref())]));
+      // Released in the finally below, whatever path this call takes. A timer
+      // used to stand in for that and opened the gate under a slow signer, so
+      // a second call signed a second nonce (2026-10-04 round 2); every
+      // network hop inside the gate carries its own timeout instead.
+      signingInFlight.set(cacheKey, mine);
     }
 
-    if (cachedAuth && cachedAuth.until > Date.now()) {
-      // Same endpoint, same requirement, still inside the window: re-send the
-      // earlier signature. Its nonce is single-use, so a server that already
-      // settled it cannot settle it again, and one that never did now can.
-      ({ headerName, paymentHeader, txHash, authorization, uptoAuth, payer } = cachedAuth);
-      authorizationReused = true;
-    } else if (isUpto) {
-      payer = await payerAddress(wallet_id);
-      payerDelegationInfo = await payerDelegation(chainId, payer);
-      const allowance = decodeUint(await ethCallHex(chainId, tokenAddress, permit2AllowanceCalldata(payer)));
-      if (allowance < BigInt(rawAmount)) {
-        if (process.env.AGENTWALLET_PERMIT2_AUTO_APPROVE === '1' && assetPolicy.via === 'stablecoin') {
-          // Approve exactly this payment's maximum, never unlimited (2026-10-04 audit).
-          const r = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: tokenAddress, value: '0', data: permit2ApproveCalldata(rawAmount), chain_id: chainId }, skip)) as { tx_hash?: string };
-          permit2ApprovalTx = String(r?.tx_hash || '');
-          await new Promise(res => setTimeout(res, 4000));
-        } else {
-          return jsonResponse({
-            status: 402, payment_required: true, payment_made: false, permit2_approval_needed: true,
-            token: tokenLabel, token_address: tokenAddress, chain_id: chainId, payer, permit2: PERMIT2_ADDRESS,
-            error: `This endpoint uses the x402 "upto" scheme, which settles through Permit2. Wallet ${payer} has not approved ` +
-              `${tokenLabel} to Permit2 on chain ${chainId}. Call approve_permit2 once for this token (a normal transaction that needs gas), ` +
-              `or set AGENTWALLET_PERMIT2_AUTO_APPROVE=1, then call pay_x402 again.`,
-          });
+    try {
+      if (cachedAuth && cachedAuth.until > Date.now()) {
+        // Same endpoint, same requirement, still inside the window: re-send the
+        // earlier signature. Its nonce is single-use, so a server that already
+        // settled it cannot settle it again, and one that never did now can.
+        ({ headerName, paymentHeader, txHash, authorization, uptoAuth, payer } = cachedAuth);
+        authorizationReused = true;
+      } else if (isUpto) {
+        payer = await payerAddress(wallet_id);
+        payerDelegationInfo = await payerDelegation(chainId, payer);
+        const allowance = decodeUint(await ethCallHex(chainId, tokenAddress, permit2AllowanceCalldata(payer, chainId)));
+        if (allowance < BigInt(rawAmount)) {
+          if (process.env.AGENTWALLET_PERMIT2_AUTO_APPROVE === '1' && assetPolicy.via === 'stablecoin') {
+            // Approve exactly this payment's maximum, never unlimited (2026-10-04 audit).
+            const r = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: tokenAddress, value: '0', data: permit2ApproveCalldata(rawAmount, chainId), chain_id: chainId }, skip)) as { tx_hash?: string };
+            permit2ApprovalTx = String(r?.tx_hash || '');
+            await new Promise(res => setTimeout(res, 4000));
+          } else {
+            return jsonResponse({
+              status: 402, payment_required: true, payment_made: false, permit2_approval_needed: true,
+              token: tokenLabel, token_address: tokenAddress, chain_id: chainId, payer, permit2: permit2Address(chainId),
+              error: `This endpoint uses the x402 "upto" scheme, which settles through Permit2. Wallet ${payer} has not approved ` +
+                `${tokenLabel} to Permit2 on chain ${chainId}. Call approve_permit2 once for this token (a normal transaction that needs gas), ` +
+                `or set AGENTWALLET_PERMIT2_AUTO_APPROVE=1, then call pay_x402 again.`,
+            });
+          }
         }
-      }
-      uptoAuth = buildUptoAuthorization(payer, option);
-      const signature = await signPermit2(wallet_id, chainId, uptoAuth, approvalUsed);
-      const payload = buildPaymentPayloadRaw(x402Version, option, uptoPayload(uptoAuth, signature), paymentInfo.resource, paymentInfo.extensions);
-      const h = paymentHeaderFor(x402Version, payload);
-      headerName = h.name;
-      paymentHeader = h.value;
-    } else if (standardExact) {
-      payer = await payerAddress(wallet_id);
-      payerDelegationInfo = await payerDelegation(chainId, payer);
-      const domain = await resolveTokenDomain(chainId, tokenAddress, option.extra);
-      authorization = buildAuthorization(payer, option);
-      const signature = await signAuthorization(wallet_id, chainId, tokenAddress, domain, authorization, approvalUsed);
-      const payload = buildPaymentPayload(x402Version, option, authorization, signature, paymentInfo.resource, paymentInfo.extensions);
-      const h = paymentHeaderFor(x402Version, payload);
-      headerName = h.name;
-      paymentHeader = h.value;
-    } else {
-      let txResult: Record<string, unknown>;
-      if (isSolanaChain(chainId)) {
-        txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', tokenAddress
-          ? { to: option.payTo, value: rawAmount, token_mint: tokenAddress, token_decimals: trustedDecimals, chain_id: chainId }
-          : { to: option.payTo, value: rawAmount, chain_id: chainId })) as Record<string, unknown>;
-      } else if (tokenAddress) {
-        const calldata = '0xa9059cbb' + padAddress(option.payTo) + encodeUint256(rawAmount);
-        txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: tokenAddress, value: '0', data: calldata, chain_id: chainId })) as Record<string, unknown>;
+        uptoAuth = buildUptoAuthorization(payer, option);
+        const signature = await signPermit2(wallet_id, chainId, uptoAuth, approvalUsed);
+        const payload = buildPaymentPayloadRaw(x402Version, option, uptoPayload(uptoAuth, signature), paymentInfo.resource, paymentInfo.extensions);
+        const h = paymentHeaderFor(x402Version, payload);
+        headerName = h.name;
+        paymentHeader = h.value;
+      } else if (standardExact) {
+        payer = await payerAddress(wallet_id);
+        payerDelegationInfo = await payerDelegation(chainId, payer);
+        const domain = await resolveTokenDomain(chainId, tokenAddress, option.extra);
+        authorization = buildAuthorization(payer, option);
+        const signature = await signAuthorization(wallet_id, chainId, tokenAddress, domain, authorization, approvalUsed);
+        const payload = buildPaymentPayload(x402Version, option, authorization, signature, paymentInfo.resource, paymentInfo.extensions);
+        const h = paymentHeaderFor(x402Version, payload);
+        headerName = h.name;
+        paymentHeader = h.value;
       } else {
-        txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: option.payTo, value: rawAmount, data: '', chain_id: chainId })) as Record<string, unknown>;
+        let txResult: Record<string, unknown>;
+        if (isSolanaChain(chainId)) {
+          txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', tokenAddress
+            ? { to: option.payTo, value: rawAmount, token_mint: tokenAddress, token_decimals: trustedDecimals, chain_id: chainId }
+            : { to: option.payTo, value: rawAmount, chain_id: chainId })) as Record<string, unknown>;
+        } else if (tokenAddress) {
+          const calldata = '0xa9059cbb' + padAddress(option.payTo) + encodeUint256(rawAmount);
+          txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: tokenAddress, value: '0', data: calldata, chain_id: chainId })) as Record<string, unknown>;
+        } else {
+          txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: option.payTo, value: rawAmount, data: '', chain_id: chainId })) as Record<string, unknown>;
+        }
+        txHash = String(txResult.tx_hash || txResult.signature || '');
+        if (!txHash) throw new Error('x402: the payment transaction returned no hash.');
+        paymentHeader = Buffer.from(JSON.stringify({ x402Version, scheme: option.scheme, network: option.network, payload: { txHash } })).toString('base64');
       }
-      txHash = String(txResult.tx_hash || txResult.signature || '');
-      if (!txHash) throw new Error('x402: the payment transaction returned no hash.');
-      paymentHeader = Buffer.from(JSON.stringify({ x402Version, scheme: option.scheme, network: option.network, payload: { txHash } })).toString('base64');
+      if (!authorizationReused) {
+        const until = authorization ? Number(authorization.validBefore) * 1000
+          : uptoAuth ? Number(uptoAuth.deadline) * 1000
+          : Date.now() + maxAuthWindowSeconds() * 1000; // a broadcast transfer: the hash stays valid, re-sending it never pays twice
+        signedPayments.set(cacheKey, { headerName, paymentHeader, txHash, authorization, uptoAuth, payer, until });
+      }
+    } finally {
+      releaseSigning();
+      signingInFlight.delete(cacheKey);
     }
-    if (!authorizationReused) {
-      const until = authorization ? Number(authorization.validBefore) * 1000
-        : uptoAuth ? Number(uptoAuth.deadline) * 1000
-        : Date.now() + maxAuthWindowSeconds() * 1000; // a broadcast transfer: the hash stays valid, re-sending it never pays twice
-      signedPayments.set(cacheKey, { headerName, paymentHeader, txHash, authorization, uptoAuth, payer, until });
-    }
-    releaseSigning();
-    signingInFlight.delete(cacheKey);
 
     // Step 6: Retry with the payment header and read the settlement receipt.
     const retryHeaders = { ...reqHeaders, [headerName]: paymentHeader };
@@ -1803,7 +1836,18 @@ server.tool(
       retryOptions.body = reqBody;
     }
 
-    const retryRes = await safeFetch(url, retryOptions);
+    let retryRes: Response;
+    try {
+      retryRes = await safeFetch(url, retryOptions);
+    } catch (e) {
+      // The authorization has already been handed over; say so instead of a bare transport error.
+      return jsonResponse({
+        status: 0, payment_required: true, payment_made: null, payment_outcome: 'unknown',
+        error: `The paid request could not be completed: ${(e as Error).message}. The authorization was already sent; it stays cached, and calling pay_x402 again with the same URL inside its window re-sends the same one rather than signing a new one.`,
+        authorization: authorization ? { nonce: authorization.nonce, valid_before: authorization.validBefore } : (uptoAuth ? { scheme: 'upto', nonce: uptoAuth.nonce, deadline: uptoAuth.deadline } : null),
+        tx_hash: txHash ?? null, amount, token: tokenLabel, pay_to: option.payTo, chain_id: chainId,
+      });
+    }
     const retryText = await retryRes.text();
     let retryParsed: unknown;
     try { retryParsed = JSON.parse(retryText); } catch { retryParsed = retryText; }
@@ -1813,6 +1857,7 @@ server.tool(
     let retryError: string | null = null;
     const retryServedFrom = finalUrlOf(retryRes, url);
     const retryCrossOrigin = new URL(retryServedFrom).origin !== new URL(url).origin;
+    const verdict = settlementVerdict(retryRes.status, settlement, retryCrossOrigin);
     if (retryCrossOrigin) {
       retryError = `The paid request was redirected to another origin (${new URL(retryServedFrom).origin}); the payment header is never forwarded across origins, so this response did not see the payment.`;
     }
@@ -1825,10 +1870,11 @@ server.tool(
     return jsonResponse({
       status: retryRes.status,
       payment_required: true,
-      // Paid means the endpoint accepted the payment: a settlement receipt, or a success status after the payment header.
-      // A 4xx other than 402 (bad body, auth) means the request failed for another reason; the authorization was
-      // sent but the facilitator normally does not settle a failed request, so it is not reported as paid.
-      payment_made: !retryCrossOrigin && (Boolean(settlement?.success) || (retryRes.status >= 200 && retryRes.status < 300)),
+      // Paid means a success status after the payment header and no server-reported settlement failure. A 402 or
+      // any other non-2xx is not paid whatever the settlement header claims (a server could send success:true on a
+      // 402 and mislead the agent, 2026-10-04 round 2); the facilitator does not settle a failed request.
+      payment_made: verdict.payment_made,
+      payment_outcome: verdict.outcome,
       authorization_reused: authorizationReused,
       retry_error: retryError,
       payment_method: isUpto ? 'permit2-upto-authorization' : (standardExact ? 'eip3009-authorization' : 'onchain-transfer'),
@@ -1843,9 +1889,10 @@ server.tool(
       pay_to: option.payTo,
       payer,
       payer_delegation: payerDelegationInfo,
-      // txHash is ours (we broadcast it); settlement.transaction is the server's
-      // claim and is surfaced only when it is shaped like a real hash.
-      tx_hash: txHash ?? (looksLikeTxHash(settlement?.transaction) ? settlement?.transaction : null) ?? null,
+      // tx_hash is only ever ours (we broadcast it). The server's claimed hash
+      // is kept apart and unverified: it is not evidence the payment settled.
+      tx_hash: txHash ?? null,
+      server_claimed_tx_hash: looksLikeTxHash(settlement?.transaction) ? settlement?.transaction : null,
       settlement_reported_by_server: settlement,
       authorization: authorization ? { nonce: authorization.nonce, valid_before: authorization.validBefore }
         : (uptoAuth ? { scheme: 'upto', max_amount: amount, nonce: uptoAuth.nonce, deadline: uptoAuth.deadline, facilitator: uptoAuth.witness.facilitator } : null),
@@ -1882,13 +1929,13 @@ server.tool(
   },
   async ({ wallet_id, token, chain_id, amount }) => {
     if (isSolanaChain(chain_id)) throw new Error('Permit2 is an EVM contract; there is nothing to approve on Solana.');
-    let data: string = permit2ApproveCalldata();
+    let data: string = permit2ApproveCalldata(undefined, chain_id);
     if (amount !== undefined) {
       const raw = parseUnits(amount, await resolveTrustedDecimals(chain_id, token));
-      data = '0x095ea7b3' + padAddress(PERMIT2_ADDRESS) + encodeUint256(raw);
+      data = permit2ApproveCalldata(raw, chain_id);
     }
     const result = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: token, value: '0', data, chain_id })) as Record<string, unknown>;
-    return jsonResponse({ ...result, token, spender: PERMIT2_ADDRESS, amount: amount ?? 'unlimited', note: 'Permit2 only transfers what a signed authorization allows; the allowance itself moves nothing.' });
+    return jsonResponse({ ...result, token, spender: permit2Address(chain_id), amount: amount ?? 'unlimited', note: 'Permit2 only transfers what a signed authorization allows; the allowance itself moves nothing.' });
   },
 );
 

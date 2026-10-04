@@ -12,6 +12,9 @@ import type { X402Requirement } from './x402-eip3009.js';
 import { maxAuthWindowSeconds } from './x402-payment.js';
 
 export const PERMIT2_ADDRESS = '0x000000000022D473030F116dDEE9F6B43aC78BA3' as const;
+/** Chains whose Permit2 is not at the canonical address (zkSync Era runs its own deployment). */
+const PERMIT2_BY_CHAIN: Record<number, `0x${string}`> = { 324: '0x0000000000225e31D15943971F47aD3022F714Fa' };
+export function permit2Address(chainId: number): `0x${string}` { return PERMIT2_BY_CHAIN[chainId] ?? PERMIT2_ADDRESS; }
 export const X402_UPTO_PERMIT2_PROXY = '0x4020A4f3b7b90ccA423B9fabCc0CE57C6C240002' as const;
 
 /** EIP-712 types. Referenced types must follow the primary type in alphabetical order (TokenPermissions, Witness). */
@@ -83,7 +86,7 @@ export function buildUptoAuthorization(
 
 export function uptoTypedData(chainId: number, auth: UptoPermit2Authorization) {
   return {
-    domain: { name: 'Permit2', chainId, verifyingContract: PERMIT2_ADDRESS },
+    domain: { name: 'Permit2', chainId, verifyingContract: permit2Address(chainId) },
     types: UPTO_PERMIT2_WITNESS_TYPES,
     primaryType: 'PermitWitnessTransferFrom' as const,
     message: {
@@ -104,14 +107,15 @@ export function uptoPayload(auth: UptoPermit2Authorization, signature: string): 
 function pad(addr: string): string { return addr.replace(/^0x/, '').toLowerCase().padStart(64, '0'); }
 
 /** allowance(owner, Permit2) calldata. */
-export function permit2AllowanceCalldata(owner: string): `0x${string}` {
-  return ('0xdd62ed3e' + pad(owner) + pad(PERMIT2_ADDRESS)) as `0x${string}`;
+export function permit2AllowanceCalldata(owner: string, chainId = 8453): `0x${string}` {
+  return ('0xdd62ed3e' + pad(owner) + pad(permit2Address(chainId))) as `0x${string}`;
 }
 
 /** approve(Permit2, amount) calldata; unlimited only when no amount is given. */
-export function permit2ApproveCalldata(amountRaw?: string): `0x${string}` {
+export function permit2ApproveCalldata(amountRaw?: string, chainId = 8453): `0x${string}` {
+  if (amountRaw !== undefined && (!/^\d+$/.test(amountRaw) || BigInt(amountRaw) > (1n << 256n) - 1n)) throw new Error(`Permit2 approval amount "${amountRaw}" is not a uint256.`);
   const word = amountRaw === undefined ? 'f'.repeat(64) : BigInt(amountRaw).toString(16).padStart(64, '0');
-  return ('0x095ea7b3' + pad(PERMIT2_ADDRESS) + word) as `0x${string}`;
+  return ('0x095ea7b3' + pad(permit2Address(chainId)) + word) as `0x${string}`;
 }
 
 export function decodeUint(hex: string): bigint {
