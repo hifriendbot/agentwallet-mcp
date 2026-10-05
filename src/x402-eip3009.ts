@@ -233,8 +233,14 @@ export function withPaymentIdentifier(extensions?: Record<string, unknown>, id?:
   return out;
 }
 
+/** Hard ceiling on the encoded payment header; pay_x402 refuses before signing well below it. */
+export const MAX_PAYMENT_HEADER_BYTES = 64 * 1024;
+
 export function paymentHeaderFor(x402Version: number, payload: Record<string, unknown>): { name: string; value: string } {
   const value = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');
+  if (value.length > MAX_PAYMENT_HEADER_BYTES) {
+    throw new Error(`x402: the payment header would be ${value.length} bytes; the server's requirement is too large to echo and the payment cannot be delivered.`);
+  }
   return { name: x402Version >= 2 ? 'PAYMENT-SIGNATURE' : 'X-PAYMENT', value };
 }
 

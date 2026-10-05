@@ -702,9 +702,15 @@ const signingInFlight = new Map<string, Promise<void>>();
 const signedPayments = new Map<string, {
   headerName: string; paymentHeader: string; txHash: string | null;
   authorization: Eip3009Authorization | null; uptoAuth: UptoPermit2Authorization | null; payer: string | null; until: number;
-  resource: string; // wallet|chain|resource|method|body: one live authorization per resource unless fresh_authorization (round 3)
-  amount: string; signedAt: number;
+  resource: string; // wallet|resource|method|body: one live authorization per resource, on any chain, unless fresh_authorization (rounds 3 and 8)
+  amount: string; signedAt: number; chainId: number;
 }>();
+/** The requirement and extensions a v2 server sends are echoed inside the payment header; nothing larger than this is signed. */
+const MAX_PAYMENT_ECHO_BYTES = 32 * 1024;
+/** A tools/call the client cancelled must not go on to sign: the SDK drops the result but leaves the handler running. */
+function assertNotCancelled(signal: AbortSignal | undefined, stage: string): void {
+  if (signal?.aborted) throw new Error(`pay_x402 was cancelled by the client before ${stage}; nothing more was signed or sent.`);
+}
 
 function looksLikeTxHash(v: unknown): v is string {
   return typeof v === 'string' && (/^0x[0-9a-fA-F]{64}$/.test(v) || /^[1-9A-HJ-NP-Za-km-z]{86,88}$/.test(v));
@@ -1750,7 +1756,8 @@ tool(
         'within the validity window re-sends the earlier signature (same nonce, so it cannot settle twice) instead of paying again.',
     ),
   },
-  async ({ url, wallet_id, method, headers: headersJson, body: reqBody, max_payment, prefer_chain, request_approval, approval_id, fresh_authorization }) => {
+  async ({ url, wallet_id, method, headers: headersJson, body: reqBody, max_payment, prefer_chain, request_approval, approval_id, fresh_authorization }, extra) => {
+    const cancel = (extra as { signal?: AbortSignal } | undefined)?.signal;
     if (max_payment !== undefined && !/^\d+(\.\d+)?$/.test(String(max_payment).trim())) {
       throw new Error(`max_payment must be a decimal number of stablecoin units, got "${serverText(max_payment)}"; nothing was fetched.`);
     }
@@ -1897,7 +1904,9 @@ tool(
     const METHOD = (method || 'GET').toUpperCase();
     const bodyDigest = createHash('sha256').update(METHOD !== 'GET' && reqBody ? reqBody : '').digest('hex').slice(0, 16);
     const walletKey = anyLocalMode() ? 'local' : String(wallet_id); // the local signer has one key whatever wallet_id says
-    const resourceTag = [walletKey, chainId, authorizationResource(url), METHOD, bodyDigest].join('|');
+    // The chain is not part of the tag: a paywall rotating the chain per answer used
+    // to harvest one cap-sized nonce per chain for a single purchase (round 8).
+    const resourceTag = [walletKey, authorizationResource(url), METHOD, bodyDigest].join('|');
     const cacheKey = [walletKey, chainId, tokenAddress.toLowerCase(), option.payTo.toLowerCase(), rawAmount, option.scheme, resourceTag].join('|');
     for (const [k, v] of signedPayments) if (v.until <= Date.now()) signedPayments.delete(k);
     const alreadySigned = !fresh_authorization && (signedPayments.get(cacheKey)?.until ?? 0) > Date.now();
@@ -1962,6 +1971,17 @@ tool(
     // usage; the payer broadcasts nothing and pays no gas for either. AgentWallet's
     // own paywalls (verified by receipt), native-asset requests and Solana still use
     // a broadcast transfer proved by hash.
+    // What the paid retry echoes back is bounded before anything is signed: a few MB
+    // of junk in outputSchema or extensions used to become a 5 MB header kept in the
+    // cache for the authorization's lifetime (round 8).
+    const echoBytes = Buffer.byteLength(JSON.stringify({ accepted: option, resource: paymentInfo.resource, extensions: paymentInfo.extensions }));
+    if (echoBytes > MAX_PAYMENT_ECHO_BYTES) {
+      return jsonResponse({
+        status: 402, payment_required: true, payment_made: false,
+        error: `The endpoint's payment requirement is ${echoBytes} bytes once echoed into the payment header; nothing above ${MAX_PAYMENT_ECHO_BYTES} bytes is signed (no HTTP server accepts a header that size, so the payment could never be delivered).`,
+        requested_amount: amount, token: tokenLabel, pay_to: option.payTo, chain_id: chainId,
+      });
+    }
     const standardExact = !isUpto && willSign;
     let headerName = 'X-PAYMENT';
     let paymentHeader = '';
@@ -2000,8 +2020,8 @@ tool(
         const [, live] = other;
         return jsonResponse({
           status: 402, payment_required: true, payment_made: false,
-          error: `This resource already holds a live authorization signed ${Math.round((Date.now() - live.signedAt) / 1000)} s ago for ${live.amount} ${tokenLabel} (the endpoint's requirement changed between answers: amount, recipient, asset or scheme). It is re-sent by calling pay_x402 again with the same arguments once the endpoint asks for the same requirement. Nothing more is signed for this resource until that authorization expires.`,
-          live_authorization: { amount: live.amount, valid_until: new Date(live.until).toISOString(), payer: live.payer },
+          error: `This resource already holds a live authorization signed ${Math.round((Date.now() - live.signedAt) / 1000)} s ago for ${live.amount} on chain ${live.chainId} (the endpoint's requirement changed between answers: amount, recipient, asset, scheme or chain). It is re-sent by calling pay_x402 again with the same arguments once the endpoint asks for the same requirement. Nothing more is signed for this resource until that authorization expires.`,
+          live_authorization: { amount: live.amount, chain_id: live.chainId, valid_until: new Date(live.until).toISOString(), payer: live.payer },
           requested_amount: amount, token: tokenLabel, pay_to: option.payTo, chain_id: chainId,
         });
       }
@@ -2009,6 +2029,7 @@ tool(
     let releaseSigning: () => void = () => {};
     let mineLock: Promise<void> | null = null;
     if (!(cachedAuth && cachedAuth.until > Date.now())) {
+      assertNotCancelled(cancel, 'signing');
       const mine = new Promise<void>(r => { releaseSigning = r; });
       // Released in the finally below, whatever path this call takes. A timer
       // used to stand in for that and opened the gate under a slow signer, so
@@ -2064,14 +2085,16 @@ tool(
       } else {
         let txResult: Record<string, unknown>;
         if (isSolanaChain(chainId)) {
+          // skip: a metered 402 from the API host on this send surfaces as the documented
+          // error instead of an auto-payment hidden inside the pay_x402 result (round 8).
           txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', tokenAddress
             ? { to: option.payTo, value: rawAmount, token_mint: tokenAddress, token_decimals: trustedDecimals, chain_id: chainId }
-            : { to: option.payTo, value: rawAmount, chain_id: chainId })) as Record<string, unknown>;
+            : { to: option.payTo, value: rawAmount, chain_id: chainId }, skip)) as Record<string, unknown>;
         } else if (tokenAddress) {
           const calldata = '0xa9059cbb' + padAddress(option.payTo) + encodeUint256(rawAmount);
-          txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: tokenAddress, value: '0', data: calldata, chain_id: chainId })) as Record<string, unknown>;
+          txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: tokenAddress, value: '0', data: calldata, chain_id: chainId }, skip)) as Record<string, unknown>;
         } else {
-          txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: option.payTo, value: rawAmount, data: '', chain_id: chainId })) as Record<string, unknown>;
+          txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: option.payTo, value: rawAmount, data: '', chain_id: chainId }, skip)) as Record<string, unknown>;
         }
         txHash = String(txResult.tx_hash || txResult.signature || '');
         if (!txHash) throw new Error('x402: the payment transaction returned no hash.');
@@ -2081,7 +2104,7 @@ tool(
         const until = authorization ? Number(authorization.validBefore) * 1000
           : uptoAuth ? Number(uptoAuth.deadline) * 1000
           : Date.now() + maxAuthWindowSeconds() * 1000; // a broadcast transfer: the hash stays valid, re-sending it never pays twice
-        signedPayments.set(cacheKey, { headerName, paymentHeader, txHash, authorization, uptoAuth, payer, until, resource: resourceTag, amount, signedAt: Date.now() });
+        signedPayments.set(cacheKey, { headerName, paymentHeader, txHash, authorization, uptoAuth, payer, until, resource: resourceTag, amount, signedAt: Date.now(), chainId });
         // A receipt on stderr the moment a signature exists, so a result the transport
         // drops (a client crash, an oversized frame) is still auditable (round 3).
         console.error(`[agentwallet] x402 authorization sent: ${amount} ${tokenLabel} to ${option.payTo} on chain ${chainId} for ${authorizationResource(url)} (${authorization ? 'nonce ' + authorization.nonce : uptoAuth ? 'permit2 nonce ' + uptoAuth.nonce : 'tx ' + txHash})`);
@@ -2093,11 +2116,14 @@ tool(
     }
 
     // Step 6: Retry with the payment header and read the settlement receipt.
+    // A cancellation here keeps the signed authorization cached for the next call
+    // (same nonce, so it cannot pay twice) and hands nothing to the endpoint now.
+    assertNotCancelled(cancel, 'the paid request');
     const retryHeaders = { ...reqHeaders, [headerName]: paymentHeader };
     const retryOptions: RequestInit = {
       method,
       headers: retryHeaders,
-      signal: AbortSignal.timeout(30_000),
+      signal: cancel ? AbortSignal.any([AbortSignal.timeout(30_000), cancel]) : AbortSignal.timeout(30_000),
     };
     if (reqBody && method !== 'GET') {
       retryOptions.body = reqBody;
