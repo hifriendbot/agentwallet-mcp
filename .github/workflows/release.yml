@@ -1,0 +1,48 @@
+# Publishes agentwallet-mcp to npm from CI with a provenance attestation.
+#
+# One-time setup on npmjs.com (package settings > Publishing access):
+#   Trusted publisher: GitHub Actions, organization hifriendbot,
+#   repository agentwallet-mcp, workflow release.yml. No token is stored
+#   anywhere; the job authenticates with the GitHub OIDC token.
+#   Then set "Require two-factor authentication and disallow tokens" so a
+#   leaked laptop token cannot publish outside this workflow.
+#
+# To release: bump package.json with `npm version <x.y.z> --no-git-tag-version`,
+# commit, then create a GitHub release whose tag is v<x.y.z>. The job checks
+# that the tag matches package.json before it publishes.
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - name: Use an npm that supports trusted publishing
+        run: npm install -g npm@latest
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - run: npm test
+      - name: Check the release tag matches package.json
+        if: github.event_name == 'release'
+        run: |
+          pkg="v$(node -p "require('./package.json').version")"
+          if [ "$pkg" != "${{ github.event.release.tag_name }}" ]; then
+            echo "package.json is $pkg but the release tag is ${{ github.event.release.tag_name }}"
+            exit 1
+          fi
+      - name: Publish with provenance
+        run: npm publish --provenance --access public

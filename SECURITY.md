@@ -77,3 +77,9 @@ We pay for real findings in USDC on Base, per the tiers published at https://hif
 ## Dependencies
 
 `npm audit` is run before every release. The SPL transfer path is hand-built to avoid `@solana/spl-token` and its `bigint-buffer` advisory. Remaining advisories, if any, are listed in the release notes with the reason they do not apply under stdio transport.
+
+## Supply chain
+
+- Releases are published by `.github/workflows/release.yml` with `npm publish --provenance`, so every version on the registry carries a Sigstore attestation that names the commit and workflow that built it. Check one with `npm audit signatures` after installing.
+- Nothing in this package runs an install script. The only dependency with one is `utf-8-validate`, an optional native helper for `ws`; the client works without it. Installing with `npm install --ignore-scripts --omit=optional agentwallet-mcp` is supported and is what a pinned deployment should do.
+- Pin the exact version in your MCP client configuration (`npx -y agentwallet-mcp@1.13.15`, not `@latest`) and review the SECURITY.md row for a version before moving to it.
