@@ -31,8 +31,8 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
           cache: npm
-      - name: Use an npm that supports trusted publishing
-        run: npm install -g npm@latest
+      - name: Use the npm the lock file was written with (11.5+ also supports trusted publishing)
+        run: npm install -g npm@11
       - run: npm ci --ignore-scripts
       - run: npm run build
       - run: npm test
