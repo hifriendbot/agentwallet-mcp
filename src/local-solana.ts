@@ -117,11 +117,22 @@ const DEFAULT_SOLANA_RPC: Record<number, string> = {
   902: 'https://api.testnet.solana.com',
 };
 
+/** A Solana RPC over plain http to anything but loopback exposes every query and lets an on-path host answer; refused like an EVM one (round 7). */
+function assertSolanaScheme(url: string, name: string): string {
+  let u: URL;
+  try { u = new URL(url); } catch { throw new Error(`${name} is not a URL: "${url}".`); }
+  const loopback = u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '[::1]';
+  if (u.protocol !== 'https:' && !(u.protocol === 'http:' && loopback)) {
+    throw new Error(`${name} must be https (got ${u.protocol}//${u.host}); plain http is allowed only for localhost.`);
+  }
+  return url;
+}
+
 export function resolveSolanaRpc(chainId = 900): string {
   const perChain = (process.env[`AGENTWALLET_SOLANA_RPC_${chainId}`] || '').trim();
-  if (perChain) return perChain;
+  if (perChain) return assertSolanaScheme(perChain, `AGENTWALLET_SOLANA_RPC_${chainId}`);
   const explicit = (process.env.AGENTWALLET_SOLANA_RPC || '').trim();
-  if (explicit) return explicit;
+  if (explicit) return assertSolanaScheme(explicit, 'AGENTWALLET_SOLANA_RPC');
   if (Object.keys(process.env).some(k => /^AGENTWALLET_SOLANA_RPC_\d+$/.test(k) && (process.env[k] || '').trim())) {
     throw new Error(`No Solana RPC for chain ${chainId}: AGENTWALLET_SOLANA_RPC_<chainId> is set for another cluster, so the public default is not used. Set AGENTWALLET_SOLANA_RPC_${chainId} or AGENTWALLET_SOLANA_RPC.`);
   }
