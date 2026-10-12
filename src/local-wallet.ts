@@ -39,6 +39,7 @@ import { lookupTrustedDecimals, maxAuthWindowSeconds } from './x402-payment.js';
 import { wrappedNativeAddress } from './wrapped-native.js';
 import { typedDataFor, type Eip3009Authorization } from './x402-eip3009.js';
 import { uptoTypedData, type UptoPermit2Authorization } from './x402-permit2.js';
+import { openKeyfile } from './keyfile.js';
 
 /* ── Key loading ─────────────────────────────────────────────────── */
 
@@ -60,7 +61,8 @@ function loadKeyMaterial(): string | null {
         const mode = statSync(file).mode & 0o777;
         if (mode & 0o077) console.error(`AgentWallet MCP: warning, AGENTWALLET_KEYFILE ${file} is readable by other users (mode ${mode.toString(8)}); chmod 600 it.`);
       }
-      return readFileSync(file, 'utf8').trim();
+      // An encrypted keyfile (see keyfile.ts) is opened with the configured passphrase; a plain one is used as is.
+      return openKeyfile(readFileSync(file, 'utf8').trim()).trim();
     } catch (e) {
       keyLoadError = `Could not read AGENTWALLET_KEYFILE at ${file}: ${(e as Error).message}`;
       return null;
@@ -658,6 +660,42 @@ export async function localSend(
     gas: gas.toString(),
     max_fee_per_gas: (maxFeePerGas ?? gasPrice ?? 0n).toString(),
     worst_case_fee: formatUnits(worst, 18),
+  };
+}
+
+/**
+ * Everything localSend checks and estimates, with nothing signed: the local
+ * guards, the node's gas estimate (which reverts when the call would), the
+ * worst-case fee against its cap, and the call's return data. A refusal is
+ * returned, not thrown, so the agent can read why before deciding.
+ */
+export async function localSimulate(chainId: number, to: Address, valueWei: bigint, data?: Hex): Promise<Record<string, unknown>> {
+  const guards: Record<string, string> = {};
+  const refuse = (stage: string, e: unknown) => ({ ok: false, stage, refusal: (e as Error).message.split('\n')[0].slice(0, 500), guards, chain_id: chainId, to, value: valueWei.toString(), signed: false, broadcast: false });
+  try { assertWithinNativeCap(valueWei); guards.native_cap = 'ok'; } catch (e) { return refuse('native_cap', e); }
+  if (data && data !== '0x') {
+    if (!/^0x([0-9a-fA-F]{2})*$/.test(data)) return refuse('calldata', new Error(`calldata is not even-length 0x hex (${data.length} chars)`));
+    try { await assertWithinTokenCap(chainId, to, data, valueWei); guards.token_cap = 'ok'; } catch (e) { return refuse('token_cap', e); }
+  }
+  try { await assertRpcServesChain(chainId); guards.rpc_chain = 'ok'; } catch (e) { return refuse('rpc', e); }
+  const { pub } = clients(chainId);
+  const account = getLocalAccount();
+  const base = { account, to, value: valueWei, ...(data && data !== '0x' ? { data } : {}) };
+  let gas: bigint;
+  try { gas = await pub.estimateGas(base); } catch (e) { return refuse('estimate_gas (the call would revert or the balance cannot cover it)', e); }
+  let returnData = '0x';
+  try { returnData = (await pub.call(base)).data ?? '0x'; } catch (e) { return refuse('eth_call', e); }
+  let perGas = 0n;
+  try { const est = await pub.estimateFeesPerGas(); perGas = est.maxFeePerGas; } catch { try { perGas = (await pub.estimateFeesPerGas({ type: 'legacy' })).gasPrice ?? 0n; } catch { perGas = 0n; } }
+  const worst = gas * perGas;
+  const feeCap = feeCapWei();
+  guards.fee_cap = worst > feeCap ? `would refuse: ${formatUnits(worst, 18)} > ${formatUnits(feeCap, 18)}` : 'ok';
+  const balance = await pub.getBalance({ address: account.address });
+  return {
+    ok: worst <= feeCap, chain_id: chainId, from: account.address, to, value: valueWei.toString(), signed: false, broadcast: false,
+    gas: gas.toString(), max_fee_per_gas: perGas.toString(), worst_case_fee: formatUnits(worst, 18), fee_cap: formatUnits(feeCap, 18),
+    native_balance: formatUnits(balance, 18), balance_covers_value_and_fee: balance >= valueWei + worst,
+    return_data: returnData.length > 2000 ? returnData.slice(0, 2000) + '…' : returnData, guards,
   };
 }
 

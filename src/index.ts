@@ -80,10 +80,105 @@ import {
   resolveSolanaRpc,
   mintDecimalsStrict,
 } from './local-solana.js';
+import { localSimulate } from './local-wallet.js';
+import {
+  loadPolicy, describePolicy, hostAllowed, recipientAllowed, targetAllowed, chainAllowed, assetAllowed, perHostRule, toolAllowed,
+  budgetReport, units as policyUnits, human as policyHuman, rawToUnits, type LoadedPolicy,
+} from './policy.js';
+import { Ledger, type ReserveInput, type Limits, type SpendMethod } from './ledger.js';
+import { discover } from './discovery.js';
+
+/* `agentwallet-mcp encrypt-keyfile <in> <out>` runs the keyfile tool instead of the server. */
+if (process.argv[2] === 'encrypt-keyfile') {
+  const { runEncryptKeyfile } = await import('./keyfile-cli.js');
+  await runEncryptKeyfile(process.argv.slice(3));
+  process.exit(process.exitCode ?? 0);
+}
 
 /** True when either chain family is running non-custodially. */
 function anyLocalMode(): boolean {
   return isLocalMode() || isSolanaLocalMode();
+}
+
+// ─── Spend policy and ledger ─────────────────────────────────────
+// Loaded before any tool is registered: the policy's tool list decides which
+// tools exist, and a policy that does not parse must stop the server here
+// rather than run with no budget.
+
+let POLICY: LoadedPolicy;
+let LEDGER: Ledger;
+try {
+  POLICY = loadPolicy();
+  const webhookUrl = (process.env.AGENTWALLET_WEBHOOK_URL || '').trim();
+  if (webhookUrl) {
+    let u: URL;
+    try { u = new URL(webhookUrl); } catch { throw new Error(`AGENTWALLET_WEBHOOK_URL is not a URL.`); }
+    const loopback = u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '[::1]';
+    if (u.protocol !== 'https:' && !(u.protocol === 'http:' && loopback)) throw new Error('AGENTWALLET_WEBHOOK_URL must be https (plain http only on localhost).');
+  }
+  LEDGER = new Ledger(POLICY.ledgerPath, webhookUrl ? { url: webhookUrl, secret: (process.env.AGENTWALLET_WEBHOOK_SECRET || '').trim() } : null);
+  if (LEDGER.integrity) console.error(`AgentWallet MCP: WARNING, the ledger at ${POLICY.ledgerPath} is not intact (${LEDGER.integrity}). Every spend is refused until it is looked at.`);
+} catch (e) {
+  console.error(`AgentWallet MCP: ${(e as Error).message}`);
+  process.exit(1);
+}
+const POL = () => POLICY.policy;
+
+/** The limits a spend is checked against; the host rule only for x402 payments. */
+function limitsFor(host: string | null): Limits {
+  const p = POL();
+  return {
+    usd: p.budget,
+    native: undefined, // filled per chain in reserveSpend
+    host: host ? perHostRule(p, host) : null,
+    unpriced: p.unpriced_spends ?? (p.budget ? 'refuse' : 'allow'),
+  };
+}
+
+/** Check every policy rule that does not need the ledger, then reserve the spend in it. Throws a refusal; returns the ledger seq. */
+function reserveSpend(input: ReserveInput): number {
+  const p = POL();
+  const chain = chainAllowed(p, input.chainId);
+  if (!chain.ok) throw new Error(chain.reason + ' Nothing was signed.');
+  const asset = assetAllowed(p, input.chainId, input.asset);
+  if (!asset.ok) throw new Error(asset.reason + ' Nothing was signed.');
+  const to = recipientAllowed(p, input.to);
+  if (!to.ok) throw new Error(to.reason + ' Nothing was signed.');
+  const limits = limitsFor(input.host);
+  limits.native = p.native_budget?.[String(input.chainId)];
+  return LEDGER.reserve(input, limits);
+}
+
+/** The same checks with nothing recorded, for quotes and simulations. */
+function spendVerdict(input: ReserveInput): { ok: true } | { ok: false; reason: string } {
+  const p = POL();
+  for (const r of [chainAllowed(p, input.chainId), assetAllowed(p, input.chainId, input.asset), recipientAllowed(p, input.to)]) if (!r.ok) return r;
+  const limits = limitsFor(input.host);
+  limits.native = p.native_budget?.[String(input.chainId)];
+  return LEDGER.check(input, limits);
+}
+
+/** Dollar value of a raw amount when the asset is a registry stablecoin, else null. */
+function usdOf(chainId: number, asset: string, raw: string, decimals: number): string | null {
+  return autopayAssetAllowed(chainId, asset).via === 'stablecoin' ? policyHuman(rawToUnits(raw, decimals)) : null;
+}
+
+/** Decode the spend a /send body describes: native value, an ERC-20 transfer, or an SPL transfer. */
+async function describeSend(body: Record<string, unknown>, chainId: number): Promise<{ kind: 'native' | 'token' | 'spl' | 'contract'; to: string; asset: string; raw: string; decimals: number }> {
+  if (body.token_mint) {
+    const mint = String(body.token_mint);
+    const d = Number(body.token_decimals);
+    return { kind: 'spl', to: String(body.to || ''), asset: mint, raw: String(body.value ?? '0'), decimals: Number.isInteger(d) && d >= 0 && d <= 36 ? d : await verifiedDecimals(chainId, mint) };
+  }
+  const data = String(body.data || '');
+  const to = String(body.to || '');
+  if (!isSolanaChain(chainId) && /^0xa9059cbb[0-9a-fA-F]{128}$/.test(data)) {
+    const recipient = '0x' + data.slice(34, 74);
+    const raw = BigInt('0x' + data.slice(74, 138)).toString();
+    return { kind: 'token', to: recipient, asset: to, raw, decimals: await resolveTrustedDecimals(chainId, to) };
+  }
+  if (data && data !== '0x') return { kind: 'contract', to, asset: '', raw: String(body.value ?? '0'), decimals: nativeDecimals(chainId) };
+  return { kind: 'native', to, asset: '', raw: String(body.value ?? '0'), decimals: nativeDecimals(chainId) };
 }
 
 // ─── Configuration ──────────────────────────────────────────────
@@ -330,6 +425,54 @@ async function routeLocally(
  * automatically pay via x402 and retry the request.
  */
 async function api(path: string, method = 'GET', body?: Record<string, unknown>, extraHeaders?: Record<string, string>): Promise<unknown> {
+  /* Spend policy at the one choke point every broadcast funds path passes
+     through (transfer, transfer_token, send_transaction, wrap, approve, the
+     x402 broadcast paths, hosted auto-pay): the body is decoded into what it
+     moves, checked against the policy, reserved in the ledger before anything
+     is signed, and settled or voided afterwards. X-AGW-CTX carries the calling
+     tool's context for the ledger and never leaves this process. */
+  let ctx: { tool?: string; host?: string; resource?: string; method?: SpendMethod } = {};
+  if (extraHeaders && extraHeaders['X-AGW-CTX'] !== undefined) {
+    try { ctx = JSON.parse(extraHeaders['X-AGW-CTX']); } catch { ctx = {}; }
+    extraHeaders = { ...extraHeaders };
+    delete extraHeaders['X-AGW-CTX'];
+  }
+  let reserved: number | null = null;
+  const m = /^\/wallets\/([^/]+)\/send(\?|$)/.exec(path);
+  if (method === 'POST' && m && body) {
+    const chainId = localChainId(body, new URLSearchParams(path.split('?')[1] || ''));
+    const d = await describeSend(body, chainId);
+    if (d.kind === 'contract') {
+      const c = chainAllowed(POL(), chainId);
+      if (!c.ok) throw new Error(c.reason + ' Nothing was signed.');
+      const t = targetAllowed(POL(), d.to);
+      if (!t.ok) throw new Error(t.reason + ' Nothing was signed.');
+    } else {
+      reserved = reserveSpend({
+        tool: ctx.tool || 'send', mode: anyLocalMode() ? 'local' : 'hosted', wallet: anyLocalMode() ? 'local' : m[1], chainId,
+        asset: d.asset, assetLabel: assetLabel(chainId, d.asset), raw: d.raw, decimals: d.decimals, usd: usdOf(chainId, d.asset, d.raw, d.decimals),
+        to: d.to, host: ctx.host ?? null, resource: ctx.resource ?? null, method: ctx.method ?? (d.kind === 'spl' ? 'spl' : d.kind === 'token' ? 'transfer' : 'native'),
+      });
+    }
+  }
+  try {
+    const out = await apiInner(path, method, body, extraHeaders);
+    if (reserved !== null) {
+      const r = out as { tx_hash?: unknown; signature?: unknown };
+      LEDGER.settle(reserved, 'broadcast', typeof r?.tx_hash === 'string' ? r.tx_hash : typeof r?.signature === 'string' ? r.signature : null);
+    }
+    return out;
+  } catch (e) {
+    // A send that may already be on the wire stays counted; only a spend that never left this process is voided.
+    if (reserved !== null) {
+      const msg = (e as Error).message;
+      if (/BROADCAST|MAY be live/i.test(msg)) LEDGER.settle(reserved, 'unknown', msg); else LEDGER.void(reserved, msg);
+    }
+    throw e;
+  }
+}
+
+async function apiInner(path: string, method = 'GET', body?: Record<string, unknown>, extraHeaders?: Record<string, string>): Promise<unknown> {
   /* Local mode intercepts here rather than inside each tool. Routing at the
      single choke point every funds operation already passes through means no
      tool can quietly stay custodial because someone forgot to update it. */
@@ -590,7 +733,11 @@ async function handleX402Payment(
     throw new Error(`x402 auto-pay: ${autopayLog.length} automatic payments were already made in the last hour (AGENTWALLET_MAX_AUTOPAY_PER_HOUR=${AUTOPAY_PER_HOUR}); refusing another. Original error: ${serverText(x402Data.error)}`);
   }
 
-  // Send payment using our wallet (with X-AGW-SKIP-X402 to prevent recursion)
+  // Send payment using our wallet (with X-AGW-SKIP-X402 to prevent recursion).
+  // The ledger context names the API host and route; the /send hook reserves and settles the spend.
+  const ctx = { 'X-AGW-SKIP-X402': 'true', 'X-AGW-CTX': JSON.stringify({ tool: 'autopay', host: new URL(API_BASE).hostname, resource: `${originalMethod} ${originalPath.split('?')[0]}`, method: 'autopay' }) };
+  const hostRule = hostAllowed(POL(), new URL(API_BASE).hostname);
+  if (!hostRule.ok) throw new Error(`x402 auto-pay refused: ${hostRule.reason}`);
   let txHash: string;
   try {
     if (tokenAddress) {
@@ -602,7 +749,7 @@ async function handleX402Payment(
         isSOL
           ? { chain_id: chainId, to: payTo, value: rawAmount, token_mint: tokenAddress, token_decimals: decimals }
           : { chain_id: chainId, to: tokenAddress, value: '0', data: buildErc20TransferData(payTo, rawAmount) },
-        { 'X-AGW-SKIP-X402': 'true' }
+        ctx
       ) as { tx_hash?: string; signature?: string };
       txHash = sendResult.tx_hash || sendResult.signature || '';
     } else {
@@ -611,7 +758,7 @@ async function handleX402Payment(
         `/wallets/${X402_WALLET_ID}/send`,
         'POST',
         { chain_id: chainId, to: payTo, value: rawAmount },
-        { 'X-AGW-SKIP-X402': 'true' }
+        ctx
       ) as { tx_hash?: string; signature?: string };
       txHash = sendResult.tx_hash || sendResult.signature || '';
     }
@@ -704,6 +851,7 @@ const signedPayments = new Map<string, {
   authorization: Eip3009Authorization | null; uptoAuth: UptoPermit2Authorization | null; payer: string | null; until: number;
   resource: string; // wallet|resource|method|body: one live authorization per resource, on any chain, unless fresh_authorization (rounds 3 and 8)
   amount: string; signedAt: number; chainId: number;
+  ledgerSeq: number | null; // the ledger line this authorization was reserved on, so a re-send settles the same spend
 }>();
 /** The requirement and extensions a v2 server sends are echoed inside the payment header; nothing larger than this is signed. */
 const MAX_PAYMENT_ECHO_BYTES = 32 * 1024;
@@ -829,6 +977,12 @@ function validateGuardEnv(): void {
   if ((process.env.AGENTWALLET_SOLANA_KEY || '').trim() && (process.env.AGENTWALLET_SOLANA_KEYFILE || '').trim()) {
     throw new Error('Both AGENTWALLET_SOLANA_KEY and AGENTWALLET_SOLANA_KEYFILE are set; keep one.');
   }
+  if (process.env.AGENTWALLET_KEYFILE_PASSPHRASE !== undefined && (process.env.AGENTWALLET_KEYFILE_PASSPHRASE_FILE || '').trim()) {
+    throw new Error('Both AGENTWALLET_KEYFILE_PASSPHRASE and AGENTWALLET_KEYFILE_PASSPHRASE_FILE are set; keep one.');
+  }
+  if ((process.env.AGENTWALLET_WEBHOOK_SECRET || '').trim() && !(process.env.AGENTWALLET_WEBHOOK_URL || '').trim()) {
+    throw new Error('AGENTWALLET_WEBHOOK_SECRET is set without AGENTWALLET_WEBHOOK_URL.');
+  }
   // An unrecognised AGENTWALLET_* name is almost always a misspelled cap, which
   // would run uncapped without a word (round 4). Refuse to start instead.
   for (const k of Object.keys(process.env)) {
@@ -837,7 +991,7 @@ function validateGuardEnv(): void {
     throw new Error(`Unknown environment variable ${k}. AgentWallet refuses to start on an unrecognised AGENTWALLET_* name so that a misspelled cap cannot run uncapped. Known names: ${[...KNOWN_ENV].join(', ')}, AGENTWALLET_RPC_<chainId>, AGENTWALLET_SOLANA_RPC_<chainId>.`);
   }
 }
-const KNOWN_ENV = new Set(["AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS","AGENTWALLET_API_URL","AGENTWALLET_APPROVALS","AGENTWALLET_AUTOPAY_ASSETS","AGENTWALLET_CHAIN_ID","AGENTWALLET_DASHBOARD_URL","AGENTWALLET_KEYFILE","AGENTWALLET_LEGACY_PAYWALL_ORIGINS","AGENTWALLET_MAX_AUTOPAY","AGENTWALLET_MAX_AUTOPAY_PER_HOUR","AGENTWALLET_MAX_FEE_NATIVE","AGENTWALLET_MAX_TX_NATIVE","AGENTWALLET_MAX_TX_SOL","AGENTWALLET_MAX_TX_TOKEN","AGENTWALLET_PASS","AGENTWALLET_PERMIT2_AUTO_APPROVE","AGENTWALLET_PRIVATE_KEY","AGENTWALLET_RPC_URL","AGENTWALLET_SOLANA_KEY","AGENTWALLET_SOLANA_KEYFILE","AGENTWALLET_SOLANA_RPC","AGENTWALLET_TOKEN_DECIMALS","AGENTWALLET_TOKEN_RISK","AGENTWALLET_USER","AGENTWALLET_WALLET_ID","AGENTWALLET_X402_MAX_TIMEOUT"]);
+const KNOWN_ENV = new Set(["AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS","AGENTWALLET_API_URL","AGENTWALLET_APPROVALS","AGENTWALLET_AUTOPAY_ASSETS","AGENTWALLET_CHAIN_ID","AGENTWALLET_DASHBOARD_URL","AGENTWALLET_KEYFILE","AGENTWALLET_KEYFILE_PASSPHRASE","AGENTWALLET_KEYFILE_PASSPHRASE_FILE","AGENTWALLET_LEDGER","AGENTWALLET_LEGACY_PAYWALL_ORIGINS","AGENTWALLET_MAX_AUTOPAY","AGENTWALLET_MAX_AUTOPAY_PER_HOUR","AGENTWALLET_MAX_FEE_NATIVE","AGENTWALLET_MAX_TX_NATIVE","AGENTWALLET_MAX_TX_SOL","AGENTWALLET_MAX_TX_TOKEN","AGENTWALLET_PASS","AGENTWALLET_PERMIT2_AUTO_APPROVE","AGENTWALLET_POLICY","AGENTWALLET_PRIVATE_KEY","AGENTWALLET_RPC_URL","AGENTWALLET_SOLANA_KEY","AGENTWALLET_SOLANA_KEYFILE","AGENTWALLET_SOLANA_RPC","AGENTWALLET_TOKEN_DECIMALS","AGENTWALLET_TOKEN_RISK","AGENTWALLET_USER","AGENTWALLET_WALLET_ID","AGENTWALLET_WEBHOOK_SECRET","AGENTWALLET_WEBHOOK_URL","AGENTWALLET_X402_MAX_TIMEOUT"]);
 
 /**
  * Register a tool whose arguments are strict: an unknown key (max_payemnt for
@@ -845,9 +999,36 @@ const KNOWN_ENV = new Set(["AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS","AGENTWALLET_
  * advertised schema always said additionalProperties: false; now the runtime
  * agrees (round 4).
  */
+const ALWAYS_REGISTERED = new Set(['wallet_mode', 'spend_policy']); // the operator can always see what the server is
+const toolsHidden: string[] = [];
 function tool<S extends z.ZodRawShape>(name: string, description: string, shape: S, cb: (args: z.infer<z.ZodObject<S>>, extra: unknown) => unknown) {
+  // The policy's tool list decides what exists: a payer-only deployment exposes
+  // a handful of tools and the model never sees the rest.
+  if (!ALWAYS_REGISTERED.has(name) && !toolAllowed(POL(), name)) { toolsHidden.push(name); return null; }
   const wrapped = async (args: unknown, extra: unknown) => { try { return await cb(args as z.infer<z.ZodObject<S>>, extra); } catch (e) { throw boundedError(e); } };
   return server.registerTool(name, { description, inputSchema: z.object(shape).strict() }, wrapped as never);
+}
+
+/**
+ * Ask the human at the client a yes/no through MCP elicitation. 'unsupported'
+ * when the client never declared the capability; the caller then refuses.
+ * Only this process's own figures go in the message; the endpoint's words are
+ * labelled as its own.
+ */
+async function askHuman(lines: string[], timeoutMs: number): Promise<'accept' | 'decline' | 'cancel' | 'unsupported'> {
+  if (!server.server.getClientCapabilities()?.elicitation) return 'unsupported';
+  let r: { action: string; content?: Record<string, unknown> };
+  try {
+    r = await server.server.elicitInput({
+      message: lines.join('\n'),
+      requestedSchema: { type: 'object', properties: { approve: { type: 'boolean', title: 'Approve this payment', description: 'true signs it, false refuses it' } }, required: ['approve'] },
+    }, { timeout: timeoutMs });
+  } catch (e) {
+    console.error(`[agentwallet] elicitation failed: ${(e as Error).message.split('\n')[0]}`);
+    return 'cancel';
+  }
+  if (r.action !== 'accept') return r.action === 'decline' ? 'decline' : 'cancel';
+  return r.content?.approve === true ? 'accept' : 'decline';
 }
 
 // ─── EVM Helpers ──────────────────────────────────────────────────
@@ -937,7 +1118,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.13.15',
+    version: '1.14.0',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()
@@ -1780,6 +1961,12 @@ tool(
       }
     }
 
+    // A host the policy denies is never contacted at all, not even for the quote.
+    {
+      const early = hostAllowed(POL(), new URL(url).hostname);
+      if (!early.ok) return jsonResponse({ status: null, payment_required: null, payment_made: false, policy_refusal: true, host: new URL(url).hostname, error: early.reason + ' The endpoint was not contacted.' });
+    }
+
     // Validate URL: canonicalizes IP literals (including IPv4-mapped IPv6) and
     // resolves DNS names, rejecting any private/internal destination. An early
     // check here gives a clear error before any request is built; safeFetch
@@ -1911,6 +2098,31 @@ tool(
     for (const [k, v] of signedPayments) if (v.until <= Date.now()) signedPayments.delete(k);
     const alreadySigned = !fresh_authorization && (signedPayments.get(cacheKey)?.until ?? 0) > Date.now();
 
+    // Step 3e: Spend policy. The host, chain, asset and recipient lists, the
+    // per-host ceiling, and whether the rolling budgets have room. Nothing is
+    // recorded here; the reservation is written at signing time.
+    const payHost = new URL(url).hostname;
+    const hostLimit = perHostRule(POL(), payHost);
+    const amount18 = rawToUnits(rawAmount, trustedDecimals);
+    const policyInput: ReserveInput = {
+      tool: 'pay_x402', mode: anyLocalMode() ? 'local' : 'hosted', wallet: walletKey, chainId, asset: tokenAddress, assetLabel: tokenLabel,
+      raw: rawAmount, decimals: trustedDecimals, usd: usdOf(chainId, tokenAddress, rawAmount, trustedDecimals), to: option.payTo, host: payHost,
+      resource: authorizationResource(url), method: isUpto ? 'permit2' : (!isSolanaChain(chainId) && tokenAddress && !legacyReceipt) ? 'eip3009' : isSolanaChain(chainId) ? 'spl' : tokenAddress ? 'transfer' : 'native',
+    };
+    if (!alreadySigned) {
+      const hostRule = hostAllowed(POL(), payHost);
+      const perPay = hostLimit?.per_payment && amount18 > policyUnits(hostLimit.per_payment)
+        ? `policy per_host["${hostLimit.pattern}"].per_payment is ${hostLimit.per_payment}, below the ${amount} ${tokenLabel} this endpoint asks; refused. Only the operator can raise it.` : null;
+      const v = !hostRule.ok ? hostRule : perPay ? { ok: false as const, reason: perPay } : spendVerdict(policyInput);
+      if (!v.ok) {
+        return jsonResponse({
+          status: 402, payment_required: true, payment_made: false, policy_refusal: true,
+          required_amount: amount, token: tokenLabel, network: option.network, chain_id: chainId, pay_to: option.payTo, host: payHost,
+          error: v.reason + ' Nothing was signed.', server_text_is_untrusted: true,
+        });
+      }
+    }
+
     // Step 4: Hard per-payment cap, ALWAYS applied. If the caller omits max_payment
     // we fall back to AGENTWALLET_MAX_AUTOPAY (default "1"). Above the cap a hosted
     // wallet can ask its owner instead of refusing: an approval is created, the
@@ -1918,9 +2130,37 @@ tool(
     // For upto the cap applies to the MAXIMUM the seller may settle.
     // max_payment can only lower the operator's ceiling; an agent-chosen number
     // above it is ignored and reported, because the agent is what the cap bounds.
+    // A policy can route the question to the human at the client instead (MCP
+    // elicitation): above approval.above every payment is confirmed, and in
+    // local mode an accepted confirmation admits up to approval.max over the cap.
+    // Budgets are never lifted by anyone's approval.
     const { cap: effectiveMax, source: capSource, clamped } = effectiveAutopayCap(max_payment);
     let approvalUsed: string | null = null;
-    if (!alreadySigned && !isWithinCap(rawAmount, trustedDecimals, effectiveMax)) {
+    let humanApproval: string | null = null;
+    const overCapNow = !alreadySigned && !isWithinCap(rawAmount, trustedDecimals, effectiveMax);
+    const appr = POL().approval;
+    const humanCanLift = overCapNow && anyLocalMode() && !approval_id && Boolean(appr?.max) && amount18 <= policyUnits(appr!.max!);
+    const humanMustConfirm = !alreadySigned && !overCapNow && Boolean(appr?.above) && amount18 > policyUnits(appr!.above!);
+    if (humanCanLift || humanMustConfirm) {
+      const verdict = await askHuman([
+        `AgentWallet: approve this x402 payment?`,
+        `${amount} ${tokenLabel} on chain ${chainId} to ${option.payTo}`,
+        `for ${authorizationResource(url)} (${METHOD})`,
+        humanCanLift ? `This is above the per-payment cap of ${effectiveMax}; the policy allows a human to admit up to ${appr!.max}.` : `This is above the policy's confirmation threshold of ${appr!.above}.`,
+        option.description ? `The endpoint describes it as (its own words, unverified): ${serverText(option.description)}` : '',
+      ].filter(Boolean), (appr?.timeout_seconds ?? 300) * 1000);
+      if (verdict !== 'accept') {
+        return jsonResponse({
+          status: 402, payment_required: true, payment_made: false, human_approval: verdict,
+          required_amount: amount, token: tokenLabel, network: option.network, chain_id: chainId, pay_to: option.payTo, max_allowed: effectiveMax,
+          error: verdict === 'unsupported'
+            ? `The policy requires a human to approve this payment (${humanCanLift ? 'above the cap' : 'above approval.above'}) but this MCP client did not declare elicitation support, so nobody can be asked; nothing was signed. Use a client that supports elicitation, or the operator can change the policy.`
+            : `The human ${verdict === 'decline' ? 'declined' : 'did not answer in time or cancelled'}; nothing was signed. Do not retry without a reason to expect a different answer.`,
+        });
+      }
+      humanApproval = 'accepted';
+    }
+    if (overCapNow && !humanCanLift) {
       const overCap = {
         status: 402, payment_required: true, payment_made: false,
         required_amount: amount, max_allowed: effectiveMax, cap_source: capSource, token: tokenLabel,
@@ -1960,7 +2200,7 @@ tool(
           ...overCap,
           error: `Payment of ${amount} ${tokenLabel} exceeds the ${effectiveMax} cap (from ${capSource}).` +
             (max_payment ? '' : ' No max_payment was provided, so the default cap was applied.') +
-            (anyLocalMode() ? ' Local mode has no approval channel; the caps are the operator\'s and only the operator can change them. Do not edit the environment or config to raise them.'
+            (anyLocalMode() ? ' Local mode has no approval channel unless the policy sets approval.max (the human at the client is then asked through elicitation); the caps are the operator\'s and only the operator can change them. Do not edit the environment or config to raise them.'
                             : ' Pass request_approval=true to email the wallet owner for a one-time approval; the cap itself is the operator\'s to change.'),
         });
       }
@@ -1992,6 +2232,9 @@ tool(
     let permit2ApprovalTx: string | null = null;
     let payerDelegationInfo: PayerDelegation | null = null;
     let authorizationReused = false;
+    let ledgerSeq: number | null = null;
+    let signedOk = false;
+    const skipCtx = { ...skip, 'X-AGW-CTX': JSON.stringify({ tool: 'pay_x402', host: payHost, resource: policyInput.resource, method: policyInput.method }) };
 
     // The resource is the whole URL including its query: /buy?id=1 and /buy?id=2
     // are different purchases, and reusing the first signature for the second
@@ -2044,7 +2287,7 @@ tool(
         // Same endpoint, same requirement, still inside the window: re-send the
         // earlier signature. Its nonce is single-use, so a server that already
         // settled it cannot settle it again, and one that never did now can.
-        ({ headerName, paymentHeader, txHash, authorization, uptoAuth, payer } = cachedAuth);
+        ({ headerName, paymentHeader, txHash, authorization, uptoAuth, payer, ledgerSeq } = cachedAuth);
         authorizationReused = true;
       } else if (isUpto) {
         payer = await payerAddress(wallet_id);
@@ -2067,6 +2310,7 @@ tool(
           }
         }
         uptoAuth = buildUptoAuthorization(payer, option);
+        ledgerSeq = reserveSpend({ ...policyInput, method: 'permit2', proof: { nonce: uptoAuth.nonce } }); // budget reserved before the signature exists
         const signature = await signPermit2(wallet_id, chainId, uptoAuth, approvalUsed);
         const payload = buildPaymentPayloadRaw(x402Version, option, uptoPayload(uptoAuth, signature), paymentInfo.resource, paymentInfo.extensions);
         const h = paymentHeaderFor(x402Version, payload);
@@ -2077,6 +2321,7 @@ tool(
         payerDelegationInfo = await payerDelegation(chainId, payer);
         const domain = await resolveTokenDomain(chainId, tokenAddress, option.extra);
         authorization = buildAuthorization(payer, option);
+        ledgerSeq = reserveSpend({ ...policyInput, method: 'eip3009', proof: { nonce: authorization.nonce } }); // budget reserved before the signature exists
         const signature = await signAuthorization(wallet_id, chainId, tokenAddress, domain, authorization, approvalUsed);
         const payload = buildPaymentPayload(x402Version, option, authorization, signature, paymentInfo.resource, paymentInfo.extensions);
         const h = paymentHeaderFor(x402Version, payload);
@@ -2089,12 +2334,12 @@ tool(
           // error instead of an auto-payment hidden inside the pay_x402 result (round 8).
           txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', tokenAddress
             ? { to: option.payTo, value: rawAmount, token_mint: tokenAddress, token_decimals: trustedDecimals, chain_id: chainId }
-            : { to: option.payTo, value: rawAmount, chain_id: chainId }, skip)) as Record<string, unknown>;
+            : { to: option.payTo, value: rawAmount, chain_id: chainId }, skipCtx)) as Record<string, unknown>;
         } else if (tokenAddress) {
           const calldata = '0xa9059cbb' + padAddress(option.payTo) + encodeUint256(rawAmount);
-          txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: tokenAddress, value: '0', data: calldata, chain_id: chainId }, skip)) as Record<string, unknown>;
+          txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: tokenAddress, value: '0', data: calldata, chain_id: chainId }, skipCtx)) as Record<string, unknown>;
         } else {
-          txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: option.payTo, value: rawAmount, data: '', chain_id: chainId }, skip)) as Record<string, unknown>;
+          txResult = (await api(`/wallets/${wallet_id}/send`, 'POST', { to: option.payTo, value: rawAmount, data: '', chain_id: chainId }, skipCtx)) as Record<string, unknown>;
         }
         txHash = String(txResult.tx_hash || txResult.signature || '');
         if (!txHash) throw new Error('x402: the payment transaction returned no hash.');
@@ -2104,11 +2349,16 @@ tool(
         const until = authorization ? Number(authorization.validBefore) * 1000
           : uptoAuth ? Number(uptoAuth.deadline) * 1000
           : Date.now() + maxAuthWindowSeconds() * 1000; // a broadcast transfer: the hash stays valid, re-sending it never pays twice
-        signedPayments.set(cacheKey, { headerName, paymentHeader, txHash, authorization, uptoAuth, payer, until, resource: resourceTag, amount, signedAt: Date.now(), chainId });
+        signedPayments.set(cacheKey, { headerName, paymentHeader, txHash, authorization, uptoAuth, payer, until, resource: resourceTag, amount, signedAt: Date.now(), chainId, ledgerSeq });
+        signedOk = true;
         // A receipt on stderr the moment a signature exists, so a result the transport
         // drops (a client crash, an oversized frame) is still auditable (round 3).
         console.error(`[agentwallet] x402 authorization sent: ${amount} ${tokenLabel} to ${option.payTo} on chain ${chainId} for ${authorizationResource(url)} (${authorization ? 'nonce ' + authorization.nonce : uptoAuth ? 'permit2 nonce ' + uptoAuth.nonce : 'tx ' + txHash})`);
       }
+    } catch (e) {
+      // Reserved but never signed: the budget gets it back. (A broadcast path reserves inside api() and voids itself.)
+      if (ledgerSeq !== null && !signedOk && !authorizationReused) LEDGER.void(ledgerSeq, (e as Error).message);
+      throw e;
     } finally {
       releaseSigning();
       signingInFlight.delete(cacheKey);
@@ -2134,8 +2384,9 @@ tool(
       retryRes = await safeFetch(url, retryOptions);
     } catch (e) {
       // The authorization has already been handed over; say so instead of a bare transport error.
+      if (ledgerSeq !== null && (authorization || uptoAuth)) LEDGER.settle(ledgerSeq, 'unknown', (e as Error).message);
       return jsonResponse({
-        status: 0, payment_required: true, payment_made: null, payment_outcome: 'unknown',
+        status: 0, payment_required: true, payment_made: null, payment_outcome: 'unknown', ledger_seq: ledgerSeq,
         error: `The paid request could not be completed: ${(e as Error).message}. The authorization was already sent; it stays cached, and calling pay_x402 again with the same URL inside its window re-sends the same one rather than signing a new one.`,
         authorization: authorization ? { nonce: authorization.nonce, valid_before: authorization.validBefore } : (uptoAuth ? { scheme: 'upto', nonce: uptoAuth.nonce, deadline: uptoAuth.deadline } : null),
         tx_hash: txHash ?? null, amount, token: tokenLabel, pay_to: option.payTo, chain_id: chainId,
@@ -2168,10 +2419,14 @@ tool(
       retryError = serverText(String(again?.error || (retryParsed as { error?: string } | null)?.error || 'Payment was not accepted (no reason given).')) as string;
       if (payerDelegationInfo && /signature/i.test(retryError)) retryError += ` Likely cause: ${payerDelegationInfo.warning}`;
     }
+    // A signed authorization's fate goes on the ledger; a broadcast transfer was settled by the /send hook already.
+    if (ledgerSeq !== null && (authorization || uptoAuth)) LEDGER.settle(ledgerSeq, verdict.outcome, retryError);
 
     return jsonResponse({
       status: retryRes.status,
       payment_required: true,
+      human_approval: humanApproval,
+      ledger_seq: ledgerSeq,
       // Paid means a success status after the payment header and no server-reported settlement failure. A 402 or
       // any other non-2xx is not paid whatever the settlement header claims (a server could send success:true on a
       // 402 and mislead the agent, 2026-10-04 round 2); the facilitator does not settle a failed request.
@@ -2524,6 +2779,238 @@ tool(
   },
 );
 
+// ─── Tool: quote_x402 ───────────────────────────────────────────
+
+tool(
+  'quote_x402',
+  'Ask what an x402 endpoint charges without paying: fetches the URL, parses the 402 requirements, says which option this ' +
+    'wallet would pay (chain, asset, amount, recipient), whether the per-payment cap, the spend policy and the rolling budgets ' +
+    'would allow it, and nothing is signed. Call it before pay_x402 when the price is unknown.',
+  {
+    url: z.string().url().describe('The URL to quote'),
+    method: z.string().default('GET').describe('HTTP method the real request would use'),
+    headers: z.string().optional().describe('Optional JSON string of request headers, as for pay_x402'),
+    body: z.string().optional().describe('Optional request body, as for pay_x402'),
+    prefer_chain: z.number().int().optional().describe('Preferred chain ID when several are offered'),
+  },
+  async ({ url, method, headers: headersJson, body: reqBody, prefer_chain }) => {
+    const reqHeaders: Record<string, string> = { Accept: 'application/json' };
+    if (headersJson) {
+      let parsed: unknown;
+      try { parsed = JSON.parse(headersJson); } catch { parsed = null; }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Invalid headers JSON. Must be a JSON object.');
+      for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+        const name = k.toLowerCase();
+        if (FORBIDDEN_REQUEST_HEADERS.has(name) || name.startsWith('proxy-') || name.startsWith(':')) throw new Error(`Header "${k}" cannot be set by the caller.`);
+        if (typeof v !== 'string') throw new Error(`Header "${k}" must be a string.`);
+        reqHeaders[k] = v;
+      }
+    }
+    const host = new URL(url).hostname;
+    {
+      const early = hostAllowed(POL(), host);
+      if (!early.ok) return jsonResponse({ status: null, payment_required: null, would_pay: false, policy_refusal: true, host, error: early.reason + ' The endpoint was not contacted.' });
+    }
+    await assertPublicUrl(url);
+    const opts: RequestInit = { method, headers: reqHeaders, signal: AbortSignal.timeout(30_000) };
+    if (reqBody && method !== 'GET') { opts.body = reqBody; if (!reqHeaders['Content-Type']) reqHeaders['Content-Type'] = 'application/json'; }
+    const res = await safeFetch(url, opts);
+    if (res.status !== 402) {
+      return jsonResponse({ status: res.status, payment_required: false, host, note: 'The endpoint did not ask for payment on this request.', server_text_is_untrusted: true });
+    }
+    const servedFrom = finalUrlOf(res, url);
+    if (new URL(servedFrom).origin !== new URL(url).origin) {
+      return jsonResponse({ status: 402, payment_required: true, would_pay: false, error: `The endpoint redirected to another origin (${new URL(servedFrom).origin}) before asking for payment; pay_x402 would refuse it too.`, final_url: servedFrom });
+    }
+    const text = await readBounded(res, PAYWALL_MAX_CHARS, 'The endpoint');
+    let body: unknown = null;
+    try { body = JSON.parse(text); } catch { body = null; }
+    const info = parsePaymentRequired(n => res.headers.get(n), body);
+    if (!info || !Array.isArray(info.accepts) || info.accepts.length === 0) {
+      return jsonResponse({ status: 402, payment_required: true, would_pay: false, error: 'The 402 carried no x402 payment requirements.', server_text_is_untrusted: true });
+    }
+    const accepts = info.accepts as X402Requirement[];
+    const offered = accepts.slice(0, 10).map(a => ({ scheme: serverText(a.scheme), network: serverText(a.network), amount_raw: serverText(requiredAmount(a)), asset: serverText(a.asset ?? a.extra?.token ?? null), pay_to: serverText(a.payTo) }));
+    const picked = pickOption(accepts, resolveChainId, prefer_chain);
+    if (!picked.option || !picked.chainId) {
+      return jsonResponse({ status: 402, payment_required: true, would_pay: false, x402_version: Number(info.x402Version) || 1, host, error: picked.reason, offered, server_text_is_untrusted: true });
+    }
+    const option = picked.option;
+    const chainId = picked.chainId;
+    const rawAmount = normalizeRawAmount(requiredAmount(option));
+    const tokenAddress = option.asset || option.extra?.token || '';
+    const refusals: string[] = [];
+    let amount: string | null = null;
+    let trustedDecimals: number | null = null;
+    try {
+      trustedDecimals = tokenAddress ? await resolveTrustedDecimals(chainId, tokenAddress) : nativeDecimals(chainId);
+      if (typeof option.requiredDecimals === 'number') assertDeclaredDecimals(option.requiredDecimals, trustedDecimals);
+      amount = formatUnits(rawAmount, trustedDecimals);
+    } catch (e) { refusals.push((e as Error).message); }
+    const tokenLabel = assetLabel(chainId, tokenAddress);
+    try { assertPayTo(chainId, option.payTo); } catch (e) { refusals.push((e as Error).message); }
+    const assetPolicy = autopayAssetAllowed(chainId, tokenAddress);
+    if (!assetPolicy.allowed) refusals.push(assetPolicy.reason as string);
+    const { cap } = effectiveAutopayCap(undefined);
+    const appr = POL().approval;
+    let withinCap: boolean | null = null;
+    let human: string | null = null;
+    if (trustedDecimals !== null) {
+      withinCap = isWithinCap(rawAmount, trustedDecimals, cap);
+      const a18 = rawToUnits(rawAmount, trustedDecimals);
+      if (!withinCap) {
+        if (anyLocalMode() && appr?.max && a18 <= policyUnits(appr.max)) human = `above the cap of ${cap}; the policy lets the human at the client admit it (up to ${appr.max}) through elicitation`;
+        else if (!anyLocalMode()) human = `above the cap of ${cap}; a hosted wallet can email its owner for approval (request_approval)`;
+        else refusals.push(`The amount ${amount} ${tokenLabel} is above the per-payment cap ${cap} (AGENTWALLET_MAX_AUTOPAY) and no policy approval.max admits it.`);
+      } else if (appr?.above && a18 > policyUnits(appr.above)) human = `above the policy's confirmation threshold of ${appr.above}; the human at the client will be asked through elicitation`;
+      const hostRule = hostAllowed(POL(), host);
+      if (!hostRule.ok) refusals.push(hostRule.reason);
+      const hostLimit = perHostRule(POL(), host);
+      if (hostLimit?.per_payment && a18 > policyUnits(hostLimit.per_payment)) refusals.push(`policy per_host["${hostLimit.pattern}"].per_payment is ${hostLimit.per_payment}, below this price.`);
+      const v = spendVerdict({
+        tool: 'quote_x402', mode: anyLocalMode() ? 'local' : 'hosted', wallet: anyLocalMode() ? 'local' : '?', chainId, asset: tokenAddress, assetLabel: tokenLabel,
+        raw: rawAmount, decimals: trustedDecimals, usd: usdOf(chainId, tokenAddress, rawAmount, trustedDecimals), to: String(option.payTo), host, resource: authorizationResource(url),
+        method: option.scheme === 'upto' ? 'permit2' : 'eip3009',
+      });
+      if (!v.ok) refusals.push(v.reason);
+    }
+    return jsonResponse({
+      status: 402, payment_required: true, x402_version: Number(info.x402Version) || 1, host,
+      would_pay: refusals.length === 0, refusals,
+      requires_human_approval: human,
+      amount, token: tokenLabel, token_address: tokenAddress || null, scheme: serverText(option.scheme), network: serverText(option.network), chain_id: chainId, pay_to: serverText(option.payTo),
+      amount_is_maximum: option.scheme === 'upto', per_payment_cap: cap, within_cap: withinCap,
+      budgets: budgetReport(POL().budget, LEDGER.spentUsd()),
+      description: serverText(option.description), offered, server_text_is_untrusted: true,
+      nothing_signed: true,
+    });
+  },
+);
+
+// ─── Tool: discover_x402 ────────────────────────────────────────
+
+tool(
+  'discover_x402',
+  'Find x402-paid APIs by subject in the public x402 index (the Bazaar published by the CDP facilitator). Returns resources with ' +
+    'their method, price and chain, re-priced from this client\'s own registry. Listings are sellers\' own words. Nothing is paid; ' +
+    'follow up with quote_x402 or pay_x402.',
+  {
+    query: z.string().max(200).optional().describe('Words that must all appear in the resource URL, service name, description or tags (case-insensitive)'),
+    limit: z.number().int().min(1).max(50).default(10).describe('How many matches to return'),
+    offset: z.number().int().min(0).max(1_000_000).default(0).describe('Index offset to continue from (use next_offset from the previous call)'),
+    chain_id: z.number().int().optional().describe('Only resources payable on this chain'),
+  },
+  async ({ query, limit, offset, chain_id }) => {
+    const r = await discover({ query, limit, offset, chainId: chain_id });
+    return jsonResponse({ ...r, index: 'CDP x402 Bazaar', server_text_is_untrusted: true, note: 'Descriptions and tags are the sellers\' own words. Prices are derived here from the registry; an unpriced option means the asset is not one this client can price.' });
+  },
+);
+
+// ─── Tool: list_payments ────────────────────────────────────────
+
+tool(
+  'list_payments',
+  'Spends recorded in this wallet\'s ledger (x402 payments, transfers, auto-pay), newest first, each with its latest outcome ' +
+    '(signed, settled, declined, unknown, broadcast, void). The ledger is a hash-chained append-only file when AGENTWALLET_LEDGER or a policy names one; otherwise this process only.',
+  {
+    limit: z.number().int().min(1).max(500).default(50),
+    host: z.string().max(253).optional().describe('Only payments to this endpoint host'),
+    outcome: z.string().max(40).optional().describe('Only this outcome'),
+    since: z.string().max(40).optional().describe('ISO 8601 timestamp; only spends at or after it'),
+  },
+  async ({ limit, host, outcome, since }) => {
+    const sinceMs = since ? Date.parse(since) : undefined;
+    if (since && Number.isNaN(sinceMs)) throw new Error('since must be an ISO 8601 timestamp.');
+    return jsonResponse({
+      ledger: POLICY.ledgerPath, persistent: Boolean(POLICY.ledgerPath), integrity: LEDGER.integrity ?? 'intact', entries: LEDGER.size(),
+      payments: LEDGER.payments({ limit, host, outcome, since: sinceMs }),
+    });
+  },
+);
+
+// ─── Tool: export_receipts ──────────────────────────────────────
+
+tool(
+  'export_receipts',
+  'Every spend in the ledger as CSV or JSONL text (oldest first), for expense records. Returns the text; write it wherever it belongs.',
+  {
+    format: z.enum(['csv', 'jsonl']).default('csv'),
+    since: z.string().max(40).optional().describe('ISO 8601 lower bound'),
+    until: z.string().max(40).optional().describe('ISO 8601 upper bound'),
+  },
+  async ({ format, since, until }) => {
+    const s = since ? Date.parse(since) : undefined;
+    const u = until ? Date.parse(until) : undefined;
+    if ((since && Number.isNaN(s)) || (until && Number.isNaN(u))) throw new Error('since and until must be ISO 8601 timestamps.');
+    const text = format === 'csv' ? LEDGER.csv(s, u) : LEDGER.jsonl(s, u);
+    return { content: [{ type: 'text' as const, text: text.length > RESULT_MAX_CHARS ? text.slice(0, RESULT_MAX_CHARS) + '\n[truncated by agentwallet-mcp; narrow the range]' : text }] };
+  },
+);
+
+// ─── Tool: spend_policy ─────────────────────────────────────────
+
+tool(
+  'spend_policy',
+  'The spend policy this server enforces (AGENTWALLET_POLICY), its sha256, the rolling budgets with what is spent and what remains, ' +
+    'per-host spending, the ledger\'s path and integrity, and whether the connected client can answer approval questions. Read-only.',
+  {},
+  async () => {
+    const p = POL();
+    const perHost: Record<string, unknown> = {};
+    for (const [pattern, rule] of Object.entries(p.per_host || {})) {
+      if (pattern.startsWith('*.')) { perHost[pattern] = { rule, spent: 'wildcard patterns are summed per exact host; see list_payments' }; continue; }
+      perHost[pattern] = { rule, ...budgetReport({ daily: rule.daily, monthly: rule.monthly }, LEDGER.spentUsd(Date.now(), pattern)) };
+    }
+    const nativeBudgets: Record<string, unknown> = {};
+    for (const [chain, w] of Object.entries(p.native_budget || {})) nativeBudgets[chain] = budgetReport(w, LEDGER.spentNative(Number(chain)));
+    return jsonResponse({
+      policy: describePolicy(POLICY),
+      budgets: { usd: budgetReport(p.budget, LEDGER.spentUsd()), native: nativeBudgets, per_host: perHost, windows: 'rolling: daily = last 24 h, monthly = last 30 days, total = lifetime of the ledger' },
+      ledger: { path: POLICY.ledgerPath, persistent: Boolean(POLICY.ledgerPath), integrity: LEDGER.integrity ?? 'intact', entries: LEDGER.size() },
+      tools_hidden_by_policy: toolsHidden,
+      human_approval_channel: server.server.getClientCapabilities()?.elicitation ? 'this client supports elicitation' : 'this client declared no elicitation support; approval.above and approval.max cannot be used with it',
+      webhook: (process.env.AGENTWALLET_WEBHOOK_URL || '').trim() ? redactUrl(process.env.AGENTWALLET_WEBHOOK_URL!.trim()) : null,
+      note: 'The policy and the budgets are the operator\'s. Do not edit the policy file, the ledger or the environment to change them.',
+    });
+  },
+);
+
+// ─── Tool: simulate_transaction ─────────────────────────────────
+
+tool(
+  'simulate_transaction',
+  'Dry-run an EVM transaction with nothing signed: the local guards (native cap, token cap, fee cap), the spend policy, the node\'s gas ' +
+    'estimate (which fails when the call would revert), the worst-case fee, whether the balance covers it, and the call\'s return data. ' +
+    'Local mode runs the full check; hosted mode runs the policy and an eth_call.',
+  {
+    wallet_id: z.number().int().describe('Wallet ID (ignored in local mode)'),
+    to: z.string().regex(/^0x[a-fA-F0-9]{40}$/).describe('Destination address'),
+    value: z.string().default('0').describe('Native amount in human units (e.g. "0.01" ETH)'),
+    data: z.string().optional().describe('Optional calldata (0x-prefixed hex)'),
+    chain_id: z.number().int().describe('EVM chain ID'),
+  },
+  async ({ wallet_id, to, value, data, chain_id }) => {
+    if (isSolanaChain(chain_id)) throw new Error('simulate_transaction is EVM-only.');
+    const valueRaw = parseUnits(value, 18);
+    const d = await describeSend({ to, value: valueRaw, data: data || '', chain_id }, chain_id);
+    const policy = d.kind === 'contract'
+      ? (() => { for (const r of [chainAllowed(POL(), chain_id), targetAllowed(POL(), d.to)]) if (!r.ok) return r; return { ok: true as const }; })()
+      : spendVerdict({ tool: 'simulate_transaction', mode: anyLocalMode() ? 'local' : 'hosted', wallet: anyLocalMode() ? 'local' : String(wallet_id), chainId: chain_id, asset: d.asset, assetLabel: assetLabel(chain_id, d.asset), raw: d.raw, decimals: d.decimals, usd: usdOf(chain_id, d.asset, d.raw, d.decimals), to: d.to, host: null, resource: null, method: d.kind === 'token' ? 'transfer' : 'native' });
+    const moves = { kind: d.kind, to: d.to, asset: d.asset || 'native', asset_label: assetLabel(chain_id, d.asset), amount: formatUnits(d.raw, d.decimals) };
+    if (isLocalMode()) {
+      const sim = await localSimulate(chain_id, to as `0x${string}`, BigInt(valueRaw), data && data !== '0x' ? (data as `0x${string}`) : undefined);
+      return jsonResponse({ ...sim, ok: Boolean(sim.ok) && policy.ok, moves, policy: policy.ok ? 'ok' : policy.reason, mode: 'local' });
+    }
+    let returnData: string | null = null;
+    let callError: string | null = null;
+    try {
+      const r = (await api('/eth-call', 'POST', { chain_id, to, data: data || '0x' }, { 'X-AGW-SKIP-X402': 'true' })) as { result?: string };
+      returnData = typeof r?.result === 'string' ? r.result.slice(0, 2000) : null;
+    } catch (e) { callError = (e as Error).message; }
+    return jsonResponse({ ok: policy.ok && !callError, moves, policy: policy.ok ? 'ok' : policy.reason, return_data: returnData, call_error: callError, signed: false, broadcast: false, mode: 'hosted', note: 'Hosted mode cannot run the local guards; the hosted signer applies its own limits at send time.' });
+  },
+);
+
 // ─── Tool: wallet_mode ──────────────────────────────────────────
 
 tool(
@@ -2538,6 +3025,7 @@ tool(
         custody: 'agentwallet',
         signing: 'AgentWallet servers hold an encrypted key and sign on your behalf.',
         api_base: redactUrl(API_BASE),
+        spend_policy: POLICY.path ? { path: POLICY.path, sha256: POLICY.hash, name: POLICY.policy.name ?? null, ledger: POLICY.ledgerPath, see: 'spend_policy' } : 'none (AGENTWALLET_POLICY not set)',
         client_guards: {
           autopay_cap_usd: autopayEnvCap(),
           internal_autopay_armed: Boolean(X402_WALLET_ID),
@@ -2559,6 +3047,7 @@ tool(
       mode: 'local',
       custody: 'self',
       signing: 'Signed in this process. Keys are never sent to AgentWallet or anyone else.',
+      spend_policy: POLICY.path ? { path: POLICY.path, sha256: POLICY.hash, name: POLICY.policy.name ?? null, ledger: POLICY.ledgerPath, see: 'spend_policy' } : 'none (AGENTWALLET_POLICY not set; only the per-transaction caps apply)',
       max_autopay: autopayEnvCap(),
       max_autopay_per_hour: AUTOPAY_PER_HOUR,
       internal_autopay_armed: false, // internal auto-pay never runs in local mode

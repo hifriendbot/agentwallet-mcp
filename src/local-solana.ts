@@ -24,6 +24,7 @@ import {
 } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { lookupTrustedDecimals } from './x402-payment.js';
+import { openKeyfile } from './keyfile.js';
 
 /* ── Program IDs ─────────────────────────────────────────────────── */
 
@@ -89,7 +90,7 @@ export function getSolanaKeypair(): Keypair {
   let raw = inline;
   if (!raw && file) {
     try {
-      raw = readFileSync(file, 'utf8');
+      raw = openKeyfile(readFileSync(file, 'utf8')); // an encrypted keyfile is opened with the configured passphrase
     } catch (e) {
       throw new Error(`Could not read AGENTWALLET_SOLANA_KEYFILE at ${file}: ${(e as Error).message}`);
     }

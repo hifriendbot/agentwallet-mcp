@@ -74,7 +74,8 @@ Local signing uses [viem](https://viem.sh) for EVM and `@solana/web3.js` for Sol
 
 ## Features
 
-- **34 MCP tools**: create wallets, send transactions, approve tokens, wrap ETH, transfer SPL tokens, pay and accept x402 payments, verify custody mode, and more
+- **40 MCP tools**: create wallets, send transactions, approve tokens, wrap ETH, transfer SPL tokens, quote, discover, pay and accept x402 payments, verify custody mode, and more
+- **Spend policy**: rolling daily and monthly budgets, per-host ceilings, host and recipient lists, human approval through MCP elicitation, and a tool allowlist, in one JSON file, enforced from a hash-chained ledger. The key stays yours and the agent still cannot overspend.
 - **EVM + Solana**: Ethereum, Base, Polygon, BSC, Arbitrum, Optimism, Avalanche, Zora, PulseChain, Solana, and any other EVM-compatible chain
 - **SOL + SPL tokens**: native SOL transfers and SPL token transfers (USDC, USDT, etc.) with automatic account creation
 - **Built-in guards**: in hosted mode, daily spending limits, gas price protection, emergency pause and rate limiting are enforced server-side by default. In local mode your protection is the per-transaction caps you set (`AGENTWALLET_MAX_TX_NATIVE`, `AGENTWALLET_MAX_TX_TOKEN`, `AGENTWALLET_MAX_TX_SOL`, `AGENTWALLET_MAX_AUTOPAY`). x402 replay protection and on-chain verification apply either way
@@ -174,6 +175,12 @@ Add to your settings:
 | `wrap_eth` | Wrap native tokens to WETH/WAVAX/etc. |
 | `unwrap_eth` | Unwrap WETH back to native tokens |
 | `pay_x402` | Pay x402 invoices (exact via EIP-3009, upto via Permit2), with approvals above the cap |
+| `quote_x402` | What an x402 endpoint charges and whether the cap, policy and budgets would allow it; nothing signed |
+| `discover_x402` | Find x402-paid APIs by subject in the public x402 index (the Bazaar) |
+| `list_payments` | Spends on the ledger with their outcomes, newest first |
+| `export_receipts` | The ledger as CSV or JSONL for expense records |
+| `spend_policy` | The policy in force, its sha256, budgets spent and remaining, ledger integrity |
+| `simulate_transaction` | Dry-run an EVM transaction: guards, policy, gas estimate, fee, return data, nothing signed |
 | `check_approval` | Status of a human approval created by an over-cap `pay_x402` |
 | `approve_permit2` | One-time token approval to Permit2 for `upto` endpoints |
 | `check_token_risk` | Honeypot, tax, owner-power and holder-concentration flags for a token |
@@ -341,7 +348,52 @@ Which guards apply depends on who holds the key.
 - `AGENTWALLET_CHAIN_ID`: the EVM chain used when a call names none (default 8453)
 - `AGENTWALLET_LEGACY_PAYWALL_ORIGINS`: comma-separated https origins whose legacy-shaped 402 may be settled by an on-chain transfer proved by hash; every other host gets a signed authorization
 
+- `AGENTWALLET_POLICY`: a spend policy file (see below) that bounds sums, hosts, recipients, chains, assets and tools; `AGENTWALLET_LEDGER` names the ledger it is enforced from
+- `AGENTWALLET_KEYFILE_PASSPHRASE` or `AGENTWALLET_KEYFILE_PASSPHRASE_FILE`: opens an encrypted keyfile (see below)
+- `AGENTWALLET_WEBHOOK_URL` (https, or http on localhost) and `AGENTWALLET_WEBHOOK_SECRET`: every ledger line is POSTed as JSON, signed `X-AgentWallet-Signature: sha256=<hmac>` when a secret is set; a webhook never delays or fails a signature
+
 Every `AGENTWALLET_*` variable is validated at startup: a malformed cap stops the server rather than reading as "no limit", and an unrecognised name (a misspelled cap) stops it too. `wallet_mode` reports every guard with its parsed value. Tool arguments are strict: an unknown argument name (a typo in `max_payment`) is an error, never silently ignored. `pay_x402` signs one live authorization per resource; a second, different requirement for the same resource is refused until the first expires unless `fresh_authorization` is passed. Node.js 22.19 or newer is required.
+
+### Spend policy: bounding sums, not just single payments
+
+A per-transaction cap bounds one signature. It cannot see that the five hundredth payment of 0.99 under a cap of 1 is the five hundredth. A spend policy can. Point `AGENTWALLET_POLICY` at a JSON file:
+
+```json
+{
+  "version": 1,
+  "name": "research agent",
+  "budget": { "daily": "5", "monthly": "50" },
+  "native_budget": { "8453": { "daily": "0.01" } },
+  "hosts": { "allow": ["*.example.com", "api.ozdreamtools.de"], "deny": ["evil.example.com"] },
+  "per_host": { "*.example.com": { "daily": "2", "per_payment": "0.25" } },
+  "recipients": { "deny": ["0x0000000000000000000000000000000000000000"] },
+  "chains": { "allow": [8453, 900] },
+  "approval": { "above": "0.50", "max": "20" },
+  "tools": { "allow": ["pay_x402", "quote_x402", "discover_x402", "get_balance", "list_payments", "spend_policy", "wallet_mode"] }
+}
+```
+
+- **`budget`**: rolling dollar budgets (last 24 hours, last 30 days, lifetime) across every chain, counting x402 payments and stablecoin transfers in registry stablecoins. A spend the budget cannot price (a token outside the registry) is refused while a budget is set, unless `"unpriced_spends": "allow"`.
+- **`native_budget`**: the same per chain, in the chain's own coin.
+- **`hosts`**, **`per_host`**: which endpoints `pay_x402` may pay, and how much per host per day, per month and per payment. A denied host is never contacted, not even for a quote.
+- **`recipients`**: where funds may go (transfers, x402 `payTo`). The allow list covers funds destinations; contract targets (approve, wrap, arbitrary calldata) are checked against the deny list and the chain list.
+- **`chains`**, **`assets`**: allow lists; an asset entry can be scoped `"8453:0x..."` or be the word `native`.
+- **`approval`**: above `above`, every x402 payment is put to the human at the MCP client through [elicitation](https://modelcontextprotocol.io/specification/2025-06-18/client/elicitation) (the client shows the amount, token, recipient and resource and asks yes or no; a client that declared no elicitation support cannot answer, so the payment is refused). In local mode an accepted answer may admit a payment above the per-payment cap, up to `max`. Budgets are never lifted by anyone's approval.
+- **`tools`**: the tools the model sees. A payer-only deployment exposes seven; the rest are not registered. `wallet_mode` and `spend_policy` are always present so the operator can see what the server is.
+
+An unknown key stops the server, so a misspelled `budgets` cannot run unbounded. `spend_policy` reports the file, its sha256 (compare it with the file you reviewed), what each budget has spent and has left, and which tools the policy hid. `quote_x402` answers "would this be paid?" for a URL before anything is signed.
+
+**The ledger.** Budgets are enforced from an append-only, hash-chained JSONL file (`AGENTWALLET_LEDGER`, or the policy's `ledger`, or `agentwallet-ledger.jsonl` beside the policy when a budget needs one). A spend is reserved on it before the signature exists; a reservation whose signing fails is voided by a later line; the endpoint's or chain's answer is settled onto it afterwards. On startup the chain is verified, and a ledger that does not verify refuses every spend until the operator has looked at it. `list_payments` reads it, `export_receipts` turns it into CSV or JSONL, and `AGENTWALLET_WEBHOOK_URL` receives every line as it is written.
+
+### Encrypted keyfiles
+
+A plaintext key in a shell config or a file is readable by anything that can read the disk. Seal it:
+
+```bash
+npx agentwallet-mcp encrypt-keyfile ./plain.key ./agent.keyfile
+```
+
+The passphrase is asked for on the terminal (or taken from `AGENTWALLET_KEYFILE_PASSPHRASE` for scripted use); scrypt derives the key and AES-256-GCM seals the material, with Node's own crypto and no new dependency. Point `AGENTWALLET_KEYFILE` or `AGENTWALLET_SOLANA_KEYFILE` at the result, set `AGENTWALLET_KEYFILE_PASSPHRASE` or `AGENTWALLET_KEYFILE_PASSPHRASE_FILE`, confirm with `wallet_mode` that the same address appears, then delete the plaintext. A wrong passphrase fails with a fixed message that never includes the key.
 
 **Either mode**, for x402 paywalls you run through the hosted API:
 
