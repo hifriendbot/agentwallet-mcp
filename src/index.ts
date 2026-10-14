@@ -163,8 +163,43 @@ function usdOf(chainId: number, asset: string, raw: string, decimals: number): s
   return autopayAssetAllowed(chainId, asset).via === 'stablecoin' ? policyHuman(rawToUnits(raw, decimals)) : null;
 }
 
-/** Decode the spend a /send body describes: native value, an ERC-20 transfer, or an SPL transfer. */
-async function describeSend(body: Record<string, unknown>, chainId: number): Promise<{ kind: 'native' | 'token' | 'spl' | 'contract'; to: string; asset: string; raw: string; decimals: number }> {
+/**
+ * What a /send body does with the wallet's funds, as the policy sees it.
+ *
+ * - native: value to an account.
+ * - token: an ERC-20 value mover (transfer, transferFrom, transferAndCall,
+ *   ERC-777 send and operatorSend); `to` is the recipient, `asset` the token.
+ * - approval: a standing allowance (approve, increaseAllowance, approveAndCall,
+ *   Permit2.approve); `to` is the spender, `asset` the token. An allowance is a
+ *   spend the spender executes later, so it is priced and budgeted when it is
+ *   granted. Before 1.14.1 only `transfer` was decoded and an approval fell
+ *   through to 'contract', outside every budget (reported privately 2026-10-14).
+ * - spl: a Solana token transfer.
+ * - contract: anything else; `raw` is the native value it carries, which is a
+ *   spend to that contract (wrap_eth, or send_transaction with value and data).
+ *
+ * `unbounded` marks an approval of 2^128 base units or more: no budget can
+ * count it, so under a policy it is refused rather than reserved.
+ */
+type DescribedSend = { kind: 'native' | 'token' | 'approval' | 'spl' | 'contract'; to: string; asset: string; raw: string; decimals: number; unbounded?: boolean };
+
+/* Calldata the policy prices: which word holds the amount, which the recipient
+   or spender, and for Permit2.approve which the token (there `to` is Permit2).
+   The same functions the local token cap prices, so the two guards agree. */
+const SPEND_LAYOUTS: Record<string, { kind: 'token' | 'approval'; what: string; toIndex: number; amountIndex: number; tokenIndex?: number; permit2Only?: boolean }> = {
+  a9059cbb: { kind: 'token', what: 'transfer', toIndex: 0, amountIndex: 1 },                      // transfer(address,uint256)
+  '23b872dd': { kind: 'token', what: 'transferFrom', toIndex: 1, amountIndex: 2 },                // transferFrom(address,address,uint256)
+  '4000aea0': { kind: 'token', what: 'transferAndCall', toIndex: 0, amountIndex: 1 },             // transferAndCall(address,uint256,bytes)
+  '9bd9bbc6': { kind: 'token', what: 'ERC-777 send', toIndex: 0, amountIndex: 1 },                // send(address,uint256,bytes)
+  '62ad1b83': { kind: 'token', what: 'ERC-777 operatorSend', toIndex: 1, amountIndex: 2 },        // operatorSend(address,address,uint256,bytes,bytes)
+  '095ea7b3': { kind: 'approval', what: 'approve', toIndex: 0, amountIndex: 1 },                  // approve(address,uint256)
+  '39509351': { kind: 'approval', what: 'increaseAllowance', toIndex: 0, amountIndex: 1 },        // increaseAllowance(address,uint256)
+  cae9ca51: { kind: 'approval', what: 'approveAndCall', toIndex: 0, amountIndex: 1 },             // approveAndCall(address,uint256,bytes)
+  '87517c45': { kind: 'approval', what: 'Permit2 approve', toIndex: 1, amountIndex: 2, tokenIndex: 0, permit2Only: true }, // Permit2.approve(address,address,uint160,uint48)
+};
+const UNBOUNDED_APPROVAL = 1n << 128n;
+
+async function describeSend(body: Record<string, unknown>, chainId: number): Promise<DescribedSend> {
   if (body.token_mint) {
     const mint = String(body.token_mint);
     const d = Number(body.token_decimals);
@@ -172,13 +207,81 @@ async function describeSend(body: Record<string, unknown>, chainId: number): Pro
   }
   const data = String(body.data || '');
   const to = String(body.to || '');
-  if (!isSolanaChain(chainId) && /^0xa9059cbb[0-9a-fA-F]{128}$/.test(data)) {
-    const recipient = '0x' + data.slice(34, 74);
-    const raw = BigInt('0x' + data.slice(74, 138)).toString();
-    return { kind: 'token', to: recipient, asset: to, raw, decimals: await resolveTrustedDecimals(chainId, to) };
+  const value = String(body.value ?? '0');
+  if (!isSolanaChain(chainId) && /^0x[0-9a-fA-F]{8}/.test(data)) {
+    const layout = SPEND_LAYOUTS[data.slice(2, 10).toLowerCase()];
+    const isPermit2 = to.toLowerCase() === permit2Address(chainId).toLowerCase();
+    if (layout && (!layout.permit2Only || isPermit2)) {
+      // A short word is refused, never read as "not a transfer after all": the
+      // local guard treats truncated calldata the same way, for the same reason.
+      const wordAt = (i: number): string => {
+        const w = data.slice(10 + i * 64, 10 + (i + 1) * 64);
+        if (w.length !== 64) throw new Error(`policy: calldata for ${layout.what} is truncated (word ${i} has ${w.length / 2} bytes, expected 32); refused rather than treated as a plain contract call. Nothing was signed.`);
+        return w;
+      };
+      const token = layout.tokenIndex === undefined ? to : '0x' + wordAt(layout.tokenIndex).slice(24);
+      const counterparty = '0x' + wordAt(layout.toIndex).slice(24);
+      const amount = BigInt('0x' + wordAt(layout.amountIndex));
+      if (layout.kind === 'approval' && amount >= UNBOUNDED_APPROVAL) {
+        return { kind: 'approval', to: counterparty, asset: token, raw: amount.toString(), decimals: 0, unbounded: true };
+      }
+      // Decimals matter here only to price a registry stablecoin (resolved
+      // offline) and to print the ledger amount. A token the registry and the
+      // node cannot place is unpriced whatever its decimals, so a failed lookup
+      // is evaluated at 0 (the fail-closed figure the local cap uses) and the
+      // call goes on to the local guard or the hosted signer, which refuse on
+      // their own terms (audit-11312: transferAndCall on a not-a-token target).
+      let decimals = 0;
+      try { decimals = await resolveTrustedDecimals(chainId, token); } catch { decimals = 0; }
+      return { kind: layout.kind, to: counterparty, asset: token, raw: amount.toString(), decimals };
+    }
   }
-  if (data && data !== '0x') return { kind: 'contract', to, asset: '', raw: String(body.value ?? '0'), decimals: nativeDecimals(chainId) };
-  return { kind: 'native', to, asset: '', raw: String(body.value ?? '0'), decimals: nativeDecimals(chainId) };
+  if (data && data !== '0x') return { kind: 'contract', to, asset: '', raw: value, decimals: nativeDecimals(chainId) };
+  return { kind: 'native', to, asset: '', raw: value, decimals: nativeDecimals(chainId) };
+}
+
+/** The ledger method a decoded send is recorded under, unless the caller named one. */
+function methodOf(kind: DescribedSend['kind']): SpendMethod {
+  return kind === 'spl' ? 'spl' : kind === 'token' ? 'transfer' : kind === 'approval' ? 'approval' : 'native';
+}
+
+/**
+ * The list checks every send gets before anything is reserved: the chain, and
+ * for a contract call or an approval the contract itself against the deny
+ * list (an approval's contract is the token; its spender is checked as a
+ * recipient when the spend is reserved). Throws the refusal.
+ */
+function assertSendTarget(d: DescribedSend, chainId: number): void {
+  const c = chainAllowed(POL(), chainId);
+  if (!c.ok) throw new Error(c.reason + ' Nothing was signed.');
+  if (d.kind === 'contract' || d.kind === 'approval') {
+    const t = targetAllowed(POL(), d.kind === 'approval' ? d.asset : d.to);
+    if (!t.ok) throw new Error(t.reason + ' Nothing was signed.');
+  }
+}
+
+/**
+ * The spend a decoded send makes against the policy, or null when nothing
+ * leaves the wallet: a zero-value contract call can only pull what an
+ * approval already granted, and approvals are counted when they are granted.
+ * An approval's recipient is its spender, so recipients.allow and .deny bind
+ * who may be allowed to pull; the native value of a contract call is a spend
+ * to that contract. Throws for an unbounded approval under a policy.
+ */
+function spendInputOf(d: DescribedSend, chainId: number, tool: string, wallet: string, ctx: { host?: string; resource?: string; method?: SpendMethod } = {}): ReserveInput | null {
+  if (d.kind === 'contract' && BigInt(d.raw) === 0n) return null;
+  if (d.kind === 'approval' && d.unbounded && POLICY.path) {
+    throw new Error(
+      `policy: an unlimited approval of ${assetLabel(chainId, d.asset)} to ${d.to} cannot be counted against any budget, and under a spend policy every approval is a bounded spend. ` +
+      `Approve an exact amount instead. Nothing was signed.`
+    );
+  }
+  return {
+    tool, mode: anyLocalMode() ? 'local' : 'hosted', wallet: anyLocalMode() ? 'local' : wallet, chainId,
+    asset: d.asset, assetLabel: assetLabel(chainId, d.asset), raw: d.raw, decimals: d.decimals,
+    usd: d.unbounded ? null : usdOf(chainId, d.asset, d.raw, d.decimals),
+    to: d.to, host: ctx.host ?? null, resource: ctx.resource ?? null, method: ctx.method ?? methodOf(d.kind),
+  };
 }
 
 // ─── Configuration ──────────────────────────────────────────────
@@ -428,9 +531,11 @@ async function api(path: string, method = 'GET', body?: Record<string, unknown>,
   /* Spend policy at the one choke point every broadcast funds path passes
      through (transfer, transfer_token, send_transaction, wrap, approve, the
      x402 broadcast paths, hosted auto-pay): the body is decoded into what it
-     moves, checked against the policy, reserved in the ledger before anything
-     is signed, and settled or voided afterwards. X-AGW-CTX carries the calling
-     tool's context for the ledger and never leaves this process. */
+     moves or allows, checked against the policy, reserved in the ledger before
+     anything is signed, and settled or voided afterwards. Approvals and the
+     native value of a contract call are spends too (1.14.1); only a zero-value
+     contract call reserves nothing. X-AGW-CTX carries the calling tool's
+     context for the ledger and never leaves this process. */
   let ctx: { tool?: string; host?: string; resource?: string; method?: SpendMethod } = {};
   if (extraHeaders && extraHeaders['X-AGW-CTX'] !== undefined) {
     try { ctx = JSON.parse(extraHeaders['X-AGW-CTX']); } catch { ctx = {}; }
@@ -442,18 +547,9 @@ async function api(path: string, method = 'GET', body?: Record<string, unknown>,
   if (method === 'POST' && m && body) {
     const chainId = localChainId(body, new URLSearchParams(path.split('?')[1] || ''));
     const d = await describeSend(body, chainId);
-    if (d.kind === 'contract') {
-      const c = chainAllowed(POL(), chainId);
-      if (!c.ok) throw new Error(c.reason + ' Nothing was signed.');
-      const t = targetAllowed(POL(), d.to);
-      if (!t.ok) throw new Error(t.reason + ' Nothing was signed.');
-    } else {
-      reserved = reserveSpend({
-        tool: ctx.tool || 'send', mode: anyLocalMode() ? 'local' : 'hosted', wallet: anyLocalMode() ? 'local' : m[1], chainId,
-        asset: d.asset, assetLabel: assetLabel(chainId, d.asset), raw: d.raw, decimals: d.decimals, usd: usdOf(chainId, d.asset, d.raw, d.decimals),
-        to: d.to, host: ctx.host ?? null, resource: ctx.resource ?? null, method: ctx.method ?? (d.kind === 'spl' ? 'spl' : d.kind === 'token' ? 'transfer' : 'native'),
-      });
-    }
+    assertSendTarget(d, chainId);
+    const input = spendInputOf(d, chainId, ctx.tool || 'send', m[1], ctx);
+    if (input) reserved = reserveSpend(input);
   }
   try {
     const out = await apiInner(path, method, body, extraHeaders);
@@ -1118,7 +1214,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.14.0',
+    version: '1.14.1',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()
@@ -1535,7 +1631,8 @@ tool(
   'approve_token',
   'Approve a spender contract to transfer ERC-20 tokens on your behalf. ' +
     'Required before interacting with any DeFi protocol (DEXs, lending, etc.). ' +
-    'Use amount "max" for unlimited approval, or specify an exact amount.',
+    'Use amount "max" for unlimited approval, or specify an exact amount. ' +
+    'Under a spend policy an approval is a spend: it counts against the budgets, the spender is checked as a recipient, and "max" is refused.',
   {
     wallet_id: z.number().int().describe('Wallet ID'),
     token: z.string().regex(/^0x[a-fA-F0-9]{40}$/).describe('ERC-20 token contract address'),
@@ -2482,7 +2579,7 @@ tool(
   'approve_permit2',
   'One-time ERC-20 approval of a token to the Permit2 contract, needed before paying x402 "upto" endpoints with that token. ' +
     'A normal on-chain transaction (needs gas). By default approves the maximum, the ecosystem norm, so it never has to be repeated; ' +
-    'pass amount to grant a bounded allowance instead (required under AGENTWALLET_MAX_TX_TOKEN, which refuses a max approval). ' +
+    'pass amount to grant a bounded allowance instead (required under AGENTWALLET_MAX_TX_TOKEN and under a spend policy, both of which refuse a max approval; under a policy the allowance counts against the budgets). ' +
     'Permit2 itself only moves what each signed authorization allows.',
   {
     wallet_id: z.number().int().describe('Wallet ID'),
@@ -2993,10 +3090,19 @@ tool(
     if (isSolanaChain(chain_id)) throw new Error('simulate_transaction is EVM-only.');
     const valueRaw = parseUnits(value, 18);
     const d = await describeSend({ to, value: valueRaw, data: data || '', chain_id }, chain_id);
-    const policy = d.kind === 'contract'
-      ? (() => { for (const r of [chainAllowed(POL(), chain_id), targetAllowed(POL(), d.to)]) if (!r.ok) return r; return { ok: true as const }; })()
-      : spendVerdict({ tool: 'simulate_transaction', mode: anyLocalMode() ? 'local' : 'hosted', wallet: anyLocalMode() ? 'local' : String(wallet_id), chainId: chain_id, asset: d.asset, assetLabel: assetLabel(chain_id, d.asset), raw: d.raw, decimals: d.decimals, usd: usdOf(chain_id, d.asset, d.raw, d.decimals), to: d.to, host: null, resource: null, method: d.kind === 'token' ? 'transfer' : 'native' });
-    const moves = { kind: d.kind, to: d.to, asset: d.asset || 'native', asset_label: assetLabel(chain_id, d.asset), amount: formatUnits(d.raw, d.decimals) };
+    // The same gate the send path runs, with nothing recorded.
+    const policy: { ok: true } | { ok: false; reason: string } = (() => {
+      try {
+        assertSendTarget(d, chain_id);
+        const input = spendInputOf(d, chain_id, 'simulate_transaction', String(wallet_id));
+        return input ? spendVerdict(input) : { ok: true as const };
+      } catch (e) { return { ok: false as const, reason: (e as Error).message }; }
+    })();
+    const moves = {
+      kind: d.kind, to: d.to, asset: d.asset || 'native', asset_label: assetLabel(chain_id, d.asset),
+      amount: d.unbounded ? 'unlimited' : formatUnits(d.raw, d.decimals),
+      ...(d.kind === 'approval' ? { note: 'an approval: `to` is the spender being allowed to pull `amount` of `asset`' } : {}),
+    };
     if (isLocalMode()) {
       const sim = await localSimulate(chain_id, to as `0x${string}`, BigInt(valueRaw), data && data !== '0x' ? (data as `0x${string}`) : undefined);
       return jsonResponse({ ...sim, ok: Boolean(sim.ok) && policy.ok, moves, policy: policy.ok ? 'ok' : policy.reason, mode: 'local' });

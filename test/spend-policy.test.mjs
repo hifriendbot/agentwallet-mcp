@@ -277,11 +277,16 @@ const stdioLedger = join(dir, 'stdio-ledger.jsonl');
 writeFileSync(policyFile, JSON.stringify({
   version: 1, name: 'test policy',
   budget: { daily: '5' },
+  native_budget: { 8453: { daily: '0.01' } },
   hosts: { deny: ['denied.example.com'] },
   recipients: { deny: [OTHER] },
   tools: { deny: ['delete_wallet', 'create_paywall'] },
 }, null, 2));
-const baseEnv = { AGENTWALLET_PRIVATE_KEY: TEST_KEY, AGENTWALLET_API_URL: DEAD_API, AGENTWALLET_RPC_8453: DEAD_RPC, AGENTWALLET_POLICY: policyFile, AGENTWALLET_LEDGER: stdioLedger, AGENTWALLET_MAX_TX_TOKEN: '100' };
+// AGENTWALLET_TOKEN_RISK=0: approve_token would otherwise ask GoPlus over the network before the policy runs.
+const baseEnv = { AGENTWALLET_PRIVATE_KEY: TEST_KEY, AGENTWALLET_API_URL: DEAD_API, AGENTWALLET_RPC_8453: DEAD_RPC, AGENTWALLET_POLICY: policyFile, AGENTWALLET_LEDGER: stdioLedger, AGENTWALLET_MAX_TX_TOKEN: '100', AGENTWALLET_TOKEN_RISK: '0' };
+const WETH_BASE = '0x4200000000000000000000000000000000000006';
+const pad32 = (hex) => hex.replace(/^0x/, '').toLowerCase().padStart(64, '0');
+const approveCalldata = (spender, raw) => '0x095ea7b3' + pad32(spender) + BigInt(raw).toString(16).padStart(64, '0');
 
 // Seed the ledger with a settled 4-dollar spend so the day has 1 dollar left before the server starts.
 {
@@ -302,6 +307,18 @@ const run = await callTools([
   { name: 'export_receipts', arguments: { format: 'csv' } },
   { name: 'simulate_transaction', arguments: { wallet_id: 1, to: OTHER, value: '0.001', chain_id: 8453 } },
   { name: 'delete_wallet', arguments: { wallet_id: 1, confirm: 'DELETE' } },
+  // 1.14.1: approvals and the native value of contract calls are spends (reported privately 2026-10-14).
+  { name: 'approve_token', arguments: { wallet_id: 1, token: USDC_BASE, spender: DEAD, amount: 'max', chain_id: 8453 } },          // 111
+  { name: 'approve_token', arguments: { wallet_id: 1, token: USDC_BASE, spender: DEAD, amount: '50', chain_id: 8453 } },           // 112
+  { name: 'approve_token', arguments: { wallet_id: 1, token: USDC_BASE, spender: OTHER, amount: '0.5', chain_id: 8453 } },         // 113
+  { name: 'approve_permit2', arguments: { wallet_id: 1, token: USDC_BASE, chain_id: 8453 } },                                       // 114
+  { name: 'send_transaction', arguments: { wallet_id: 1, to: DEAD, value: '1000000000000000000', data: '0x12345678', chain_id: 8453 } }, // 115
+  { name: 'wrap_eth', arguments: { wallet_id: 1, amount: '0.02', chain_id: 8453 } },                                                 // 116
+  { name: 'wrap_eth', arguments: { wallet_id: 1, amount: '0.005', chain_id: 8453 } },                                                // 117
+  { name: 'approve_token', arguments: { wallet_id: 1, token: USDC_BASE, spender: DEAD, amount: '0.25', chain_id: 8453 } },         // 118
+  { name: 'simulate_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '0', data: approveCalldata(DEAD, (1n << 256n) - 1n), chain_id: 8453 } }, // 119
+  { name: 'simulate_transaction', arguments: { wallet_id: 1, to: DEAD, value: '0.02', data: '0x12345678', chain_id: 8453 } },     // 120
+  { name: 'send_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '0', data: '0x095ea7b3' + pad32(DEAD) + 'ff', chain_id: 8453 } }, // 121
 ], baseEnv, { listTools: true, waitMs: 15000 });
 const byId = (id) => run.responses.find((r) => r.id === id);
 
@@ -372,6 +389,67 @@ check('the on-disk ledger chain is intact after the session and the void is reco
   const after = new Ledger(stdioLedger);
   assert.equal(after.integrity, null);
   assert.equal(human(after.spentUsd().daily), '4');
+});
+
+console.log('\n1.14.1: approvals and contract calls with value are spends under the policy\n');
+
+check('approve_token "max" is refused under a policy before any RPC call (reported 2026-10-14: approvals bypassed every budget)', () => {
+  const t = rawText(byId(111));
+  assert.match(t, /unlimited approval of USDC .* cannot be counted against any budget/);
+  assert.match(t, /Nothing was signed/);
+  assert.ok(!/RPC node answered|ECONNREFUSED/.test(t), 'no RPC was contacted');
+});
+check('a bounded approval above the remaining daily budget is refused by the budget', () => {
+  assert.match(rawText(byId(112)), /daily budget of 5 would be exceeded/);
+});
+check('an approval to a denied address is refused: the spender is a recipient', () => {
+  assert.match(rawText(byId(113)), /policy denies recipient/);
+});
+check('approve_permit2 with no amount is an unlimited approval and is refused under a policy', () => {
+  assert.match(rawText(byId(114)), /unlimited approval of USDC/);
+});
+check('send_transaction with calldata AND native value counts the value against native_budget', () => {
+  assert.match(rawText(byId(115)), /native_budget\.8453 daily budget of 0\.01 would be exceeded/);
+});
+check('wrap_eth above the native budget is refused (deposit() carries its amount as value)', () => {
+  assert.match(rawText(byId(116)), /native_budget\.8453 daily budget of 0\.01 would be exceeded/);
+});
+check('simulate_transaction reports an unlimited approval as a policy refusal and signs nothing', () => {
+  const s = textOf(byId(119));
+  assert.equal(s.ok, false);
+  assert.equal(s.moves.kind, 'approval');
+  assert.equal(s.moves.to.toLowerCase(), DEAD.toLowerCase());
+  assert.equal(s.moves.amount, 'unlimited');
+  assert.match(s.policy, /unlimited approval/);
+  assert.equal(s.signed, false);
+});
+check('simulate_transaction reports the native budget for a contract call with value', () => {
+  const s = textOf(byId(120));
+  assert.equal(s.ok, false);
+  assert.equal(s.moves.kind, 'contract');
+  assert.match(s.policy, /native_budget\.8453/);
+});
+check('truncated approve calldata is refused, not reclassified as a plain contract call', () => {
+  assert.match(rawText(byId(121)), /calldata for approve is truncated/);
+});
+const third = await callTools([{ name: 'list_payments', arguments: { limit: 20 } }], baseEnv, { waitMs: 7000 });
+check('an approval and a wrap inside the budgets are reserved on the ledger (then voided by the dead RPC)', () => {
+  const lp = textOf(third.responses.find((x) => x.id === 100));
+  const appr = lp.payments.find((p) => p.method === 'approval');
+  assert.ok(appr, 'the 0.25 approval is on the ledger');
+  assert.equal(appr.amount, '0.25');
+  assert.equal(appr.usd, '0.25');
+  assert.equal(appr.to.toLowerCase(), DEAD.toLowerCase());
+  assert.equal(appr.asset.toLowerCase(), USDC_BASE.toLowerCase());
+  assert.equal(appr.outcome, 'void');
+  const wrap = lp.payments.find((p) => p.amount === '0.005');
+  assert.ok(wrap, 'the 0.005 wrap is on the ledger');
+  assert.equal(wrap.asset, '');
+  assert.equal(wrap.method, 'native');
+  assert.equal(wrap.to.toLowerCase(), WETH_BASE.toLowerCase());
+  assert.equal(wrap.outcome, 'void');
+  const after = new Ledger(stdioLedger);
+  assert.equal(after.integrity, null);
 });
 
 console.log('\nStartup refusals and the encrypted keyfile over stdio\n');

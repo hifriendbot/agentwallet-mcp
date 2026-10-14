@@ -16,7 +16,8 @@ import { appendFileSync, existsSync, readFileSync, openSync, closeSync } from 'n
 import { createHash, createHmac } from 'node:crypto';
 import { DAY_MS, MONTH_MS, type Spent, units, rawToUnits, human } from './policy.js';
 
-export type SpendMethod = 'eip3009' | 'permit2' | 'transfer' | 'native' | 'spl' | 'autopay';
+/** 'approval' is an ERC-20 allowance granted (approve, increaseAllowance, Permit2.approve): a spend the spender executes later, counted when granted. */
+export type SpendMethod = 'eip3009' | 'permit2' | 'transfer' | 'native' | 'spl' | 'autopay' | 'approval';
 export interface SpendEntry {
   seq: number;
   ts: string;
