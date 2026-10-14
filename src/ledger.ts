@@ -3,16 +3,20 @@
  * process reserved, and what became of it.
  *
  * Budgets are enforced from it, so a reservation is written BEFORE the
- * signature exists: check and append happen in one synchronous step, which in
- * a single-threaded process means two concurrent calls cannot both fit the
- * last dollar. A reservation whose signing fails is voided by a later line;
- * the spend line itself is never edited, so the chain stays verifiable.
+ * signature exists. Check and append happen in one step under an exclusive
+ * lock file, after the file has been re-read and the chain re-verified, so
+ * two concurrent calls cannot both fit the last dollar, whether they come
+ * from one process or from several agentwallet-mcp processes sharing the
+ * file (two MCP clients configured with the same wallet and ledger). A
+ * reservation whose signing fails is voided by a later line; the spend line
+ * itself is never edited, so the chain stays verifiable.
  *
  * Each line carries the sha256 of the previous line's hash plus its own body.
- * On load the chain is verified; a broken chain with a budget configured
- * refuses every spend until the operator looks at the file.
+ * The chain is verified on every read; a broken chain with a budget
+ * configured refuses every spend until the operator looks at the file, and a
+ * file that no longer holds what this process wrote is refused the same way.
  */
-import { appendFileSync, existsSync, readFileSync, openSync, closeSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, openSync, closeSync, writeSync, unlinkSync, statSync } from 'node:fs';
 import { createHash, createHmac } from 'node:crypto';
 import { DAY_MS, MONTH_MS, type Spent, units, rawToUnits, human } from './policy.js';
 
@@ -56,9 +60,37 @@ export type Entry = SpendEntry | FollowEntry;
 
 const GENESIS = '0'.repeat(64);
 const MAX_LINE = 16 * 1024;
+/** How long a spend waits for another process to finish its own check-and-append. */
+const LOCK_WAIT_MS = 10_000;
+/** A lock older than this was left by a process that died holding it. */
+const LOCK_STALE_MS = 30_000;
+const sleeper = new Int32Array(new SharedArrayBuffer(4));
+function sleepSync(ms: number): void { Atomics.wait(sleeper, 0, 0, ms); }
 
 function hashOf(prev: string, body: Record<string, unknown>): string {
   return createHash('sha256').update(prev + '\n' + JSON.stringify(body)).digest('hex');
+}
+
+interface Chain { entries: Entry[]; last: string; seq: number; integrity: string | null }
+
+/** Parse and verify a ledger file's text. A trailing line without its newline is still being written by another process and is not read. */
+function parseChain(text: string): Chain {
+  const complete = text.endsWith('\n') || !text.includes('\n') && text.trim() === '' ? text : text.slice(0, text.lastIndexOf('\n') + 1);
+  const lines = complete.split('\n').filter(l => l.trim());
+  const out: Chain = { entries: [], last: GENESIS, seq: 0, integrity: null };
+  let prev = GENESIS;
+  for (let i = 0; i < lines.length; i++) {
+    let e: Entry;
+    try { e = JSON.parse(lines[i]); } catch { out.integrity = `line ${i + 1} is not JSON`; break; }
+    const { hash, ...body } = e as Entry & Record<string, unknown>;
+    if (e.prev !== prev || hashOf(prev, body) !== hash) { out.integrity = `chain broken at line ${i + 1} (seq ${e.seq})`; break; }
+    if (e.seq !== out.seq + 1) { out.integrity = `sequence gap at line ${i + 1}`; break; }
+    out.entries.push(e);
+    out.seq = e.seq;
+    prev = hash;
+  }
+  out.last = prev;
+  return out;
 }
 
 export interface ReserveInput {
@@ -74,41 +106,73 @@ export interface Limits {
   unpriced: 'refuse' | 'allow';
 }
 
+export interface LedgerOptions {
+  /** Tests shorten the wait for a held lock. */
+  lockWaitMs?: number;
+}
+
 export class Ledger {
   readonly path: string | null;
   private entries: Entry[] = [];
   private last = GENESIS;
   private seq = 0;
-  /** null = intact; otherwise what broke. */
+  /** null = intact; otherwise what broke. Refreshed from the file on every read. */
   integrity: string | null = null;
   private webhook: { url: string; secret: string } | null = null;
+  private lockWaitMs = LOCK_WAIT_MS;
 
-  constructor(path: string | null, webhook?: { url: string; secret: string } | null) {
+  constructor(path: string | null, webhook?: { url: string; secret: string } | null, opts?: LedgerOptions) {
     this.path = path;
     this.webhook = webhook ?? null;
-    if (path) this.load();
+    if (opts?.lockWaitMs !== undefined) this.lockWaitMs = opts.lockWaitMs;
+    if (path) {
+      // Create it now so a permissions problem shows at startup, not at the first spend.
+      if (!existsSync(path)) closeSync(openSync(path, 'a', 0o600));
+      this.sync();
+    }
   }
 
-  private load(): void {
-    if (!existsSync(this.path!)) {
-      // Create it now so a permissions problem shows at startup, not at the first spend.
-      closeSync(openSync(this.path!, 'a', 0o600));
+  /**
+   * Re-read the file so the sums include what every other process wrote.
+   * The file must still begin with what this process has seen, line for
+   * line; otherwise it was rewritten underneath us and nothing is adopted.
+   */
+  private sync(): void {
+    if (!this.path) return;
+    if (!existsSync(this.path)) { this.integrity = `the file was removed while this process was running (it held seq ${this.seq})`; return; }
+    const c = parseChain(readFileSync(this.path, 'utf8'));
+    const n = this.entries.length;
+    if (c.entries.length < n || (n > 0 && c.entries[n - 1].hash !== this.last)) {
+      this.integrity = c.integrity && c.entries.length < n ? c.integrity : `the file was rewritten underneath this process (it held seq ${this.seq} ending ${this.last.slice(0, 12)}, the file now ends at seq ${c.seq})`;
       return;
     }
-    const text = readFileSync(this.path!, 'utf8');
-    const lines = text.split('\n').filter(l => l.trim());
-    let prev = GENESIS;
-    for (let i = 0; i < lines.length; i++) {
-      let e: Entry;
-      try { e = JSON.parse(lines[i]); } catch { this.integrity = `line ${i + 1} is not JSON`; break; }
-      const { hash, ...body } = e as Entry & Record<string, unknown>;
-      if (e.prev !== prev || hashOf(prev, body) !== hash) { this.integrity = `chain broken at line ${i + 1} (seq ${e.seq})`; break; }
-      if (e.seq !== this.seq + 1) { this.integrity = `sequence gap at line ${i + 1}`; break; }
-      this.entries.push(e);
-      this.seq = e.seq;
-      prev = hash;
+    this.entries = c.entries;
+    this.seq = c.seq;
+    this.last = c.last;
+    this.integrity = c.integrity;
+  }
+
+  /** Take the exclusive lock file; returns the release. A lock a dead process left behind is cleared after LOCK_STALE_MS. */
+  private lock(): () => void {
+    if (!this.path) return () => {};
+    const lockPath = this.path + '.lock';
+    const deadline = Date.now() + this.lockWaitMs;
+    for (;;) {
+      try {
+        const fd = openSync(lockPath, 'wx', 0o600);
+        try { writeSync(fd, `${process.pid} ${new Date().toISOString()}\n`); } finally { closeSync(fd); }
+        return () => { try { unlinkSync(lockPath); } catch { /* already gone */ } };
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+      }
+      try {
+        if (Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS) { unlinkSync(lockPath); continue; }
+      } catch { continue; /* released between the two calls */ }
+      if (Date.now() >= deadline) {
+        throw new Error(`The ledger at ${this.path} is locked by another agentwallet-mcp process (${lockPath}) that did not finish within ${this.lockWaitMs} ms. Nothing was signed. If no other process is running, remove the lock file.`);
+      }
+      sleepSync(5);
     }
-    this.last = prev;
   }
 
   private append(body: Omit<Entry, 'hash' | 'prev' | 'seq' | 'ts'> & Record<string, unknown>): Entry {
@@ -144,11 +208,19 @@ export class Ledger {
     return this.entries.filter((e): e is SpendEntry => e.kind === 'spend' && !voided.has(e.seq));
   }
 
-  /** Dollar sums over rolling windows; nowMs for tests. */
+  /** Dollar sums over rolling windows from a fresh read of the file; nowMs for tests. */
   spentUsd(nowMs = Date.now(), host?: string): Spent {
-    return this.sum(nowMs, e => (host === undefined || e.host === host) && e.usd !== null ? units(e.usd!) : 0n);
+    this.sync();
+    return this.sumUsd(nowMs, host);
   }
   spentNative(chainId: number, nowMs = Date.now()): Spent {
+    this.sync();
+    return this.sumNative(chainId, nowMs);
+  }
+  private sumUsd(nowMs: number, host?: string): Spent {
+    return this.sum(nowMs, e => (host === undefined || e.host === host) && e.usd !== null ? units(e.usd!) : 0n);
+  }
+  private sumNative(chainId: number, nowMs: number): Spent {
     return this.sum(nowMs, e => e.chain_id === chainId && e.asset === '' ? rawToUnits(e.raw, nativeDecimalsOf(chainId)) : 0n);
   }
   private sum(nowMs: number, f: (e: SpendEntry) => bigint): Spent {
@@ -164,12 +236,17 @@ export class Ledger {
     return out;
   }
 
-  /** Would this spend fit every limit? The reason names the first it does not. */
+  /** Would this spend fit every limit, given what every process has written so far? The reason names the first limit it does not. */
   check(input: ReserveInput, limits: Limits, nowMs = Date.now()): { ok: true } | { ok: false; reason: string } {
+    this.sync();
+    return this.evaluate(input, limits, nowMs);
+  }
+
+  private evaluate(input: ReserveInput, limits: Limits, nowMs: number): { ok: true } | { ok: false; reason: string } {
     if (this.integrity) return { ok: false, reason: `The ledger at ${this.path} is not intact (${this.integrity}); every spend is refused until the operator has looked at it.` };
     const amount18 = rawToUnits(input.raw, input.decimals);
     if (input.asset === '') {
-      const r = refusal(limits.native, this.spentNative(input.chainId, nowMs), amount18, `native_budget.${input.chainId}`);
+      const r = refusal(limits.native, this.sumNative(input.chainId, nowMs), amount18, `native_budget.${input.chainId}`);
       if (r) return { ok: false, reason: r };
     } else if (input.usd === null) {
       if (limits.unpriced === 'refuse' && (limits.usd || limits.host)) {
@@ -178,41 +255,52 @@ export class Ledger {
     }
     if (input.usd !== null) {
       const usd18 = units(input.usd);
-      const r = refusal(limits.usd, this.spentUsd(nowMs), usd18, 'budget');
+      const r = refusal(limits.usd, this.sumUsd(nowMs), usd18, 'budget');
       if (r) return { ok: false, reason: r };
       if (limits.host && input.host) {
-        const h = refusal({ daily: limits.host.daily, monthly: limits.host.monthly }, this.spentUsd(nowMs, input.host), usd18, `per_host["${limits.host.pattern}"]`);
+        const h = refusal({ daily: limits.host.daily, monthly: limits.host.monthly }, this.sumUsd(nowMs, input.host), usd18, `per_host["${limits.host.pattern}"]`);
         if (h) return { ok: false, reason: h };
       }
     }
     return { ok: true };
   }
 
-  /** Check and record in one synchronous step. Returns the spend's seq. */
+  /** Re-read, check and record in one step under the lock. Returns the spend's seq. */
   reserve(input: ReserveInput, limits: Limits): number {
-    const c = this.check(input, limits);
-    if (!c.ok) throw new Error(c.reason);
-    const amount = human(rawToUnits(input.raw, input.decimals));
-    const e = this.append({
-      kind: 'spend', tool: input.tool, mode: input.mode, wallet: input.wallet, chain_id: input.chainId, asset: input.asset, asset_label: input.assetLabel,
-      amount, raw: input.raw, usd: input.usd, to: input.to, host: input.host, resource: input.resource, method: input.method, proof: input.proof ?? null,
-    });
-    return e.seq;
+    const unlock = this.lock();
+    try {
+      this.sync();
+      const c = this.evaluate(input, limits, Date.now());
+      if (!c.ok) throw new Error(c.reason);
+      const amount = human(rawToUnits(input.raw, input.decimals));
+      const e = this.append({
+        kind: 'spend', tool: input.tool, mode: input.mode, wallet: input.wallet, chain_id: input.chainId, asset: input.asset, asset_label: input.assetLabel,
+        amount, raw: input.raw, usd: input.usd, to: input.to, host: input.host, resource: input.resource, method: input.method, proof: input.proof ?? null,
+      });
+      return e.seq;
+    } finally { unlock(); }
+  }
+
+  /** A follow-up line, written under the lock after a fresh read so it chains onto whatever any process wrote last. */
+  private follow(body: Omit<FollowEntry, 'hash' | 'prev' | 'seq' | 'ts'>): void {
+    const unlock = this.lock();
+    try { this.sync(); this.append(body as unknown as Omit<Entry, 'hash' | 'prev' | 'seq' | 'ts'> & Record<string, unknown>); } finally { unlock(); }
   }
 
   /** The spend never happened (signing or broadcast failed before anything left this process). */
   void(ref: number, detail: string): void {
-    try { this.append({ kind: 'void', ref, outcome: 'void', detail: detail.slice(0, 300) }); } catch (e) { console.error(`[agentwallet] ledger void failed: ${(e as Error).message}`); }
+    try { this.follow({ kind: 'void', ref, outcome: 'void', detail: detail.slice(0, 300) }); } catch (e) { console.error(`[agentwallet] ledger void failed: ${(e as Error).message}`); }
   }
   /** What the endpoint or chain said afterwards. Never throws: the payment already happened. */
   settle(ref: number, outcome: string, detail: string | null): void {
-    try { this.append({ kind: 'settle', ref, outcome: outcome.slice(0, 40), detail: detail ? detail.slice(0, 300) : null }); } catch (e) { console.error(`[agentwallet] ledger settle failed: ${(e as Error).message}`); }
+    try { this.follow({ kind: 'settle', ref, outcome: outcome.slice(0, 40), detail: detail ? detail.slice(0, 300) : null }); } catch (e) { console.error(`[agentwallet] ledger settle failed: ${(e as Error).message}`); }
   }
 
-  size(): number { return this.entries.length; }
+  size(): number { this.sync(); return this.entries.length; }
 
-  /** Spends newest first with their latest follow-up folded in. */
+  /** Spends newest first with their latest follow-up folded in, from a fresh read. */
   payments(opts: { limit: number; host?: string; outcome?: string; since?: number }): Array<Record<string, unknown>> {
+    this.sync();
     const follow = new Map<number, FollowEntry>();
     for (const e of this.entries) if (e.kind !== 'spend') follow.set((e as FollowEntry).ref, e as FollowEntry);
     const out: Array<Record<string, unknown>> = [];

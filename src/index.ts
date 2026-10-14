@@ -543,19 +543,24 @@ async function api(path: string, method = 'GET', body?: Record<string, unknown>,
     delete extraHeaders['X-AGW-CTX'];
   }
   let reserved: number | null = null;
-  const m = /^\/wallets\/([^/]+)\/send(\?|$)/.exec(path);
-  if (method === 'POST' && m && body) {
+  // /sign with a transaction body is the same spend as /send: the caller gets
+  // a broadcast-ready raw transaction (2026-10-14 report, 1.14.2). A message
+  // signature (body.message) moves nothing and is not gated.
+  const m = /^\/wallets\/([^/]+)\/(send|sign)(\?|$)/.exec(path);
+  const signsTx = m !== null && (m[2] === 'send' || typeof body?.message !== 'string');
+  if (method === 'POST' && m && body && signsTx) {
     const chainId = localChainId(body, new URLSearchParams(path.split('?')[1] || ''));
     const d = await describeSend(body, chainId);
     assertSendTarget(d, chainId);
-    const input = spendInputOf(d, chainId, ctx.tool || 'send', m[1], ctx);
+    const input = spendInputOf(d, chainId, ctx.tool || (m[2] === 'sign' ? 'sign_transaction' : 'send'), m[1], ctx);
     if (input) reserved = reserveSpend(input);
   }
   try {
     const out = await apiInner(path, method, body, extraHeaders);
     if (reserved !== null) {
       const r = out as { tx_hash?: unknown; signature?: unknown };
-      LEDGER.settle(reserved, 'broadcast', typeof r?.tx_hash === 'string' ? r.tx_hash : typeof r?.signature === 'string' ? r.signature : null);
+      if (m![2] === 'sign') LEDGER.settle(reserved, 'signed', 'raw transaction returned to the caller; not broadcast by this process, so it stays counted');
+      else LEDGER.settle(reserved, 'broadcast', typeof r?.tx_hash === 'string' ? r.tx_hash : typeof r?.signature === 'string' ? r.signature : null);
     }
     return out;
   } catch (e) {
@@ -1214,7 +1219,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.14.1',
+    version: '1.14.2',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()
@@ -1362,7 +1367,8 @@ tool(
   'sign_transaction',
   'Sign a transaction with a wallet\'s private key. ' +
     'For EVM: returns signed raw transaction hex. For Solana: returns base64 signed transaction. ' +
-    'Does NOT broadcast — use send_transaction for sign + broadcast.',
+    'Does NOT broadcast. Use send_transaction for sign + broadcast. ' +
+    'A signed transaction is a spend: under a spend policy it is checked, reserved on the ledger and counted against the budgets exactly as send_transaction is, because the caller can broadcast it.',
   {
     wallet_id: z.number().int().describe('Wallet ID'),
     to: AddressSchema.describe('Destination address (0x-prefixed for EVM, Base58 for Solana)'),

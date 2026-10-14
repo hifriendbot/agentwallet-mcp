@@ -7,7 +7,7 @@
  */
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, appendFileSync, utimesSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
@@ -190,6 +190,79 @@ check('windows roll: a spend 25 hours old is out of the day but in the month', (
   const now = Date.parse(line.ts) + 25 * 3600 * 1000;
   assert.equal(human(old.spentUsd(now).daily), '0');
   assert.equal(human(old.spentUsd(now).monthly), '2');
+});
+
+console.log('\n1.14.2: one budget across every process sharing the ledger (reported 2026-10-14)\n');
+
+const sixty = () => spend({ raw: '600000', usd: '0.6' });
+const oneDollar = () => limits({ usd: { total: '1' } });
+check('two ledgers opened on one empty file before either spent: the second sees the first\'s spend and refuses the last dollar', () => {
+  const p = join(dir, 'shared.jsonl');
+  const A = new Ledger(p);
+  const B = new Ledger(p);
+  assert.equal(A.reserve(sixty(), oneDollar()), 1);
+  assert.throws(() => B.reserve(sixty(), oneDollar()), /lifetime budget of 1 would be exceeded: 0\.6 already spent/);
+  assert.equal(B.reserve(spend({ raw: '400000', usd: '0.4' }), oneDollar()), 2, 'the remainder fits and chains onto seq 1');
+  assert.throws(() => A.reserve(spend({ raw: '10000', usd: '0.01' }), oneDollar()), /0 remaining/);
+  assert.equal(human(A.spentUsd().total), '1');
+  const fresh = new Ledger(p);
+  assert.equal(fresh.integrity, null, 'no fork: one chain, two writers');
+  assert.equal(fresh.size(), 2);
+  assert.ok(!existsSync(p + '.lock'), 'the lock is released');
+  B.void(2, 'the other process gave it back');
+  assert.equal(A.check(spend({ raw: '400000', usd: '0.4' }), oneDollar()).ok, true, 'a void by one process is seen by the other');
+});
+check('a ledger file rewritten underneath a live process is refused, never forked', () => {
+  const p = join(dir, 'rewritten.jsonl');
+  const A = new Ledger(p);
+  A.reserve(spend(), limits());
+  writeFileSync(p, '');
+  assert.throws(() => A.reserve(spend(), limits()), /rewritten underneath this process/);
+  assert.match(A.integrity, /rewritten underneath/);
+  assert.equal(A.check(spend(), limits()).ok, false);
+});
+check('a lock left by a dead process is cleared; a live lock is waited for, then refused with nothing signed', () => {
+  const p = join(dir, 'locked.jsonl');
+  const A = new Ledger(p, null, { lockWaitMs: 300 });
+  writeFileSync(p + '.lock', '1 dead');
+  const old = (Date.now() - 120_000) / 1000;
+  utimesSync(p + '.lock', old, old);
+  assert.equal(A.reserve(spend(), limits()), 1, 'a stale lock does not block');
+  writeFileSync(p + '.lock', `${process.pid} live`);
+  const t0 = Date.now();
+  assert.throws(() => A.reserve(spend(), limits()), /locked by another agentwallet-mcp process .*Nothing was signed/);
+  assert.ok(Date.now() - t0 >= 250, 'it waited for the lock');
+  assert.equal(new Ledger(p).size(), 1, 'nothing was written while locked');
+  unlinkSync(p + '.lock');
+  assert.equal(A.reserve(spend(), limits()), 2);
+});
+await checkAsync('two OS processes released at the same instant: exactly one fits the last dollar and the chain stays intact', async () => {
+  const p = join(dir, 'race.jsonl');
+  const script = join(dir, 'race-child.mjs');
+  writeFileSync(script, [
+    `import { Ledger } from ${JSON.stringify(new URL('../build/ledger.js', import.meta.url).href)};`,
+    `const L = new Ledger(process.argv[2]);`,
+    `process.stdout.write('ready\\n');`,
+    `process.stdin.once('data', () => {`,
+    `  try { const seq = L.reserve(${JSON.stringify(sixty())}, ${JSON.stringify(oneDollar())}); console.log('RESERVED ' + seq); }`,
+    `  catch (e) { console.log('REFUSED ' + e.message); }`,
+    `  process.exit(0);`,
+    `});`,
+  ].join('\n'));
+  const children = [0, 1].map(() => spawn(process.execPath, [script, p], { stdio: ['pipe', 'pipe', 'pipe'] }));
+  const outs = ['', ''];
+  const ready = children.map((c, i) => new Promise((res) => c.stdout.on('data', (d) => { outs[i] += d.toString(); if (outs[i].includes('ready')) res(); })));
+  const exits = children.map((c) => new Promise((res) => c.on('exit', res)));
+  await Promise.all(ready);
+  for (const c of children) c.stdin.write('go\n');
+  await Promise.all(exits);
+  const results = outs.map((o) => o.split('\n').find((l) => /^(RESERVED|REFUSED)/.test(l)) || '(no result)');
+  assert.equal(results.filter((r) => r.startsWith('RESERVED')).length, 1, results.join(' | '));
+  assert.match(results.find((r) => r.startsWith('REFUSED')), /lifetime budget of 1 would be exceeded/);
+  const after = new Ledger(p);
+  assert.equal(after.integrity, null);
+  assert.equal(after.size(), 1);
+  assert.ok(!existsSync(p + '.lock'));
 });
 
 console.log('\nEncrypted keyfile\n');
@@ -450,6 +523,61 @@ check('an approval and a wrap inside the budgets are reserved on the ledger (the
   assert.equal(wrap.outcome, 'void');
   const after = new Ledger(stdioLedger);
   assert.equal(after.integrity, null);
+});
+
+console.log('\n1.14.2: hosted sign_transaction is the same spend as send (reported 2026-10-14)\n');
+
+// Hosted mode: no local key, the API on a closed port. The policy must refuse before the API is ever contacted.
+const hostedLedger = join(dir, 'hosted-ledger.jsonl');
+const hostedEnv = { AGENTWALLET_API_URL: DEAD_API, AGENTWALLET_USER: 'u', AGENTWALLET_PASS: 'p', AGENTWALLET_POLICY: policyFile, AGENTWALLET_LEDGER: hostedLedger, AGENTWALLET_TOKEN_RISK: '0' };
+const transferCalldata = (to, raw) => '0xa9059cbb' + pad32(to) + BigInt(raw).toString(16).padStart(64, '0');
+const hosted = await callTools([
+  { name: 'wallet_mode', arguments: {} },                                                                                                      // 100
+  { name: 'sign_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '0', data: transferCalldata(OTHER, 100_000_000n), chain_id: 8453 } }, // 101
+  { name: 'sign_transaction', arguments: { wallet_id: 1, to: OTHER, value: '5000000000000000000', chain_id: 8453 } },                       // 102
+  { name: 'sign_transaction', arguments: { wallet_id: 1, to: DEAD, value: '20000000000000000', chain_id: 8453 } },                          // 103
+  { name: 'sign_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '0', data: approveCalldata(DEAD, (1n << 256n) - 1n), chain_id: 8453 } }, // 104
+  { name: 'sign_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '0', data: transferCalldata(DEAD, 100_000_000n), chain_id: 8453 } },  // 105
+  { name: 'sign_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '0', data: transferCalldata(DEAD, 500_000n), chain_id: 8453 } },      // 106
+], hostedEnv, { waitMs: 15000 });
+const hid = (id) => hosted.responses.find((r) => r.id === id);
+check('the session is hosted mode with the policy loaded', () => {
+  const m = textOf(hid(100));
+  assert.equal(m.mode, 'custodial', 'no local key: the hosted signer is the custodian');
+  assert.equal(m.spend_policy.name, 'test policy');
+});
+check('sign_transaction of a 100 USDC transfer to a denied recipient is refused before the API is contacted', () => {
+  const t = rawText(hid(101));
+  assert.match(t, /policy denies recipient/);
+  assert.ok(!/ECONNREFUSED|fetch failed/i.test(t), 'the API was never contacted');
+});
+check('sign_transaction of 5 ETH to a denied recipient is refused', () => {
+  assert.match(rawText(hid(102)), /policy denies recipient/);
+});
+check('sign_transaction of native value above native_budget is refused', () => {
+  assert.match(rawText(hid(103)), /native_budget\.8453 daily budget of 0\.01 would be exceeded/);
+});
+check('sign_transaction of an unlimited approve is refused under the policy', () => {
+  assert.match(rawText(hid(104)), /unlimited approval of USDC/);
+});
+check('sign_transaction of a transfer above the daily budget is refused', () => {
+  assert.match(rawText(hid(105)), /daily budget of 5 would be exceeded/);
+});
+check('a sign_transaction inside the policy is reserved on the ledger, then voided when the API cannot be reached', () => {
+  const t = rawText(hid(106));
+  assert.match(t, /ECONNREFUSED|fetch failed|Cannot reach|connect/i);
+  assert.ok(!/policy/.test(t), t);
+});
+const hostedList = await callTools([{ name: 'list_payments', arguments: { limit: 10 } }], hostedEnv, { waitMs: 7000 });
+check('the ledger names sign_transaction as the tool for that spend', () => {
+  const lp = textOf(hostedList.responses.find((x) => x.id === 100));
+  const mine = lp.payments.find((p) => p.amount === '0.5');
+  assert.ok(mine, 'the 0.5 sign is on the ledger: ' + JSON.stringify(lp.payments));
+  assert.equal(mine.tool, 'sign_transaction');
+  assert.equal(mine.mode, 'hosted');
+  assert.equal(mine.outcome, 'void');
+  assert.equal(lp.payments.length, 1, 'the refused signs never reached the ledger');
+  assert.equal(new Ledger(hostedLedger).integrity, null);
 });
 
 console.log('\nStartup refusals and the encrypted keyfile over stdio\n');
