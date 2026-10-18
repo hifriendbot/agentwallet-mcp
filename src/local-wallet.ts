@@ -40,6 +40,7 @@ import { wrappedNativeAddress } from './wrapped-native.js';
 import { typedDataFor, type Eip3009Authorization } from './x402-eip3009.js';
 import { uptoTypedData, type UptoPermit2Authorization } from './x402-permit2.js';
 import { openKeyfile } from './keyfile.js';
+import { markMaybeLive } from './maybe-live.js';
 
 /* ── Key loading ─────────────────────────────────────────────────── */
 
@@ -643,10 +644,11 @@ export async function localSend(
     reported = await pub.sendRawTransaction({ serializedTransaction: signed });
   } catch (e) {
     account.nonceManager!.reset({ address, chainId });
-    throw new Error(`Broadcast of transaction ${localHash} (nonce ${nonce}) failed: ${(e as Error).message.split('\n')[0]}. The transaction is signed and MAY be live if the node forwarded it before answering; check the hash on an explorer before retrying.`);
+    // Marked, not worded: the ledger keeps this spend counted because of the marker, never because of the text (1.14.3).
+    throw markMaybeLive(new Error(`Broadcast of transaction ${localHash} (nonce ${nonce}) failed: ${(e as Error).message.split('\n')[0]}. The transaction is signed and MAY be live if the node forwarded it before answering; check the hash on an explorer before retrying.`));
   }
   if (reported.toLowerCase() !== localHash.toLowerCase()) {
-    throw new Error(`Transaction ${localHash} (nonce ${nonce}) was BROADCAST, but the node answered with a different hash (${String(reported).slice(0, 80)}), so it cannot be trusted about its fate. Verify ${localHash} on an explorer before retrying.`);
+    throw markMaybeLive(new Error(`Transaction ${localHash} (nonce ${nonce}) was BROADCAST, but the node answered with a different hash (${String(reported).slice(0, 80)}), so it cannot be trusted about its fate. Verify ${localHash} on an explorer before retrying.`));
   }
 
   return {

@@ -25,6 +25,7 @@ import {
 import bs58 from 'bs58';
 import { lookupTrustedDecimals } from './x402-payment.js';
 import { openKeyfile } from './keyfile.js';
+import { markMaybeLive, isMaybeLive } from './maybe-live.js';
 
 /* ── Program IDs ─────────────────────────────────────────────────── */
 
@@ -262,7 +263,8 @@ async function sendSigned(conn: Connection, tx: Transaction, payer: Keypair): Pr
   if (!tx.signature) throw new Error('The transaction could not be signed.');
   const local = bs58.encode(tx.signature);
   const reported = await conn.sendRawTransaction(tx.serialize());
-  const after = (what: string) => new Error(`Transaction ${local} was BROADCAST but ${what}. Check it on an explorer before retrying: a retry is a second transfer.`);
+  // Marked, not worded: the ledger keeps the spend counted because of the marker, never because of the text (1.14.3).
+  const after = (what: string) => markMaybeLive(new Error(`Transaction ${local} was BROADCAST but ${what}. Check it on an explorer before retrying: a retry is a second transfer.`));
   if (reported !== local) throw after(`the RPC answered with a different signature (${String(reported).slice(0, 90)}), so the node cannot be trusted about its fate`);
   const confirm = conn.confirmTransaction({ signature: local, blockhash, lastValidBlockHeight }, 'confirmed');
   const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(after(`was not confirmed within ${CONFIRM_TIMEOUT_MS / 1000} s`)), CONFIRM_TIMEOUT_MS).unref());
@@ -270,7 +272,7 @@ async function sendSigned(conn: Connection, tx: Transaction, payer: Keypair): Pr
   try {
     result = await Promise.race([confirm, timeout]);
   } catch (e) {
-    if (e instanceof Error && /was BROADCAST/.test(e.message)) throw e;
+    if (isMaybeLive(e)) throw e;
     throw after(`confirmation failed: ${e instanceof Error ? e.message : JSON.stringify(e)}`);
   }
   if (result.value.err) throw after(`it failed on chain: ${JSON.stringify(result.value.err)}`);

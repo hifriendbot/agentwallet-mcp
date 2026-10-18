@@ -7,6 +7,7 @@
  */
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
+import { createServer } from 'node:http';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, appendFileSync, utimesSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -578,6 +579,105 @@ check('the ledger names sign_transaction as the tool for that spend', () => {
   assert.equal(mine.outcome, 'void');
   assert.equal(lp.payments.length, 1, 'the refused signs never reached the ledger');
   assert.equal(new Ledger(hostedLedger).integrity, null);
+});
+
+console.log('\n1.14.3: a refused local sign_transaction is voided, never counted (reported 2026-10-16)\n');
+
+// Local mode refuses transaction signing on the sign route with a message that
+// contains the word "broadcasts". The old test for "may already be live" was a
+// case-insensitive regex over the message, so every refused sign stayed counted
+// and ten refusals ate a whole day's native budget; the eleventh legitimate
+// spend was then refused by the budget. Eleven refused signs must all get the
+// local-mode refusal, none a budget refusal, and the ledger must void them all.
+const signLedger = join(dir, 'local-sign-ledger.jsonl');
+const signEnv = { ...baseEnv, AGENTWALLET_LEDGER: signLedger };
+const tenthOfBudget = '1000000000000000'; // 0.001 ETH; native_budget for 8453 is 0.01 a day, so ten fill it
+// Ten in one session (the SDK runs them concurrently, so all ten are reserved
+// before the first void lands), then the eleventh alone in a fresh session,
+// which is the reporter's sequence: ten failures, then the spend that used to
+// be refused for a budget nothing had spent.
+const signCall = { name: 'sign_transaction', arguments: { wallet_id: 1, to: DEAD, value: tenthOfBudget, chain_id: 8453 } };
+const signs = await callTools(Array.from({ length: 10 }, () => signCall), signEnv, { waitMs: 15000 });
+const eleventh = await callTools([signCall], signEnv, { waitMs: 8000 });
+check('ten refused local sign_transaction calls all get the local-mode refusal, none a budget refusal', () => {
+  for (let i = 0; i < 10; i++) {
+    const t = rawText(signs.responses.find((r) => r.id === 100 + i));
+    assert.match(t, /Local mode signs messages in-process/, t);
+    assert.ok(!/budget/i.test(t), 'a refused sign consumed budget: ' + t);
+  }
+});
+check('the eleventh, after ten failures worth a full day of budget, is still not refused by the budget', () => {
+  const t = rawText(eleventh.responses.find((r) => r.id === 100));
+  assert.match(t, /Local mode signs messages in-process/, t);
+  assert.ok(!/budget/i.test(t), 'the failed signs consumed the budget: ' + t);
+});
+const signList = await callTools([{ name: 'list_payments', arguments: { limit: 20 } }, { name: 'spend_policy', arguments: {} }], signEnv, { waitMs: 7000 });
+check('every refused sign is on the ledger as void and the native budget is untouched', () => {
+  const lp = textOf(signList.responses.find((x) => x.id === 100));
+  assert.equal(lp.payments.length, 11, JSON.stringify(lp.payments));
+  for (const p of lp.payments) { assert.equal(p.tool, 'sign_transaction'); assert.equal(p.outcome, 'void', JSON.stringify(p)); }
+  const sp = textOf(signList.responses.find((x) => x.id === 101));
+  assert.equal(sp.budgets.native['8453'].daily.spent, '0');
+  assert.equal(sp.budgets.native['8453'].daily.remaining, '0.01');
+  assert.equal(new Ledger(signLedger).integrity, null);
+});
+
+// The other side of the same decision: a broadcast that failed after the signed
+// bytes went to the node must still stay counted (outcome unknown), now by the
+// marker on the error rather than by its wording.
+const liveLedger = join(dir, 'live-ledger.jsonl');
+const liveRpc = createServer((req, res) => {
+  let b = ''; req.on('data', (c) => { b += c; });
+  req.on('end', () => {
+    const r = JSON.parse(b);
+    const send = (p) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ jsonrpc: '2.0', id: r.id, ...p })); };
+    switch (r.method) {
+      case 'eth_chainId': return send({ result: '0x2105' });
+      case 'eth_getCode': return send({ result: '0x' });
+      case 'eth_getBalance': return send({ result: '0x' + (10n ** 18n).toString(16) });
+      case 'eth_estimateGas': return send({ result: '0x5208' });
+      case 'eth_maxPriorityFeePerGas': return send({ result: '0x3b9aca00' });
+      case 'eth_gasPrice': return send({ result: '0x77359400' });
+      case 'eth_getBlockByNumber': return send({ result: { number: '0x10', baseFeePerGas: '0x3b9aca00', gasLimit: '0x1c9c380', gasUsed: '0x0', timestamp: '0x1', hash: '0x' + '11'.repeat(32), parentHash: '0x' + '22'.repeat(32), transactions: [], miner: '0x' + '00'.repeat(20), nonce: '0x0000000000000000', difficulty: '0x0', extraData: '0x', logsBloom: '0x' + '00'.repeat(256), size: '0x0', stateRoot: '0x' + '33'.repeat(32), transactionsRoot: '0x' + '44'.repeat(32), receiptsRoot: '0x' + '55'.repeat(32), sha3Uncles: '0x' + '66'.repeat(32), totalDifficulty: '0x0', uncles: [] } });
+      case 'eth_getTransactionCount': return send({ result: '0x5' });
+      case 'eth_sendRawTransaction': return send({ error: { code: -32000, message: 'already known' } }); // the node had the bytes before it answered
+      default: return send({ error: { code: -32601, message: `mock: ${r.method} not served` } });
+    }
+  });
+});
+await new Promise((r) => liveRpc.listen(0, '127.0.0.1', r));
+const liveEnv = { ...baseEnv, AGENTWALLET_LEDGER: liveLedger, AGENTWALLET_RPC_8453: `http://127.0.0.1:${liveRpc.address().port}` };
+const live = await callTools([{ name: 'transfer', arguments: { wallet_id: 1, to: DEAD, amount: '0.001', chain_id: 8453 } }], liveEnv, { waitMs: 15000 });
+const liveList = await callTools([{ name: 'list_payments', arguments: { limit: 5 } }], liveEnv, { waitMs: 7000 });
+liveRpc.close();
+check('a send whose broadcast failed after the bytes reached the node says it may be live', () => {
+  assert.match(rawText(live.responses.find((r) => r.id === 100)), /MAY be live/);
+});
+check('that spend stays on the ledger as unknown, not void', () => {
+  const lp = textOf(liveList.responses.find((x) => x.id === 100));
+  assert.equal(lp.payments.length, 1, JSON.stringify(lp.payments));
+  assert.equal(lp.payments[0].tool, 'send');
+  assert.equal(lp.payments[0].outcome, 'unknown', JSON.stringify(lp.payments[0]));
+});
+
+// Hosted mode, same distinction: a host that was never reached (the dead port
+// above) voids the spend; a host that took the request and then dropped the
+// connection may have signed and broadcast, so the spend stays counted.
+const resetApi = createServer((req, res) => { req.on('data', () => {}); req.on('end', () => { res.socket.destroy(); }); });
+await new Promise((r) => resetApi.listen(0, '127.0.0.1', r));
+const resetLedger = join(dir, 'reset-ledger.jsonl');
+const resetEnv = { ...hostedEnv, AGENTWALLET_API_URL: `http://127.0.0.1:${resetApi.address().port}`, AGENTWALLET_LEDGER: resetLedger };
+const reset = await callTools([{ name: 'sign_transaction', arguments: { wallet_id: 1, to: DEAD, value: tenthOfBudget, chain_id: 8453 } }], resetEnv, { waitMs: 10000 });
+const resetList = await callTools([{ name: 'list_payments', arguments: { limit: 5 } }], resetEnv, { waitMs: 7000 });
+resetApi.close();
+check('hosted: a connection the host dropped after taking the request says the transaction may be live', () => {
+  assert.match(rawText(reset.responses.find((r) => r.id === 100)), /did not answer .* may be live/);
+});
+check('hosted: that spend stays on the ledger as unknown', () => {
+  const lp = textOf(resetList.responses.find((x) => x.id === 100));
+  assert.equal(lp.payments.length, 1, JSON.stringify(lp.payments));
+  assert.equal(lp.payments[0].tool, 'sign_transaction');
+  assert.equal(lp.payments[0].outcome, 'unknown', JSON.stringify(lp.payments[0]));
 });
 
 console.log('\nStartup refusals and the encrypted keyfile over stdio\n');

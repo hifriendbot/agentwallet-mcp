@@ -86,6 +86,7 @@ import {
   budgetReport, units as policyUnits, human as policyHuman, rawToUnits, type LoadedPolicy,
 } from './policy.js';
 import { Ledger, type ReserveInput, type Limits, type SpendMethod } from './ledger.js';
+import { markMaybeLive, isMaybeLive, carryMaybeLive, connectionNeverMade } from './maybe-live.js';
 import { discover } from './discovery.js';
 
 /* `agentwallet-mcp encrypt-keyfile <in> <out>` runs the keyfile tool instead of the server. */
@@ -564,10 +565,15 @@ async function api(path: string, method = 'GET', body?: Record<string, unknown>,
     }
     return out;
   } catch (e) {
-    // A send that may already be on the wire stays counted; only a spend that never left this process is voided.
+    // A send that may already be on the wire stays counted; only a spend that
+    // never left this process is voided. The signers mark the former on the
+    // error object (markMaybeLive); the decision used to be a regex over the
+    // message and the word "broadcasts" in the local-mode refusal of
+    // transaction signing made every refused sign_transaction consume the
+    // budget for good (reported privately 2026-10-16, 1.14.3).
     if (reserved !== null) {
       const msg = (e as Error).message;
-      if (/BROADCAST|MAY be live/i.test(msg)) LEDGER.settle(reserved, 'unknown', msg); else LEDGER.void(reserved, msg);
+      if (isMaybeLive(e)) LEDGER.settle(reserved, 'unknown', msg); else LEDGER.void(reserved, msg);
     }
     throw e;
   }
@@ -582,7 +588,7 @@ async function apiInner(path: string, method = 'GET', body?: Record<string, unkn
     try {
       handled = await routeLocally(path, method, body);
     } catch (e) {
-      throw new Error(redactRpcSecrets(e)); // viem puts the RPC URL, key and all, in its messages
+      throw carryMaybeLive(e, new Error(redactRpcSecrets(e))); // viem puts the RPC URL, key and all, in its messages; the may-be-live marker rides along
     }
     if (handled !== NOT_HANDLED) return handled;
   }
@@ -607,13 +613,32 @@ async function apiInner(path: string, method = 'GET', body?: Record<string, unkn
     options.body = JSON.stringify(body);
   }
 
-  const res = await fetch(url, options);
+  // Hosted mode: a connection that was never made (refused, unresolvable,
+  // TLS rejected) carried nothing to the host, so a reserved spend is voided.
+  // A timeout waiting for the answer or a reset mid-request may have reached
+  // the custodian, which may have signed and broadcast; a spend there stays
+  // counted (1.14.3).
+  let res: Response;
+  try {
+    res = await fetch(url, options);
+  } catch (e) {
+    if (method === 'POST' && /^\/wallets\/[^/]+\/(send|sign)(\?|$)/.test(path) && !connectionNeverMade(e)) {
+      const cause = (e as { cause?: { code?: string; message?: string } }).cause;
+      const why = (e as Error)?.name === 'TimeoutError' ? `no answer within ${API_TIMEOUT_MS / 1000} s` : (cause?.code || cause?.message || (e as Error)?.message || 'connection failed');
+      throw markMaybeLive(new Error(`The AgentWallet API host did not answer ${path} (${why}). The request may have reached it, so a transaction may be live; check the wallet's history before retrying.`));
+    }
+    throw e;
+  }
   if (res.status >= 300 && res.status < 400) {
     throw new Error(`The AgentWallet API host answered ${path} with a redirect (HTTP ${res.status}); refusing to follow it.`);
   }
   const text = await readBounded(res, API_MAX_RESPONSE_CHARS, 'The AgentWallet API host');
   let data: unknown;
-  try { data = JSON.parse(text); } catch { throw new Error(`The AgentWallet API host returned a non-JSON response (HTTP ${res.status}).`); }
+  try { data = JSON.parse(text); } catch {
+    // A 2xx the host did not phrase as JSON may still have been a completed send; counted, not voided (1.14.3).
+    const err = new Error(`The AgentWallet API host returned a non-JSON response (HTTP ${res.status}).`);
+    throw res.ok && method === 'POST' ? markMaybeLive(err) : err;
+  }
   data = boundHostData(data, 0); // strings, arrays and depth bounded; the host writes none of the agent's instructions
 
   // A 402 from the API host is paid automatically only for a HOSTED wallet the
@@ -645,7 +670,8 @@ async function apiInner(path: string, method = 'GET', body?: Record<string, unkn
   if (method === 'POST' && /^\/wallets\/[^/]+\/send(\?|$)/.test(path) && data && typeof data === 'object') {
     const d = data as { tx_hash?: unknown; signature?: unknown };
     if (!looksLikeTxHash(d.tx_hash) && !(typeof d.signature === 'string' && /^[1-9A-HJ-NP-Za-km-z]{43,120}$/.test(d.signature))) {
-      throw new Error('The AgentWallet API host answered the send without a transaction hash or signature; treating it as not sent.');
+      // The agent is told it was not sent (no hash to act on); the ledger keeps it counted because the host may disagree (1.14.3).
+      throw markMaybeLive(new Error('The AgentWallet API host answered the send without a transaction hash or signature; treating it as not sent.'));
     }
   }
   // The marker comes FIRST so a truncated result still carries it, and an
@@ -1219,7 +1245,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.14.2',
+    version: '1.14.3',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()
