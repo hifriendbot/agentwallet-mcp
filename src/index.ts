@@ -181,8 +181,14 @@ function usdOf(chainId: number, asset: string, raw: string, decimals: number): s
  *
  * `unbounded` marks an approval of 2^128 base units or more: no budget can
  * count it, so under a policy it is refused rather than reserved.
+ *
+ * `carried` is the native value a token or approval call sends along with
+ * its calldata. A payable token contract keeps it, so it is a second spend:
+ * native, against native_budget, to the called contract. Before 1.14.4 it was
+ * dropped the moment the calldata matched a layout (reported privately
+ * 2026-10-23).
  */
-type DescribedSend = { kind: 'native' | 'token' | 'approval' | 'spl' | 'contract'; to: string; asset: string; raw: string; decimals: number; unbounded?: boolean };
+type DescribedSend = { kind: 'native' | 'token' | 'approval' | 'spl' | 'contract'; to: string; asset: string; raw: string; decimals: number; unbounded?: boolean; carried?: { raw: string; to: string } };
 
 /* Calldata the policy prices: which word holds the amount, which the recipient
    or spender, and for Permit2.approve which the token (there `to` is Permit2).
@@ -223,8 +229,12 @@ async function describeSend(body: Record<string, unknown>, chainId: number): Pro
       const token = layout.tokenIndex === undefined ? to : '0x' + wordAt(layout.tokenIndex).slice(24);
       const counterparty = '0x' + wordAt(layout.toIndex).slice(24);
       const amount = BigInt('0x' + wordAt(layout.amountIndex));
+      // The call's own value does not vanish because the calldata was
+      // recognised: the contract keeps whatever rides along. It is a second
+      // spend, native, to the contract (reported privately 2026-10-23, 1.14.4).
+      const carried = BigInt(value) > 0n ? { raw: value, to } : undefined;
       if (layout.kind === 'approval' && amount >= UNBOUNDED_APPROVAL) {
-        return { kind: 'approval', to: counterparty, asset: token, raw: amount.toString(), decimals: 0, unbounded: true };
+        return { kind: 'approval', to: counterparty, asset: token, raw: amount.toString(), decimals: 0, unbounded: true, ...(carried ? { carried } : {}) };
       }
       // Decimals matter here only to price a registry stablecoin (resolved
       // offline) and to print the ledger amount. A token the registry and the
@@ -234,7 +244,7 @@ async function describeSend(body: Record<string, unknown>, chainId: number): Pro
       // their own terms (audit-11312: transferAndCall on a not-a-token target).
       let decimals = 0;
       try { decimals = await resolveTrustedDecimals(chainId, token); } catch { decimals = 0; }
-      return { kind: layout.kind, to: counterparty, asset: token, raw: amount.toString(), decimals };
+      return { kind: layout.kind, to: counterparty, asset: token, raw: amount.toString(), decimals, ...(carried ? { carried } : {}) };
     }
   }
   if (data && data !== '0x') return { kind: 'contract', to, asset: '', raw: value, decimals: nativeDecimals(chainId) };
@@ -259,30 +269,42 @@ function assertSendTarget(d: DescribedSend, chainId: number): void {
     const t = targetAllowed(POL(), d.kind === 'approval' ? d.asset : d.to);
     if (!t.ok) throw new Error(t.reason + ' Nothing was signed.');
   }
+  if (d.carried) {
+    const t = targetAllowed(POL(), d.carried.to); // the contract that keeps the value
+    if (!t.ok) throw new Error(t.reason + ' Nothing was signed.');
+  }
 }
 
 /**
- * The spend a decoded send makes against the policy, or null when nothing
- * leaves the wallet: a zero-value contract call can only pull what an
- * approval already granted, and approvals are counted when they are granted.
- * An approval's recipient is its spender, so recipients.allow and .deny bind
- * who may be allowed to pull; the native value of a contract call is a spend
- * to that contract. Throws for an unbounded approval under a policy.
+ * The spends a decoded send makes against the policy, in the order they are
+ * reserved; empty when nothing leaves the wallet: a zero-value contract call
+ * can only pull what an approval already granted, and approvals are counted
+ * when they are granted. An approval's recipient is its spender, so
+ * recipients.allow and .deny bind who may be allowed to pull; the native
+ * value of a contract call is a spend to that contract; the native value
+ * carried on a token or approval call is a second spend, native, to the
+ * called contract (1.14.4). Throws for an unbounded approval under a policy.
  */
-function spendInputOf(d: DescribedSend, chainId: number, tool: string, wallet: string, ctx: { host?: string; resource?: string; method?: SpendMethod } = {}): ReserveInput | null {
-  if (d.kind === 'contract' && BigInt(d.raw) === 0n) return null;
+function spendInputsOf(d: DescribedSend, chainId: number, tool: string, wallet: string, ctx: { host?: string; resource?: string; method?: SpendMethod } = {}): ReserveInput[] {
   if (d.kind === 'approval' && d.unbounded && POLICY.path) {
     throw new Error(
       `policy: an unlimited approval of ${assetLabel(chainId, d.asset)} to ${d.to} cannot be counted against any budget, and under a spend policy every approval is a bounded spend. ` +
       `Approve an exact amount instead. Nothing was signed.`
     );
   }
-  return {
-    tool, mode: anyLocalMode() ? 'local' : 'hosted', wallet: anyLocalMode() ? 'local' : wallet, chainId,
-    asset: d.asset, assetLabel: assetLabel(chainId, d.asset), raw: d.raw, decimals: d.decimals,
-    usd: d.unbounded ? null : usdOf(chainId, d.asset, d.raw, d.decimals),
-    to: d.to, host: ctx.host ?? null, resource: ctx.resource ?? null, method: ctx.method ?? methodOf(d.kind),
-  };
+  const base = { tool, mode: anyLocalMode() ? 'local' as const : 'hosted' as const, wallet: anyLocalMode() ? 'local' : wallet, chainId, host: ctx.host ?? null, resource: ctx.resource ?? null };
+  const out: ReserveInput[] = [];
+  if (!(d.kind === 'contract' && BigInt(d.raw) === 0n)) {
+    out.push({
+      ...base, asset: d.asset, assetLabel: assetLabel(chainId, d.asset), raw: d.raw, decimals: d.decimals,
+      usd: d.unbounded ? null : usdOf(chainId, d.asset, d.raw, d.decimals),
+      to: d.to, method: ctx.method ?? methodOf(d.kind),
+    });
+  }
+  if (d.carried) {
+    out.push({ ...base, asset: '', assetLabel: assetLabel(chainId, ''), raw: d.carried.raw, decimals: nativeDecimals(chainId), usd: null, to: d.carried.to, method: 'native' });
+  }
+  return out;
 }
 
 // ─── Configuration ──────────────────────────────────────────────
@@ -543,7 +565,7 @@ async function api(path: string, method = 'GET', body?: Record<string, unknown>,
     extraHeaders = { ...extraHeaders };
     delete extraHeaders['X-AGW-CTX'];
   }
-  let reserved: number | null = null;
+  const reserved: number[] = [];
   // /sign with a transaction body is the same spend as /send: the caller gets
   // a broadcast-ready raw transaction (2026-10-14 report, 1.14.2). A message
   // signature (body.message) moves nothing and is not gated.
@@ -553,15 +575,22 @@ async function api(path: string, method = 'GET', body?: Record<string, unknown>,
     const chainId = localChainId(body, new URLSearchParams(path.split('?')[1] || ''));
     const d = await describeSend(body, chainId);
     assertSendTarget(d, chainId);
-    const input = spendInputOf(d, chainId, ctx.tool || (m[2] === 'sign' ? 'sign_transaction' : 'send'), m[1], ctx);
-    if (input) reserved = reserveSpend(input);
+    const tool = ctx.tool || (m[2] === 'sign' ? 'sign_transaction' : 'send');
+    // One line per spend the call makes (a token call that also carries native
+    // value makes two); a refusal of a later one releases the earlier ones.
+    for (const input of spendInputsOf(d, chainId, tool, m[1], ctx)) {
+      try { reserved.push(reserveSpend(input)); } catch (e) {
+        for (const seq of reserved) LEDGER.void(seq, `released, the same call was refused: ${(e as Error).message}`);
+        throw e;
+      }
+    }
   }
   try {
     const out = await apiInner(path, method, body, extraHeaders);
-    if (reserved !== null) {
+    for (const seq of reserved) {
       const r = out as { tx_hash?: unknown; signature?: unknown };
-      if (m![2] === 'sign') LEDGER.settle(reserved, 'signed', 'raw transaction returned to the caller; not broadcast by this process, so it stays counted');
-      else LEDGER.settle(reserved, 'broadcast', typeof r?.tx_hash === 'string' ? r.tx_hash : typeof r?.signature === 'string' ? r.signature : null);
+      if (m![2] === 'sign') LEDGER.settle(seq, 'signed', 'raw transaction returned to the caller; not broadcast by this process, so it stays counted');
+      else LEDGER.settle(seq, 'broadcast', typeof r?.tx_hash === 'string' ? r.tx_hash : typeof r?.signature === 'string' ? r.signature : null);
     }
     return out;
   } catch (e) {
@@ -571,9 +600,9 @@ async function api(path: string, method = 'GET', body?: Record<string, unknown>,
     // message and the word "broadcasts" in the local-mode refusal of
     // transaction signing made every refused sign_transaction consume the
     // budget for good (reported privately 2026-10-16, 1.14.3).
-    if (reserved !== null) {
+    for (const seq of reserved) {
       const msg = (e as Error).message;
-      if (isMaybeLive(e)) LEDGER.settle(reserved, 'unknown', msg); else LEDGER.void(reserved, msg);
+      if (isMaybeLive(e)) LEDGER.settle(seq, 'unknown', msg); else LEDGER.void(seq, msg);
     }
     throw e;
   }
@@ -1245,7 +1274,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.14.3',
+    version: '1.14.4',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()
@@ -3126,14 +3155,18 @@ tool(
     const policy: { ok: true } | { ok: false; reason: string } = (() => {
       try {
         assertSendTarget(d, chain_id);
-        const input = spendInputOf(d, chain_id, 'simulate_transaction', String(wallet_id));
-        return input ? spendVerdict(input) : { ok: true as const };
+        for (const input of spendInputsOf(d, chain_id, 'simulate_transaction', String(wallet_id))) {
+          const v = spendVerdict(input);
+          if (!v.ok) return v;
+        }
+        return { ok: true as const };
       } catch (e) { return { ok: false as const, reason: (e as Error).message }; }
     })();
     const moves = {
       kind: d.kind, to: d.to, asset: d.asset || 'native', asset_label: assetLabel(chain_id, d.asset),
       amount: d.unbounded ? 'unlimited' : formatUnits(d.raw, d.decimals),
       ...(d.kind === 'approval' ? { note: 'an approval: `to` is the spender being allowed to pull `amount` of `asset`' } : {}),
+      ...(d.carried ? { carried_native: { amount: formatUnits(d.carried.raw, nativeDecimals(chain_id)), to: d.carried.to, note: 'native value sent along with the calldata: a second spend, against native_budget, to the called contract' } } : {}),
     };
     if (isLocalMode()) {
       const sim = await localSimulate(chain_id, to as `0x${string}`, BigInt(valueRaw), data && data !== '0x' ? (data as `0x${string}`) : undefined);

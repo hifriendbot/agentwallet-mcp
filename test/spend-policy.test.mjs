@@ -361,6 +361,7 @@ const baseEnv = { AGENTWALLET_PRIVATE_KEY: TEST_KEY, AGENTWALLET_API_URL: DEAD_A
 const WETH_BASE = '0x4200000000000000000000000000000000000006';
 const pad32 = (hex) => hex.replace(/^0x/, '').toLowerCase().padStart(64, '0');
 const approveCalldata = (spender, raw) => '0x095ea7b3' + pad32(spender) + BigInt(raw).toString(16).padStart(64, '0');
+const transferCalldata = (to, raw) => '0xa9059cbb' + pad32(to) + BigInt(raw).toString(16).padStart(64, '0');
 
 // Seed the ledger with a settled 4-dollar spend so the day has 1 dollar left before the server starts.
 {
@@ -393,6 +394,11 @@ const run = await callTools([
   { name: 'simulate_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '0', data: approveCalldata(DEAD, (1n << 256n) - 1n), chain_id: 8453 } }, // 119
   { name: 'simulate_transaction', arguments: { wallet_id: 1, to: DEAD, value: '0.02', data: '0x12345678', chain_id: 8453 } },     // 120
   { name: 'send_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '0', data: '0x095ea7b3' + pad32(DEAD) + 'ff', chain_id: 8453 } }, // 121
+  // 1.14.4: the native value carried on a classified token call is a spend too (reported privately 2026-10-23).
+  { name: 'send_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '1000000000000000000', data: transferCalldata(DEAD, 1000n), chain_id: 8453 } }, // 122
+  { name: 'send_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '2000000000000000', data: transferCalldata(DEAD, 1000n), chain_id: 8453 } },    // 123
+  { name: 'simulate_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '1', data: transferCalldata(DEAD, 1000n), chain_id: 8453 } },                // 124
+  { name: 'send_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '1000000000000000000', data: approveCalldata(DEAD, 1000n), chain_id: 8453 } },  // 125
 ], baseEnv, { listTools: true, waitMs: 15000 });
 const byId = (id) => run.responses.find((r) => r.id === id);
 
@@ -506,10 +512,31 @@ check('simulate_transaction reports the native budget for a contract call with v
 check('truncated approve calldata is refused, not reclassified as a plain contract call', () => {
   assert.match(rawText(byId(121)), /calldata for approve is truncated/);
 });
+check('1.14.4: a transfer() call carrying 1 ETH is refused by native_budget, the token amount notwithstanding', () => {
+  const t = rawText(byId(122));
+  assert.match(t, /native_budget\.8453 daily budget of 0\.01 would be exceeded/);
+  assert.ok(!/RPC node answered|fetch failed/i.test(t), 'refused before any RPC call');
+});
+check('1.14.4: a transfer() call carrying 0.002 ETH inside the budget reaches the signer (then fails on the dead RPC)', () => {
+  const t = rawText(byId(123));
+  assert.ok(!/policy/.test(t), t);
+  assert.match(t, /RPC node answered|fetch failed|ECONNREFUSED|Broadcast|connect/i);
+});
+check('1.14.4: simulate_transaction reports the carried native value and the native_budget refusal', () => {
+  const s = textOf(byId(124));
+  assert.equal(s.ok, false);
+  assert.equal(s.moves.kind, 'token');
+  assert.match(s.moves.carried_native.amount, /^1(.0+)?$/);
+  assert.equal(s.moves.carried_native.to.toLowerCase(), USDC_BASE.toLowerCase());
+  assert.match(s.policy, /native_budget\.8453/);
+});
+check('1.14.4: an approve() call carrying 1 ETH is refused by native_budget too', () => {
+  assert.match(rawText(byId(125)), /native_budget\.8453 daily budget of 0\.01 would be exceeded/);
+});
 const third = await callTools([{ name: 'list_payments', arguments: { limit: 20 } }], baseEnv, { waitMs: 7000 });
 check('an approval and a wrap inside the budgets are reserved on the ledger (then voided by the dead RPC)', () => {
   const lp = textOf(third.responses.find((x) => x.id === 100));
-  const appr = lp.payments.find((p) => p.method === 'approval');
+  const appr = lp.payments.find((p) => p.method === 'approval' && p.amount === '0.25');
   assert.ok(appr, 'the 0.25 approval is on the ledger');
   assert.equal(appr.amount, '0.25');
   assert.equal(appr.usd, '0.25');
@@ -525,13 +552,30 @@ check('an approval and a wrap inside the budgets are reserved on the ledger (the
   const after = new Ledger(stdioLedger);
   assert.equal(after.integrity, null);
 });
+check('1.14.4: a token call with carried value is two ledger lines, and a refused pair is released together', () => {
+  const lp = textOf(third.responses.find((x) => x.id === 100));
+  const nat = lp.payments.find((p) => p.asset === '' && p.amount === '0.002');
+  assert.ok(nat, 'the carried 0.002 ETH is on the ledger as its own native line: ' + JSON.stringify(lp.payments));
+  assert.equal(nat.method, 'native');
+  assert.equal(nat.to.toLowerCase(), USDC_BASE.toLowerCase(), 'the native value goes to the token contract');
+  assert.equal(nat.outcome, 'void');
+  const tok = lp.payments.filter((p) => p.method === 'transfer' && p.amount === '0.001' && p.asset.toLowerCase() === USDC_BASE.toLowerCase());
+  assert.equal(tok.length, 2, 'both transfer() calls put their token line on the ledger: ' + JSON.stringify(tok));
+  const released = tok.find((p) => /released, the same call was refused: .*native_budget/.test(p.outcome_detail || ''));
+  assert.ok(released, 'the token line of the refused 1 ETH call was released with the native refusal as its reason: ' + JSON.stringify(tok));
+  assert.equal(released.outcome, 'void');
+  const appr = lp.payments.find((p) => p.method === 'approval' && p.amount === '0.001');
+  assert.ok(appr, 'the approval line of the refused approve()+1 ETH call is on the ledger');
+  assert.equal(appr.outcome, 'void');
+  assert.match(appr.outcome_detail, /released, the same call was refused: .*native_budget/);
+  assert.equal(lp.payments.filter((p) => p.asset === '' && p.amount === '1').length, 0, 'the refused 1 ETH was never reserved');
+});
 
 console.log('\n1.14.2: hosted sign_transaction is the same spend as send (reported 2026-10-14)\n');
 
 // Hosted mode: no local key, the API on a closed port. The policy must refuse before the API is ever contacted.
 const hostedLedger = join(dir, 'hosted-ledger.jsonl');
 const hostedEnv = { AGENTWALLET_API_URL: DEAD_API, AGENTWALLET_USER: 'u', AGENTWALLET_PASS: 'p', AGENTWALLET_POLICY: policyFile, AGENTWALLET_LEDGER: hostedLedger, AGENTWALLET_TOKEN_RISK: '0' };
-const transferCalldata = (to, raw) => '0xa9059cbb' + pad32(to) + BigInt(raw).toString(16).padStart(64, '0');
 const hosted = await callTools([
   { name: 'wallet_mode', arguments: {} },                                                                                                      // 100
   { name: 'sign_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '0', data: transferCalldata(OTHER, 100_000_000n), chain_id: 8453 } }, // 101
@@ -649,7 +693,38 @@ await new Promise((r) => liveRpc.listen(0, '127.0.0.1', r));
 const liveEnv = { ...baseEnv, AGENTWALLET_LEDGER: liveLedger, AGENTWALLET_RPC_8453: `http://127.0.0.1:${liveRpc.address().port}` };
 const live = await callTools([{ name: 'transfer', arguments: { wallet_id: 1, to: DEAD, amount: '0.001', chain_id: 8453 } }], liveEnv, { waitMs: 15000 });
 const liveList = await callTools([{ name: 'list_payments', arguments: { limit: 5 } }], liveEnv, { waitMs: 7000 });
+// 1.14.4, the reporter's sequence: a transfer() carrying 0.006 ETH reaches the
+// node (which says it may be live, so both lines stay counted); the same call
+// again must be refused by native_budget, where before it went out uncounted
+// as many times as the balance allowed.
+const carryLedger = join(dir, 'carry-ledger.jsonl');
+const carryEnv = { ...liveEnv, AGENTWALLET_LEDGER: carryLedger };
+const carryCall = { name: 'send_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '6000000000000000', data: transferCalldata(DEAD, 1000n), chain_id: 8453 } };
+const carry1 = await callTools([carryCall], carryEnv, { waitMs: 15000 });
+const carry2 = await callTools([carryCall], carryEnv, { waitMs: 15000 });
+const carryList = await callTools([{ name: 'list_payments', arguments: { limit: 5 } }, { name: 'spend_policy', arguments: {} }], carryEnv, { waitMs: 7000 });
 liveRpc.close();
+check('1.14.4: the first transfer() carrying 0.006 ETH reaches the node and may be live', () => {
+  assert.match(rawText(carry1.responses.find((r) => r.id === 100)), /MAY be live/);
+});
+check('1.14.4: the second identical call is refused by native_budget, the carried value having been counted', () => {
+  const t = rawText(carry2.responses.find((r) => r.id === 100));
+  assert.match(t, /native_budget\.8453 daily budget of 0\.01 would be exceeded: 0\.006 already spent/);
+});
+check('1.14.4: the ledger holds the native line and the token line of the first call, both unknown, and spend_policy shows 0.006 native spent', () => {
+  const lp = textOf(carryList.responses.find((x) => x.id === 100));
+  const nat = lp.payments.filter((p) => p.asset === '');
+  assert.equal(nat.length, 1, JSON.stringify(lp.payments));
+  assert.equal(nat[0].amount, '0.006');
+  assert.equal(nat[0].outcome, 'unknown');
+  assert.equal(nat[0].to.toLowerCase(), USDC_BASE.toLowerCase());
+  const tok = lp.payments.filter((p) => p.asset !== '' && p.outcome === 'unknown');
+  assert.equal(tok.length, 1, JSON.stringify(lp.payments));
+  assert.equal(lp.payments.filter((p) => p.outcome === 'void').length, 1, 'the refused second call released its token line');
+  const sp = textOf(carryList.responses.find((x) => x.id === 101));
+  assert.equal(sp.budgets.native['8453'].daily.spent, '0.006', JSON.stringify(sp.budgets));
+  assert.equal(new Ledger(carryLedger).integrity, null);
+});
 check('a send whose broadcast failed after the bytes reached the node says it may be live', () => {
   assert.match(rawText(live.responses.find((r) => r.id === 100)), /MAY be live/);
 });
