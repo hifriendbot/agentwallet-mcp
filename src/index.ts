@@ -188,12 +188,12 @@ function usdOf(chainId: number, asset: string, raw: string, decimals: number): s
  * dropped the moment the calldata matched a layout (reported privately
  * 2026-10-23).
  */
-type DescribedSend = { kind: 'native' | 'token' | 'approval' | 'spl' | 'contract'; to: string; asset: string; raw: string; decimals: number; unbounded?: boolean; carried?: { raw: string; to: string } };
+type DescribedSend = { kind: 'native' | 'token' | 'approval' | 'spl' | 'contract'; to: string; asset: string; raw: string; decimals: number; unbounded?: boolean; carried?: { raw: string; to: string }; nftTransfer?: boolean; }
 
 /* Calldata the policy prices: which word holds the amount, which the recipient
    or spender, and for Permit2.approve which the token (there `to` is Permit2).
    The same functions the local token cap prices, so the two guards agree. */
-const SPEND_LAYOUTS: Record<string, { kind: 'token' | 'approval'; what: string; toIndex: number; amountIndex: number; tokenIndex?: number; permit2Only?: boolean }> = {
+const SPEND_LAYOUTS: Record<string, { kind: 'token' | 'approval'; what: string; toIndex: number; amountIndex: number; tokenIndex?: number; permit2Only?: boolean; nftApproval?: boolean; nftTransfer?: boolean }> = {
   a9059cbb: { kind: 'token', what: 'transfer', toIndex: 0, amountIndex: 1 },                      // transfer(address,uint256)
   '23b872dd': { kind: 'token', what: 'transferFrom', toIndex: 1, amountIndex: 2 },                // transferFrom(address,address,uint256)
   '4000aea0': { kind: 'token', what: 'transferAndCall', toIndex: 0, amountIndex: 1 },             // transferAndCall(address,uint256,bytes)
@@ -203,6 +203,10 @@ const SPEND_LAYOUTS: Record<string, { kind: 'token' | 'approval'; what: string; 
   '39509351': { kind: 'approval', what: 'increaseAllowance', toIndex: 0, amountIndex: 1 },        // increaseAllowance(address,uint256)
   cae9ca51: { kind: 'approval', what: 'approveAndCall', toIndex: 0, amountIndex: 1 },             // approveAndCall(address,uint256,bytes)
   '87517c45': { kind: 'approval', what: 'Permit2 approve', toIndex: 1, amountIndex: 2, tokenIndex: 0, permit2Only: true }, // Permit2.approve(address,address,uint160,uint48)
+  a22cb465: { kind: 'approval', what: 'setApprovalForAll', toIndex: 0, amountIndex: 1, nftApproval: true }, // ERC-721/1155 setApprovalForAll(address,bool)
+  '42842e0e': { kind: 'token', what: 'ERC-721 safeTransferFrom', toIndex: 1, amountIndex: 2, nftTransfer: true }, // safeTransferFrom(address,address,uint256)
+  b88d4fde: { kind: 'token', what: 'ERC-721 safeTransferFrom with data', toIndex: 1, amountIndex: 2, nftTransfer: true }, // safeTransferFrom(address,address,uint256,bytes)
+  f242432a: { kind: 'token', what: 'ERC-1155 safeTransferFrom', toIndex: 1, amountIndex: 3, nftTransfer: true }, // safeTransferFrom(address,address,uint256,uint256,bytes)
 };
 const UNBOUNDED_APPROVAL = 1n << 128n;
 
@@ -229,6 +233,12 @@ async function describeSend(body: Record<string, unknown>, chainId: number): Pro
       const token = layout.tokenIndex === undefined ? to : '0x' + wordAt(layout.tokenIndex).slice(24);
       const counterparty = '0x' + wordAt(layout.toIndex).slice(24);
       const amount = BigInt('0x' + wordAt(layout.amountIndex));
+      if (layout.nftApproval) {
+        return { kind: 'approval', to: counterparty, asset: to, raw: amount.toString(), decimals: 0, unbounded: true, ...(BigInt(value) > 0n ? { carried: { raw: value, to } } : {}) };
+      }
+      if (layout.nftTransfer) {
+        return { kind: 'token', to: counterparty, asset: to, raw: amount.toString(), decimals: 0, nftTransfer: true, ...(BigInt(value) > 0n ? { carried: { raw: value, to } } : {}) };
+      }
       // The call's own value does not vanish because the calldata was
       // recognised: the contract keeps whatever rides along. It is a second
       // spend, native, to the contract (reported privately 2026-10-23, 1.14.4).
