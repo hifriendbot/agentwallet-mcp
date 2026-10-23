@@ -362,6 +362,11 @@ const WETH_BASE = '0x4200000000000000000000000000000000000006';
 const pad32 = (hex) => hex.replace(/^0x/, '').toLowerCase().padStart(64, '0');
 const approveCalldata = (spender, raw) => '0x095ea7b3' + pad32(spender) + BigInt(raw).toString(16).padStart(64, '0');
 const transferCalldata = (to, raw) => '0xa9059cbb' + pad32(to) + BigInt(raw).toString(16).padStart(64, '0');
+const nftCollection = '0x4444444444444444444444444444444444444444';
+const nftOperator = '0x2222222222222222222222222222222222222222';
+const nftRecipient = '0x3333333333333333333333333333333333333333';
+const setApprovalForAllCalldata = (operator) => '0xa22cb465' + pad32(operator) + '1'.padStart(64, '0');
+const nftSafeTransferFromCalldata = (from, to, tokenId) => '0x42842e0e' + pad32(from) + pad32(to) + BigInt(tokenId).toString(16).padStart(64, '0');
 
 // Seed the ledger with a settled 4-dollar spend so the day has 1 dollar left before the server starts.
 {
@@ -399,6 +404,11 @@ const run = await callTools([
   { name: 'send_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '2000000000000000', data: transferCalldata(DEAD, 1000n), chain_id: 8453 } },    // 123
   { name: 'simulate_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '1', data: transferCalldata(DEAD, 1000n), chain_id: 8453 } },                // 124
   { name: 'send_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '1000000000000000000', data: approveCalldata(DEAD, 1000n), chain_id: 8453 } },  // 125
+  // ERC-721 selectors under the spend policy.
+  { name: 'send_transaction', arguments: { wallet_id: 1, to: nftCollection, value: '0', data: setApprovalForAllCalldata(nftOperator), chain_id: 8453 } }, // 126
+  { name: 'simulate_transaction', arguments: { wallet_id: 1, to: nftCollection, value: '0', data: setApprovalForAllCalldata(nftOperator), chain_id: 8453 } }, // 127
+  { name: 'send_transaction', arguments: { wallet_id: 1, to: nftCollection, value: '0', data: nftSafeTransferFromCalldata(TEST_ADDRESS, nftRecipient, 1n), chain_id: 8453 } }, // 128
+  { name: 'simulate_transaction', arguments: { wallet_id: 1, to: nftCollection, value: '0', data: nftSafeTransferFromCalldata(TEST_ADDRESS, nftRecipient, 1n), chain_id: 8453 } }, // 129
 ], baseEnv, { listTools: true, waitMs: 15000 });
 const byId = (id) => run.responses.find((r) => r.id === id);
 
@@ -532,6 +542,26 @@ check('1.14.4: simulate_transaction reports the carried native value and the nat
 });
 check('1.14.4: an approve() call carrying 1 ETH is refused by native_budget too', () => {
   assert.match(rawText(byId(125)), /native_budget\.8453 daily budget of 0\.01 would be exceeded/);
+});
+check('ERC-721 setApprovalForAll is exposed as an unbounded approval and refused under the policy', () => {
+  const t = rawText(byId(126));
+  assert.match(t, /unlimited approval/);
+  assert.match(t, /Nothing was signed/);
+  const sm = textOf(byId(127));
+  assert.equal(sm.moves.kind, 'approval');
+  assert.equal(sm.moves.amount, 'unlimited');
+  assert.equal(sm.moves.to.toLowerCase(), nftOperator.toLowerCase());
+  assert.equal(sm.moves.asset.toLowerCase(), nftCollection.toLowerCase());
+  assert.equal(sm.signed, false);
+});
+check('ERC-721 safeTransferFrom is exposed as an NFT token movement and refused by the asset allowlist', () => {
+  const t = rawText(byId(128));
+  assert.match(t, /not a registry stablecoin|does not allow asset/);
+  const sm = textOf(byId(129));
+  assert.equal(sm.moves.kind, 'token');
+  assert.equal(sm.moves.to.toLowerCase(), nftRecipient.toLowerCase());
+  assert.equal(sm.moves.asset.toLowerCase(), nftCollection.toLowerCase());
+  assert.equal(sm.signed, false);
 });
 const third = await callTools([{ name: 'list_payments', arguments: { limit: 20 } }], baseEnv, { waitMs: 7000 });
 check('an approval and a wrap inside the budgets are reserved on the ledger (then voided by the dead RPC)', () => {
