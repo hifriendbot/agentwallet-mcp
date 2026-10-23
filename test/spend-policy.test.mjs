@@ -755,6 +755,27 @@ check('hosted: that spend stays on the ledger as unknown', () => {
   assert.equal(lp.payments[0].outcome, 'unknown', JSON.stringify(lp.payments[0]));
 });
 
+// 1.14.4, the second report of the same gap (same day): with recipients.allow
+// set, the contract that keeps the carried value was never checked, only the
+// address inside the calldata. The native line's recipient is the contract,
+// so the allow list binds it; the same call with no value is unaffected.
+const allowPolicy = join(dir, 'allow-policy.json');
+writeFileSync(allowPolicy, JSON.stringify({ version: 1, name: 'allow policy', native_budget: { 8453: { daily: '0.01' } }, recipients: { allow: [DEAD] } }));
+const allowEnv = { ...baseEnv, AGENTWALLET_POLICY: allowPolicy, AGENTWALLET_LEDGER: join(dir, 'allow-ledger.jsonl') };
+const allowRun = await callTools([
+  { name: 'send_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '1000000000000000', data: transferCalldata(DEAD, 1000n), chain_id: 8453 } }, // 100
+  { name: 'send_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '0', data: transferCalldata(DEAD, 1000n), chain_id: 8453 } },                // 101
+], allowEnv, { waitMs: 15000 });
+check('1.14.4: a transfer() to an allowed recipient still cannot carry native value to a contract outside recipients.allow', () => {
+  const t = rawText(allowRun.responses.find((r) => r.id === 100));
+  assert.match(t, /policy does not allow recipient 0x833589fcd6edb6e08f4c7c32d4f71b54bda02913/i);
+  assert.ok(!/RPC node answered|fetch failed/i.test(t), 'refused before any RPC call');
+});
+check('1.14.4: the same transfer() with no value is not touched by that check', () => {
+  const t = rawText(allowRun.responses.find((r) => r.id === 101));
+  assert.ok(!/policy/.test(t), t);
+});
+
 console.log('\nStartup refusals and the encrypted keyfile over stdio\n');
 
 await checkAsync('a policy that does not parse stops the server', async () => {
