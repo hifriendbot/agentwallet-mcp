@@ -127,9 +127,28 @@ export function needsLedger(p: Policy): boolean {
 
 /* ── Matching ─────────────────────────────────────────────────────── */
 
+/**
+ * A DNS name as the policy compares, sums and records it: lowercase, without
+ * the root label's trailing dot. "api.example.com." (and its %2E spelling)
+ * names the same host as "api.example.com", TLS accepts either, and Node's URL
+ * parser keeps the dot, so the raw hostname slipped past hosts.deny and
+ * per_host (reported privately 2026-10-24, 1.14.5). IP literals pass through.
+ */
+export function canonicalHost(host: string): string {
+  let h = host.trim().toLowerCase();
+  if (h.startsWith('[')) return h;
+  while (h.endsWith('.')) h = h.slice(0, -1);
+  return h;
+}
+
+/** The host of a URL as the policy sees it. */
+export function hostOf(url: string): string {
+  return canonicalHost(new URL(url).hostname);
+}
+
 export function hostMatches(pattern: string, host: string): boolean {
-  const p = pattern.toLowerCase();
-  const h = host.toLowerCase();
+  const p = canonicalHost(pattern);
+  const h = canonicalHost(host);
   if (p.startsWith('*.')) return h.endsWith(p.slice(1)) && h.length > p.length - 1;
   return p === h;
 }

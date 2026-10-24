@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 
 const {
-  parsePolicy, hostMatches, hostAllowed, recipientAllowed, targetAllowed, assetAllowed, toolAllowed, perHostRule, units, human, rawToUnits, loadPolicy, needsLedger,
+  parsePolicy, hostMatches, hostAllowed, recipientAllowed, targetAllowed, assetAllowed, toolAllowed, perHostRule, units, human, rawToUnits, loadPolicy, needsLedger, canonicalHost, hostOf,
 } = await import('../build/policy.js');
 const { Ledger } = await import('../build/ledger.js');
 const { encryptKeyfile, decryptKeyfile, isEncryptedKeyfile, keyfilePassphrase, openKeyfile } = await import('../build/keyfile.js');
@@ -94,6 +94,37 @@ check('per_host rule lookup follows the same matching', () => {
   const p = { version: 1, per_host: { '*.example.com': { daily: '1', per_payment: '0.1' } } };
   assert.equal(perHostRule(p, 'api.example.com').per_payment, '0.1');
   assert.equal(perHostRule(p, 'example.com'), null);
+});
+// 1.14.5: "api.example.com." is api.example.com. Node keeps the root dot in
+// URL.hostname (and decodes %2E into one), and the raw string matched nothing
+// in hosts.deny or per_host (reported privately 2026-10-24).
+check('a trailing DNS root dot names the same host: deny, wildcard deny and per_host all apply', () => {
+  const p = { version: 1, hosts: { deny: ['api.example.com', '*.blocked.example.com'] }, per_host: { 'api.example.com': { daily: '1', per_payment: '0.10' } } };
+  for (const spelled of ['api.example.com.', 'API.example.com.', 'api.example.com..']) {
+    assert.equal(hostAllowed(p, spelled).ok, false, spelled);
+    assert.equal(perHostRule(p, spelled)?.per_payment, '0.10', spelled);
+  }
+  assert.equal(hostAllowed(p, 'a.blocked.example.com.').ok, false);
+  assert.equal(hostMatches('*.example.com', 'example.com.'), false, 'the apex with a root dot is still the apex');
+  assert.equal(hostAllowed({ version: 1, hosts: { allow: ['api.example.com'] } }, 'api.example.com.').ok, true, 'an allow list admits the dotted spelling of its own entry');
+});
+check('hostOf canonicalises the URL host: literal dot, %2E, upper case; IP literals pass through', () => {
+  assert.equal(hostOf('https://api.example.com./pay'), 'api.example.com');
+  assert.equal(hostOf('https://api.example.com%2E/pay'), 'api.example.com');
+  assert.equal(hostOf('https://API.Example.COM./pay'), 'api.example.com');
+  assert.equal(hostOf('https://1.2.3.4./pay'), '1.2.3.4');
+  assert.equal(canonicalHost('[::1]'), '[::1]');
+  assert.equal(canonicalHost('  Example.ORG.  '), 'example.org');
+});
+check('the ledger sums and lists a host by its canonical name, old dotted lines included', () => {
+  const file = join(dir, 'dotted-ledger.jsonl');
+  const l = new Ledger(file);
+  const mk = (host) => ({ tool: 'pay_x402', mode: 'local', wallet: 'local', chainId: 8453, asset: USDC_BASE, assetLabel: 'USDC', raw: '250000', decimals: 6, usd: '0.25', to: DEAD, host, resource: 'GET /x', method: 'exact' });
+  l.settle(l.reserve(mk('api.example.com.'), { usd: undefined, native: undefined, host: null, unpriced: 'refuse' }), 'settled', null);
+  l.settle(l.reserve(mk('api.example.com'), { usd: undefined, native: undefined, host: null, unpriced: 'refuse' }), 'settled', null);
+  assert.equal(human(l.spentUsd(Date.now(), 'api.example.com').daily), '0.5');
+  assert.equal(human(l.spentUsd(Date.now(), 'api.example.com.').daily), '0.5');
+  assert.equal(l.payments({ limit: 10, host: 'api.example.com' }).length, 2);
 });
 check('fixed-point arithmetic: "1.50" and "1.5" agree, raw amounts scale by decimals', () => {
   assert.equal(units('1.50'), units('1.5'));
@@ -399,6 +430,9 @@ const run = await callTools([
   { name: 'send_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '2000000000000000', data: transferCalldata(DEAD, 1000n), chain_id: 8453 } },    // 123
   { name: 'simulate_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '1', data: transferCalldata(DEAD, 1000n), chain_id: 8453 } },                // 124
   { name: 'send_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '1000000000000000000', data: approveCalldata(DEAD, 1000n), chain_id: 8453 } },  // 125
+  // 1.14.5: the DNS root dot and its %2E spelling name the denied host (reported privately 2026-10-24).
+  { name: 'pay_x402', arguments: { url: 'https://denied.example.com./paid', wallet_id: 1 } },    // 126
+  { name: 'quote_x402', arguments: { url: 'https://DENIED.example.com%2E/paid' } },             // 127
 ], baseEnv, { listTools: true, waitMs: 15000 });
 const byId = (id) => run.responses.find((r) => r.id === id);
 
@@ -438,6 +472,17 @@ check('quote_x402 to a denied host never contacts it either', () => {
   const r = textOf(byId(105));
   assert.equal(r.would_pay, false);
   assert.match(r.error, /policy denies host/);
+});
+check('1.14.5: pay_x402 to the denied host spelled with a DNS root dot is refused before contact', () => {
+  const r = textOf(byId(126));
+  assert.equal(r.policy_refusal, true, rawText(byId(126)));
+  assert.equal(r.host, 'denied.example.com');
+  assert.match(r.error, /policy denies host denied\.example\.com .*not contacted/);
+});
+check('1.14.5: quote_x402 with the %2E spelling of the root dot is refused the same way', () => {
+  const r = textOf(byId(127));
+  assert.equal(r.would_pay, false, rawText(byId(127)));
+  assert.match(r.error, /policy denies host denied\.example\.com/);
 });
 // The SDK runs tool calls concurrently, so the ledger is read in a fresh session once the first has exited.
 const second = await callTools([{ name: 'list_payments', arguments: { limit: 10 } }], baseEnv, { waitMs: 7000 });
@@ -816,6 +861,72 @@ await checkAsync('an unknown AGENTWALLET_* name still refuses to start; the new 
   assert.match(r.stderr, /Unknown environment variable AGENTWALLET_LEDGERR/);
   const ok = await callTools([{ name: 'wallet_mode', arguments: {} }], { ...baseEnv, AGENTWALLET_WEBHOOK_URL: 'https://hooks.example.com/x', AGENTWALLET_WEBHOOK_SECRET: 's' }, { waitMs: 7000 });
   assert.equal(textOf(ok.responses.find((x) => x.id === 100)).mode, 'local');
+});
+
+// 1.14.5: in hosted mode the caller's token_decimals priced an SPL send against
+// the policy. With USDC (6 decimals) and token_decimals 18, 1,000 USDC was
+// valued at a trillionth of a dollar, passed a 1 dollar daily budget and the
+// request reached the custodian (reported privately 2026-10-24). The mint's own
+// decimals price the spend now and a disagreeing hint is refused before any
+// request leaves the process.
+console.log('\n1.14.5: hosted SPL send is priced by the mint, not the caller (reported 2026-10-24)\n');
+
+const USDC_SOL = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const SYSTEM_PROGRAM = '11111111111111111111111111111111';
+const FAKE_SIG = '5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW';
+const splPosts = [];
+const splApi = createServer((req, res) => {
+  let raw = '';
+  req.on('data', (c) => { raw += c; });
+  req.on('end', () => {
+    if (req.method === 'POST') splPosts.push({ path: req.url, body: JSON.parse(raw || '{}') });
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify(req.method === 'POST' ? { signature: FAKE_SIG } : { ok: true }));
+  });
+});
+await new Promise((r) => splApi.listen(0, '127.0.0.1', r));
+const splPolicy = join(dir, 'spl-policy.json');
+writeFileSync(splPolicy, JSON.stringify({ version: 1, budget: { daily: '1.00' }, chains: { allow: [900] }, assets: { allow: ['900:' + USDC_SOL] } }));
+const splLedger = join(dir, 'spl-ledger.jsonl');
+const splEnv = { ...hostedEnv, AGENTWALLET_API_URL: `http://127.0.0.1:${splApi.address().port}`, AGENTWALLET_POLICY: splPolicy, AGENTWALLET_LEDGER: splLedger };
+const splSend = (value, token_decimals) => ({ name: 'send_transaction', arguments: { wallet_id: 1, chain_id: 900, to: SYSTEM_PROGRAM, token_mint: USDC_SOL, value, ...(token_decimals === undefined ? {} : { token_decimals }) } });
+
+const splWrong = await callTools([splSend('1000000000', 18)], splEnv, { waitMs: 10000 });
+const postsAfterWrong = splPosts.length;
+const splRight = await callTools([splSend('1000000000', 6)], splEnv, { waitMs: 10000 });
+const postsAfterRight = splPosts.length;
+const splOk = await callTools([splSend('500000', 6)], splEnv, { waitMs: 10000 });
+const splHint = await callTools([splSend('250000')], splEnv, { waitMs: 10000 });
+const splList = await callTools([{ name: 'list_payments', arguments: { limit: 10 } }], splEnv, { waitMs: 7000 });
+splApi.close();
+
+check('token_decimals 18 on the USDC mint is refused as a decimals mismatch, before the custodian is asked', () => {
+  assert.match(rawText(splWrong.responses.find((r) => r.id === 100)), /decimals 18 was passed but .* has 6 decimals/);
+  assert.equal(postsAfterWrong, 0, JSON.stringify(splPosts));
+});
+check('the same 1,000 USDC at its true 6 decimals is refused by the 1 dollar daily budget, still without a request', () => {
+  assert.match(rawText(splRight.responses.find((r) => r.id === 100)), /daily budget of 1.00 would be exceeded/);
+  assert.equal(postsAfterRight, 0, JSON.stringify(splPosts));
+});
+check('an in-budget 0.5 USDC send at 6 decimals reaches the custodian once, with the body unchanged', () => {
+  const r = textOf(splOk.responses.find((x) => x.id === 100));
+  assert.equal(r?.signature, FAKE_SIG, rawText(splOk.responses.find((x) => x.id === 100)));
+  const post = splPosts.find((p) => p.body.value === '500000');
+  assert.ok(post, JSON.stringify(splPosts));
+  assert.match(post.path, /^\/wallets\/1\/send/);
+  assert.equal(post.body.token_decimals, 6);
+});
+check('with no hint the mint decides: 0.25 USDC is priced at 6 decimals and sent', () => {
+  assert.equal(textOf(splHint.responses.find((x) => x.id === 100))?.signature, FAKE_SIG, rawText(splHint.responses.find((x) => x.id === 100)));
+  assert.equal(splPosts.length, 2, JSON.stringify(splPosts));
+});
+check('the ledger holds the two sends at their dollar value and nothing for the refused ones', () => {
+  const lp = textOf(splList.responses.find((x) => x.id === 100));
+  assert.equal(lp.payments.length, 2, JSON.stringify(lp.payments));
+  const usd = lp.payments.map((p) => p.usd).sort();
+  assert.deepEqual(usd, ['0.25', '0.5'], JSON.stringify(lp.payments));
+  for (const p of lp.payments) assert.equal(p.outcome, 'broadcast', JSON.stringify(p));
+  assert.equal(new Ledger(splLedger).integrity, null);
 });
 
 console.log(`\nspend-policy: ${passed} passed, ${failed} failed\n`);

@@ -82,7 +82,7 @@ import {
 } from './local-solana.js';
 import { localSimulate } from './local-wallet.js';
 import {
-  loadPolicy, describePolicy, hostAllowed, recipientAllowed, targetAllowed, chainAllowed, assetAllowed, perHostRule, toolAllowed,
+  loadPolicy, describePolicy, hostAllowed, recipientAllowed, targetAllowed, chainAllowed, assetAllowed, perHostRule, toolAllowed, hostOf,
   budgetReport, units as policyUnits, human as policyHuman, rawToUnits, type LoadedPolicy,
 } from './policy.js';
 import { Ledger, type ReserveInput, type Limits, type SpendMethod } from './ledger.js';
@@ -210,7 +210,13 @@ async function describeSend(body: Record<string, unknown>, chainId: number): Pro
   if (body.token_mint) {
     const mint = String(body.token_mint);
     const d = Number(body.token_decimals);
-    return { kind: 'spl', to: String(body.to || ''), asset: mint, raw: String(body.value ?? '0'), decimals: Number.isInteger(d) && d >= 0 && d <= 36 ? d : await verifiedDecimals(chainId, mint) };
+    // The caller's token_decimals only ever confirms the mint's own value: in
+    // hosted mode it was taken as given, so "18" for USDC priced a 1,000 USDC
+    // send at a trillionth of a dollar against the budget and the request
+    // reached the custodian (reported privately 2026-10-24, 1.14.5). The chain
+    // would have refused the TransferChecked, but the ledger was already wrong.
+    const given = Number.isInteger(d) && d >= 0 && d <= 36 ? d : undefined;
+    return { kind: 'spl', to: String(body.to || ''), asset: mint, raw: String(body.value ?? '0'), decimals: await verifiedDecimals(chainId, mint, given) };
   }
   const data = String(body.data || '');
   const to = String(body.to || '');
@@ -891,8 +897,8 @@ async function handleX402Payment(
 
   // Send payment using our wallet (with X-AGW-SKIP-X402 to prevent recursion).
   // The ledger context names the API host and route; the /send hook reserves and settles the spend.
-  const ctx = { 'X-AGW-SKIP-X402': 'true', 'X-AGW-CTX': JSON.stringify({ tool: 'autopay', host: new URL(API_BASE).hostname, resource: `${originalMethod} ${originalPath.split('?')[0]}`, method: 'autopay' }) };
-  const hostRule = hostAllowed(POL(), new URL(API_BASE).hostname);
+  const ctx = { 'X-AGW-SKIP-X402': 'true', 'X-AGW-CTX': JSON.stringify({ tool: 'autopay', host: hostOf(API_BASE), resource: `${originalMethod} ${originalPath.split('?')[0]}`, method: 'autopay' }) };
+  const hostRule = hostAllowed(POL(), hostOf(API_BASE));
   if (!hostRule.ok) throw new Error(`x402 auto-pay refused: ${hostRule.reason}`);
   let txHash: string;
   try {
@@ -1274,7 +1280,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.14.4',
+    version: '1.14.5',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()
@@ -2121,8 +2127,8 @@ tool(
 
     // A host the policy denies is never contacted at all, not even for the quote.
     {
-      const early = hostAllowed(POL(), new URL(url).hostname);
-      if (!early.ok) return jsonResponse({ status: null, payment_required: null, payment_made: false, policy_refusal: true, host: new URL(url).hostname, error: early.reason + ' The endpoint was not contacted.' });
+      const early = hostAllowed(POL(), hostOf(url));
+      if (!early.ok) return jsonResponse({ status: null, payment_required: null, payment_made: false, policy_refusal: true, host: hostOf(url), error: early.reason + ' The endpoint was not contacted.' });
     }
 
     // Validate URL: canonicalizes IP literals (including IPv4-mapped IPv6) and
@@ -2259,7 +2265,7 @@ tool(
     // Step 3e: Spend policy. The host, chain, asset and recipient lists, the
     // per-host ceiling, and whether the rolling budgets have room. Nothing is
     // recorded here; the reservation is written at signing time.
-    const payHost = new URL(url).hostname;
+    const payHost = hostOf(url);
     const hostLimit = perHostRule(POL(), payHost);
     const amount18 = rawToUnits(rawAmount, trustedDecimals);
     const policyInput: ReserveInput = {
@@ -2964,7 +2970,7 @@ tool(
         reqHeaders[k] = v;
       }
     }
-    const host = new URL(url).hostname;
+    const host = hostOf(url);
     {
       const early = hostAllowed(POL(), host);
       if (!early.ok) return jsonResponse({ status: null, payment_required: null, would_pay: false, policy_refusal: true, host, error: early.reason + ' The endpoint was not contacted.' });

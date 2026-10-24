@@ -18,7 +18,7 @@
  */
 import { appendFileSync, existsSync, readFileSync, openSync, closeSync, writeSync, unlinkSync, statSync } from 'node:fs';
 import { createHash, createHmac } from 'node:crypto';
-import { DAY_MS, MONTH_MS, type Spent, units, rawToUnits, human } from './policy.js';
+import { DAY_MS, MONTH_MS, type Spent, units, rawToUnits, human, canonicalHost } from './policy.js';
 
 /** 'approval' is an ERC-20 allowance granted (approve, increaseAllowance, Permit2.approve): a spend the spender executes later, counted when granted. */
 export type SpendMethod = 'eip3009' | 'permit2' | 'transfer' | 'native' | 'spl' | 'autopay' | 'approval';
@@ -218,7 +218,10 @@ export class Ledger {
     return this.sumNative(chainId, nowMs);
   }
   private sumUsd(nowMs: number, host?: string): Spent {
-    return this.sum(nowMs, e => (host === undefined || e.host === host) && e.usd !== null ? units(e.usd!) : 0n);
+    // Lines are written with the canonical host, but a ledger from before 1.14.5
+    // may hold "api.example.com." lines; they belong to the same host's sum.
+    const want = host === undefined ? undefined : canonicalHost(host);
+    return this.sum(nowMs, e => (want === undefined || (e.host !== null && canonicalHost(e.host) === want)) && e.usd !== null ? units(e.usd!) : 0n);
   }
   private sumNative(chainId: number, nowMs: number): Spent {
     return this.sum(nowMs, e => e.chain_id === chainId && e.asset === '' ? rawToUnits(e.raw, nativeDecimalsOf(chainId)) : 0n);
@@ -307,7 +310,7 @@ export class Ledger {
     for (let i = this.entries.length - 1; i >= 0 && out.length < opts.limit; i--) {
       const e = this.entries[i];
       if (e.kind !== 'spend') continue;
-      if (opts.host !== undefined && e.host !== opts.host) continue;
+      if (opts.host !== undefined && (e.host === null || canonicalHost(e.host) !== canonicalHost(opts.host))) continue;
       if (opts.since !== undefined && Date.parse(e.ts) < opts.since) continue;
       const f = follow.get(e.seq);
       const outcome = f ? f.outcome : 'signed';
