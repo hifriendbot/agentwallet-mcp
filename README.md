@@ -256,7 +256,7 @@ pay_x402(
 
 **Asset risk.** `check_token_risk` (and every `approve_token` result) reports honeypot, tax, owner-power, verified-source, holder-concentration and liquidity flags from GoPlus Security, with an on-chain fallback. A warning for the caller to weigh, never a block.
 
-**Proof.** Real settlements are listed in [PAYMENTS.md](https://github.com/hifriendbot/agentwallet-mcp/blob/main/PAYMENTS.md); the first is a 0.02 USDC `exact` payment on Base with the facilitator paying the gas.
+**Proof.** Real settlements are listed in [PAYMENTS.md](https://github.com/hifriendbot/agentwallet-mcp/blob/main/PAYMENTS.md); the first is a 0.02 USDC `exact` payment on Base with the facilitator paying the gas. The same list, rendered with Basescan links, is at [hifriendbot.com/wallet/payments](https://hifriendbot.com/wallet/payments/), and a five-minute walkthrough from install to a real settlement is at [hifriendbot.com/wallet/quickstart](https://hifriendbot.com/wallet/quickstart/). Security policy, fixed disclosures and the release history: [hifriendbot.com/security](https://hifriendbot.com/security/) and [hifriendbot.com/changelog](https://hifriendbot.com/changelog/).
 
 ## Pay any x402 API from Claude in three steps
 
