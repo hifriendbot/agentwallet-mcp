@@ -13,6 +13,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { dirname, isAbsolute, join } from 'node:path';
 import { z } from 'zod';
 
 const Dec = z.string().regex(/^\d+(\.\d+)?$/, 'a decimal number as a string, like "5" or "0.25"');
@@ -113,10 +114,13 @@ export function loadPolicy(env: NodeJS.ProcessEnv = process.env): LoadedPolicy {
   try { text = readFileSync(file, 'utf8'); } catch (e) { throw new Error(`AGENTWALLET_POLICY: could not read ${file}: ${(e as Error).message}`); }
   const policy = parsePolicy(text);
   const hash = createHash('sha256').update(text).digest('hex');
-  const dir = file.replace(/[\\/][^\\/]*$/, '') || '.';
+  // The ledger lives beside the policy file. dirname() gives '.' for a bare
+  // filename; a hand-rolled strip-after-last-slash left the filename itself as
+  // the directory, so AGENTWALLET_POLICY=policy.json could not start (1.14.6).
+  const dir = dirname(file);
   let ledgerPath: string | null = ledgerEnv || null;
-  if (!ledgerPath && policy.ledger) ledgerPath = /^([a-zA-Z]:)?[\\/]/.test(policy.ledger) ? policy.ledger : `${dir}/${policy.ledger}`;
-  if (!ledgerPath && needsLedger(policy)) ledgerPath = `${dir}/agentwallet-ledger.jsonl`;
+  if (!ledgerPath && policy.ledger) ledgerPath = isAbsolute(policy.ledger) ? policy.ledger : join(dir, policy.ledger);
+  if (!ledgerPath && needsLedger(policy)) ledgerPath = join(dir, 'agentwallet-ledger.jsonl');
   return { policy, path: file, hash, ledgerPath };
 }
 
