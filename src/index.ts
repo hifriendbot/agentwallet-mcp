@@ -79,6 +79,7 @@ import {
   localSplTransfer,
   resolveSolanaRpc,
   mintDecimalsStrict,
+  splAccountRent,
 } from './local-solana.js';
 import { localSimulate } from './local-wallet.js';
 import {
@@ -141,7 +142,10 @@ function reserveSpend(input: ReserveInput): number {
   const p = POL();
   const chain = chainAllowed(p, input.chainId);
   if (!chain.ok) throw new Error(chain.reason + ' Nothing was signed.');
-  const asset = assetAllowed(p, input.chainId, input.asset);
+  // Rent is SOL by nature, not by choice: the operator allowed the token, and
+  // the account that holds it is paid for in the chain's coin, so assets.allow
+  // does not have to list native for the rent line. native_budget counts it.
+  const asset = input.method === 'rent' ? { ok: true as const } : assetAllowed(p, input.chainId, input.asset);
   if (!asset.ok) throw new Error(asset.reason + ' Nothing was signed.');
   const to = recipientAllowed(p, input.to);
   if (!to.ok) throw new Error(to.reason + ' Nothing was signed.');
@@ -153,7 +157,7 @@ function reserveSpend(input: ReserveInput): number {
 /** The same checks with nothing recorded, for quotes and simulations. */
 function spendVerdict(input: ReserveInput): { ok: true } | { ok: false; reason: string } {
   const p = POL();
-  for (const r of [chainAllowed(p, input.chainId), assetAllowed(p, input.chainId, input.asset), recipientAllowed(p, input.to)]) if (!r.ok) return r;
+  for (const r of [chainAllowed(p, input.chainId), input.method === 'rent' ? { ok: true as const } : assetAllowed(p, input.chainId, input.asset), recipientAllowed(p, input.to)]) if (!r.ok) return r;
   const limits = limitsFor(input.host);
   limits.native = p.native_budget?.[String(input.chainId)];
   return LEDGER.check(input, limits);
@@ -186,9 +190,13 @@ function usdOf(chainId: number, asset: string, raw: string, decimals: number): s
  * its calldata. A payable token contract keeps it, so it is a second spend:
  * native, against native_budget, to the called contract. Before 1.14.4 it was
  * dropped the moment the calldata matched a layout (reported privately
- * 2026-10-23).
+ * 2026-10-23). For an SPL send in local mode it is the rent the wallet pays
+ * to create the recipient's token account (`rent: true`): native, to the
+ * recipient, who owns the account and can close it for the lamports. Before
+ * 1.14.7 that rent met the per-transaction SOL cap only and never the rolling
+ * native_budget (reported privately 2026-10-26).
  */
-type DescribedSend = { kind: 'native' | 'token' | 'approval' | 'spl' | 'contract'; to: string; asset: string; raw: string; decimals: number; unbounded?: boolean; carried?: { raw: string; to: string } };
+type DescribedSend = { kind: 'native' | 'token' | 'approval' | 'spl' | 'contract'; to: string; asset: string; raw: string; decimals: number; unbounded?: boolean; carried?: { raw: string; to: string; rent?: true } };
 
 /* Calldata the policy prices: which word holds the amount, which the recipient
    or spender, and for Permit2.approve which the token (there `to` is Permit2).
@@ -216,7 +224,18 @@ async function describeSend(body: Record<string, unknown>, chainId: number): Pro
     // reached the custodian (reported privately 2026-10-24, 1.14.5). The chain
     // would have refused the TransferChecked, but the ledger was already wrong.
     const given = Number.isInteger(d) && d >= 0 && d <= 36 ? d : undefined;
-    return { kind: 'spl', to: String(body.to || ''), asset: mint, raw: String(body.value ?? '0'), decimals: await verifiedDecimals(chainId, mint, given) };
+    const to = String(body.to || '');
+    const decimals = await verifiedDecimals(chainId, mint, given);
+    // In local mode this process is the payer: when the recipient has no token
+    // account yet, the send creates one and the rent is native value leaving
+    // the wallet, reserved here from the same reading the signer will make.
+    // The hosted custodian pays its own rent and bounds it on its side.
+    let carried: DescribedSend['carried'];
+    if (isSolanaLocalMode() && to) {
+      const rent = await splAccountRent(mint, to, chainId);
+      if (rent > 0n) carried = { raw: rent.toString(), to, rent: true };
+    }
+    return { kind: 'spl', to, asset: mint, raw: String(body.value ?? '0'), decimals, ...(carried ? { carried } : {}) };
   }
   const data = String(body.data || '');
   const to = String(body.to || '');
@@ -289,7 +308,9 @@ function assertSendTarget(d: DescribedSend, chainId: number): void {
  * recipients.allow and .deny bind who may be allowed to pull; the native
  * value of a contract call is a spend to that contract; the native value
  * carried on a token or approval call is a second spend, native, to the
- * called contract (1.14.4). Throws for an unbounded approval under a policy.
+ * called contract (1.14.4); the rent a local SPL send pays for the recipient's
+ * token account is a native spend to the recipient, method 'rent' (1.14.7).
+ * Throws for an unbounded approval under a policy.
  */
 function spendInputsOf(d: DescribedSend, chainId: number, tool: string, wallet: string, ctx: { host?: string; resource?: string; method?: SpendMethod } = {}): ReserveInput[] {
   if (d.kind === 'approval' && d.unbounded && POLICY.path) {
@@ -308,7 +329,7 @@ function spendInputsOf(d: DescribedSend, chainId: number, tool: string, wallet: 
     });
   }
   if (d.carried) {
-    out.push({ ...base, asset: '', assetLabel: assetLabel(chainId, ''), raw: d.carried.raw, decimals: nativeDecimals(chainId), usd: null, to: d.carried.to, method: 'native' });
+    out.push({ ...base, asset: '', assetLabel: assetLabel(chainId, ''), raw: d.carried.raw, decimals: nativeDecimals(chainId), usd: null, to: d.carried.to, method: d.carried.rent ? 'rent' : 'native' });
   }
   return out;
 }
@@ -1280,7 +1301,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.14.6',
+    version: '1.14.7',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()

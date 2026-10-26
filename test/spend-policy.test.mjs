@@ -929,5 +929,137 @@ check('the ledger holds the two sends at their dollar value and nothing for the 
   assert.equal(new Ledger(splLedger).integrity, null);
 });
 
+// ─── 1.14.7: the rent an SPL send pays for the recipient's token account is a native spend ───
+// Reported privately 2026-10-26: in local mode, transfer_token to a recipient
+// with no token account creates one and the wallet funds its rent (0.00203928
+// SOL for a classic mint), checked against AGENTWALLET_MAX_TX_SOL but never
+// reserved against native_budget, so fresh recipients drained SOL past the
+// daily limit while the ledger held only token lines. The recipient owns the
+// account and can close it to keep the lamports. A loopback cluster mock
+// (HTTP RPC plus the WebSocket the confirmation subscribes to) serves a
+// 0-decimal classic mint, answers every send with its own signature and
+// remembers the token accounts it "created".
+console.log('\n1.14.7: SPL token-account rent counts against native_budget (reported 2026-10-26)\n');
+
+const { Keypair, PublicKey, Transaction } = await import('@solana/web3.js');
+const { WebSocketServer } = await import('ws');
+const bs58 = (await import('bs58')).default;
+const SOL_TOKEN_PROGRAM = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+const SOL_ATA_PROGRAM = 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL';
+const SOL_GENESIS = '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d';
+const ATA_RENT = (128 + 165) * 6960; // 2,039,280 lamports, the cluster's rent-exempt minimum for a classic token account
+const solKey = Keypair.generate();
+const rentMint = Keypair.generate().publicKey.toBase58();
+const rentR1 = Keypair.generate().publicKey.toBase58();
+const rentR2 = Keypair.generate().publicKey.toBase58();
+const ataOf = (owner) => PublicKey.findProgramAddressSync(
+  [new PublicKey(owner).toBuffer(), new PublicKey(SOL_TOKEN_PROGRAM).toBuffer(), new PublicKey(rentMint).toBuffer()],
+  new PublicKey(SOL_ATA_PROGRAM),
+)[0].toBase58();
+const createdAtas = new Set();
+const solBroadcasts = []; // { ata: boolean, payer, owner }
+const mintAccount = (parsed) => ({
+  data: parsed
+    ? { program: 'spl-token', parsed: { type: 'mint', info: { decimals: 0, supply: '1000', isInitialized: true, mintAuthority: null, freezeAuthority: null } }, space: 82 }
+    : [Buffer.alloc(82).toString('base64'), 'base64'],
+  executable: false, lamports: 1461600, owner: SOL_TOKEN_PROGRAM, rentEpoch: 0, space: 82,
+});
+const tokenAccount = () => ({ data: [Buffer.alloc(165).toString('base64'), 'base64'], executable: false, lamports: ATA_RENT, owner: SOL_TOKEN_PROGRAM, rentEpoch: 0, space: 165 });
+const solRpc = createServer((req, res) => {
+  let raw = '';
+  req.on('data', (c) => { raw += c; });
+  req.on('end', () => {
+    const { id, method, params = [] } = JSON.parse(raw);
+    const reply = (p) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ jsonrpc: '2.0', id, ...p })); };
+    const slot = { context: { slot: 1 } };
+    if (method === 'getGenesisHash') return reply({ result: SOL_GENESIS });
+    if (method === 'getAccountInfo') {
+      if (params[0] === rentMint) return reply({ result: { ...slot, value: mintAccount(params[1]?.encoding === 'jsonParsed') } });
+      if (createdAtas.has(params[0])) return reply({ result: { ...slot, value: tokenAccount() } });
+      return reply({ result: { ...slot, value: null } });
+    }
+    if (method === 'getMinimumBalanceForRentExemption') return reply({ result: ATA_RENT });
+    if (method === 'getLatestBlockhash') return reply({ result: { ...slot, value: { blockhash: bs58.encode(Buffer.alloc(32, 7)), lastValidBlockHeight: 1000 } } });
+    if (method === 'getBlockHeight') return reply({ result: 10 });
+    if (method === 'getSignatureStatuses') return reply({ result: { ...slot, value: [{ slot: 1, confirmations: 1, err: null, confirmationStatus: 'confirmed' }] } });
+    if (method === 'sendTransaction') {
+      const tx = Transaction.from(Buffer.from(params[0], 'base64'));
+      const create = tx.instructions.find((ix) => ix.programId.toBase58() === SOL_ATA_PROGRAM);
+      if (create) createdAtas.add(create.keys[1].pubkey.toBase58());
+      solBroadcasts.push({ ata: Boolean(create), payer: create?.keys[0].pubkey.toBase58() ?? null, owner: create?.keys[2].pubkey.toBase58() ?? null });
+      return reply({ result: bs58.encode(tx.signature) });
+    }
+    return reply({ error: { code: -32601, message: `mock: ${method} not served` } });
+  });
+});
+await new Promise((r) => solRpc.listen(0, '127.0.0.1', r));
+// web3.js subscribes for confirmation on the RPC port plus one.
+const solWs = new WebSocketServer({ host: '127.0.0.1', port: solRpc.address().port + 1 });
+await new Promise((r) => solWs.once('listening', r));
+solWs.on('connection', (socket) => socket.on('message', (m) => {
+  const { id, method } = JSON.parse(String(m));
+  socket.send(JSON.stringify({ jsonrpc: '2.0', id, result: method === 'signatureSubscribe' ? 1 : true }));
+  if (method === 'signatureSubscribe') setTimeout(() => socket.send(JSON.stringify({ jsonrpc: '2.0', method: 'signatureNotification', params: { result: { context: { slot: 2 }, value: { err: null } }, subscription: 1 } })), 20);
+}));
+
+const rentPolicy = join(dir, 'rent-policy.json');
+// 0.003 SOL a day holds one token-account rent (0.00203928) but not two; the
+// per-transaction cap sits above one rent, so only the rolling budget can stop the second.
+writeFileSync(rentPolicy, JSON.stringify({ version: 1, native_budget: { 900: { daily: '0.003' } }, assets: { allow: ['900:' + rentMint] } }));
+const rentLedger = join(dir, 'rent-ledger.jsonl');
+const rentEnv = {
+  AGENTWALLET_SOLANA_KEY: JSON.stringify(Array.from(solKey.secretKey)), AGENTWALLET_SOLANA_RPC_900: `http://127.0.0.1:${solRpc.address().port}`,
+  AGENTWALLET_API_URL: DEAD_API, AGENTWALLET_MAX_TX_SOL: '0.0021', AGENTWALLET_POLICY: rentPolicy, AGENTWALLET_LEDGER: rentLedger, AGENTWALLET_TOKEN_RISK: '0',
+};
+const rentSend = (to) => ({ name: 'transfer_token', arguments: { wallet_id: 1, token: rentMint, to, amount: '1', chain_id: 900 } });
+// One session per step: the SDK runs a session's calls concurrently, and each step must see the one before it settled.
+const rentFirst = await callTools([rentSend(rentR1)], rentEnv, { waitMs: 20000 });
+const broadcastsAfterFirst = solBroadcasts.length;
+const rentSecond = await callTools([rentSend(rentR2)], rentEnv, { waitMs: 20000 });
+const broadcastsAfterSecond = solBroadcasts.length;
+const rentAgain = await callTools([rentSend(rentR1)], rentEnv, { waitMs: 20000 });
+const rentReport = await callTools([{ name: 'list_payments', arguments: { limit: 10 } }, { name: 'spend_policy', arguments: {} }], rentEnv, { waitMs: 8000 });
+solWs.close();
+solRpc.close();
+
+check('the first send to a recipient with no token account goes out, and the wallet pays the account\'s rent for the recipient', () => {
+  assert.match(rawText(rentFirst.responses.find((r) => r.id === 100)), /"signature"/);
+  assert.equal(broadcastsAfterFirst, 1, JSON.stringify(solBroadcasts));
+  assert.deepEqual(solBroadcasts[0], { ata: true, payer: solKey.publicKey.toBase58(), owner: rentR1 });
+});
+check('the ledger holds that rent as its own native line, method rent, to the recipient, beside the token line', () => {
+  const lp = textOf(rentReport.responses.find((x) => x.id === 100));
+  const rent = lp.payments.filter((p) => p.method === 'rent');
+  assert.equal(rent.length, 1, JSON.stringify(lp.payments));
+  assert.equal(rent[0].asset, '');
+  assert.equal(rent[0].raw, String(ATA_RENT));
+  assert.equal(rent[0].amount, '0.00203928');
+  assert.equal(rent[0].to, rentR1);
+  assert.equal(rent[0].outcome, 'broadcast', JSON.stringify(rent[0]));
+});
+check('a second fresh recipient is refused by native_budget before anything is signed: two rents exceed the day', () => {
+  assert.match(rawText(rentSecond.responses.find((r) => r.id === 100)), /native_budget\.900.*daily budget of 0\.003 would be exceeded/);
+  assert.equal(broadcastsAfterSecond, 1, 'the refused send must not broadcast');
+});
+check('the refused send\'s token line was released with it', () => {
+  const lp = textOf(rentReport.responses.find((x) => x.id === 100));
+  const released = lp.payments.filter((p) => p.outcome === 'void');
+  assert.ok(released.length >= 1, JSON.stringify(lp.payments));
+  for (const p of released) assert.match(p.outcome_detail, /released, the same call was refused|native_budget/);
+});
+check('a send to the recipient whose account now exists pays no rent and goes out under the same budget', () => {
+  assert.match(rawText(rentAgain.responses.find((r) => r.id === 100)), /"signature"/);
+  assert.equal(solBroadcasts.length, 2, JSON.stringify(solBroadcasts));
+  assert.equal(solBroadcasts[1].ata, false, 'no create instruction the second time');
+  const lp = textOf(rentReport.responses.find((x) => x.id === 100));
+  assert.equal(lp.payments.filter((p) => p.method === 'rent').length, 1, 'still one rent line');
+  assert.equal(lp.payments.filter((p) => p.method === 'spl' && p.outcome === 'broadcast').length, 2, JSON.stringify(lp.payments));
+});
+check('spend_policy shows the rent as native spend on chain 900', () => {
+  const sp = textOf(rentReport.responses.find((x) => x.id === 101));
+  assert.equal(sp.budgets.native['900'].daily.spent, '0.00203928', JSON.stringify(sp.budgets.native));
+  assert.equal(new Ledger(rentLedger).integrity, null);
+});
+
 console.log(`\nspend-policy: ${passed} passed, ${failed} failed\n`);
 process.exit(failed ? 1 : 0);

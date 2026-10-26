@@ -507,33 +507,17 @@ export async function localSplTransfer(
   const mint = new PublicKey(mintStr);
   const recipient = new PublicKey(to);
   await assertRecipientIsWallet(conn, recipient);
-  const { tokenProgram, ataSize } = await mintLayout(conn, mint);
+  const { tokenProgram, destAta, rent } = await destinationAccount(conn, mint, recipient);
 
   const sourceAta = associatedTokenAddress(payer.publicKey, mint, tokenProgram);
-  const destAta = associatedTokenAddress(recipient, mint, tokenProgram);
 
   const tx = new Transaction();
-  const destInfo = await conn.getAccountInfo(destAta);
-  // The associated-account program creates into an address that already holds
-  // plain SOL (system-owned, no data): it tops up the rent, allocates and
-  // assigns. Only an address holding something else cannot become the token
-  // account (2026-10-04 round 2; the 1.13.5 refusal of any occupant let anyone
-  // block a recipient for the price of the rent-exempt minimum).
-  const prefunded = destInfo !== null && destInfo.owner.equals(SystemProgram.programId) && destInfo.data.length === 0;
-  if (destInfo && !destInfo.owner.equals(tokenProgram) && !prefunded) {
-    throw new Error(`Refusing to send: the recipient's token account address ${destAta.toBase58()} is occupied by an account owned by ${destInfo.owner.toBase58()}, so no token account can be created there.`);
-  }
-  if (!destInfo || prefunded) {
+  if (rent > 0n) {
     // Creating the recipient's token account costs the payer rent in SOL, an
     // outflow the SOL cap must see (0.002 SOL a time adds up over many sends).
-    // Rent follows the account's real size, which for Token-2022 is above 165;
-    // SOL already sitting at the address reduces what the payer tops up.
-    // The node's rent figure is floored at the cluster constant and the SOL the
-    // node says already sits at the address is not credited: both are numbers a
-    // lying RPC used to zero so the create went out under the cap (round 4).
-    const claimed = Number(await conn.getMinimumBalanceForRentExemption(ataSize));
-    const rent = Math.max(Number.isFinite(claimed) ? Math.trunc(claimed) : 0, (128 + ataSize) * 6960);
-    assertWithinSolCap(BigInt(rent));
+    // The policy reserved the same figure against native_budget before this
+    // call (1.14.7); the cap is the per-transaction floor under it.
+    assertWithinSolCap(rent);
     tx.add(createAtaIdempotentIx(payer.publicKey, destAta, recipient, mint, tokenProgram));
   }
   tx.add(
@@ -550,6 +534,53 @@ export async function localSplTransfer(
     mode: 'local',
     signed_locally: true,
   };
+}
+
+/**
+ * The recipient's associated account for a mint, and the rent the payer funds
+ * when it has to be created: 0 when it already exists. One reading shared by
+ * the send and by the policy's reservation, so the ledger line and the
+ * instruction carry the same figure.
+ *
+ * The associated-account program creates into an address that already holds
+ * plain SOL (system-owned, no data): it tops up the rent, allocates and
+ * assigns. Only an address holding something else cannot become the token
+ * account (2026-10-04 round 2; the 1.13.5 refusal of any occupant let anyone
+ * block a recipient for the price of the rent-exempt minimum).
+ *
+ * Rent follows the account's real size, which for Token-2022 is above 165;
+ * SOL already sitting at the address reduces what the payer tops up. The
+ * node's rent figure is floored at the cluster constant and the SOL the node
+ * says already sits at the address is not credited: both are numbers a lying
+ * RPC used to zero so the create went out under the cap (round 4).
+ */
+async function destinationAccount(conn: Connection, mint: PublicKey, recipient: PublicKey): Promise<{ tokenProgram: PublicKey; destAta: PublicKey; rent: bigint }> {
+  const { tokenProgram, ataSize } = await mintLayout(conn, mint);
+  const destAta = associatedTokenAddress(recipient, mint, tokenProgram);
+  const destInfo = await conn.getAccountInfo(destAta);
+  const prefunded = destInfo !== null && destInfo.owner.equals(SystemProgram.programId) && destInfo.data.length === 0;
+  if (destInfo && !destInfo.owner.equals(tokenProgram) && !prefunded) {
+    throw new Error(`Refusing to send: the recipient's token account address ${destAta.toBase58()} is occupied by an account owned by ${destInfo.owner.toBase58()}, so no token account can be created there.`);
+  }
+  if (destInfo && !prefunded) return { tokenProgram, destAta, rent: 0n };
+  const claimed = Number(await conn.getMinimumBalanceForRentExemption(ataSize));
+  const rent = Math.max(Number.isFinite(claimed) ? Math.trunc(claimed) : 0, (128 + ataSize) * 6960);
+  return { tokenProgram, destAta, rent: BigInt(rent) };
+}
+
+/**
+ * The SOL an SPL send to `to` spends on creating the recipient's token
+ * account, in lamports; 0n when the account exists. The recipient owns that
+ * account and can close it to keep the lamports, so it is native value leaving
+ * the wallet and the spend policy reserves it against native_budget before the
+ * send is built (reported privately 2026-10-26: it was checked against the
+ * per-transaction SOL cap only, and fresh recipients took SOL past the daily
+ * budget while the ledger held token lines alone).
+ */
+export async function splAccountRent(mintStr: string, to: string, chainId = 900): Promise<bigint> {
+  const conn = connection(chainId);
+  await assertCluster(conn, chainId);
+  return (await destinationAccount(conn, new PublicKey(mintStr), new PublicKey(to))).rent;
 }
 
 const TOKEN_ACCOUNT_SIZE = 165;

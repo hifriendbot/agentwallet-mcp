@@ -20,8 +20,11 @@ import { appendFileSync, existsSync, readFileSync, openSync, closeSync, writeSyn
 import { createHash, createHmac } from 'node:crypto';
 import { DAY_MS, MONTH_MS, type Spent, units, rawToUnits, human, canonicalHost } from './policy.js';
 
-/** 'approval' is an ERC-20 allowance granted (approve, increaseAllowance, Permit2.approve): a spend the spender executes later, counted when granted. */
-export type SpendMethod = 'eip3009' | 'permit2' | 'transfer' | 'native' | 'spl' | 'autopay' | 'approval';
+/**
+ * 'approval' is an ERC-20 allowance granted (approve, increaseAllowance, Permit2.approve): a spend the spender executes later, counted when granted.
+ * 'rent' is the SOL an SPL send pays to create the recipient's token account (1.14.7): native, to the recipient, who owns the account and can close it for the lamports.
+ */
+export type SpendMethod = 'eip3009' | 'permit2' | 'transfer' | 'native' | 'spl' | 'autopay' | 'approval' | 'rent';
 export interface SpendEntry {
   seq: number;
   ts: string;
