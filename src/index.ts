@@ -14,11 +14,13 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 // Validation errors used to echo an unknown key or enum value unbounded, a reflector for a second-stage injection (round 6).
-z.setErrorMap((issue, ctx) => {
-  const cut = (v: unknown) => { const t = String(v); return t.length > 80 ? t.slice(0, 80) + '…' : t; };
-  if (issue.code === 'unrecognized_keys') return { message: `Unrecognized key(s) in object: ${issue.keys.map(k => `'${cut(k)}'`).join(', ')}` };
-  if (issue.code === 'invalid_enum_value') return { message: `Invalid enum value. Expected ${issue.options.map(o => `'${o}'`).join(' | ')}, received '${cut(issue.received)}'` };
-  return { message: ctx.defaultError };
+z.config({
+  customError: (issue) => {
+    const cut = (v: unknown) => { const t = String(v); return t.length > 80 ? t.slice(0, 80) + '…' : t; };
+    if (issue.code === 'unrecognized_keys') return `Unrecognized key(s) in object: ${issue.keys.map((k) => `'${cut(k)}'`).join(', ')}`;
+    if (issue.code === 'invalid_value') return `Invalid enum value. Expected ${issue.values.map((o) => `'${String(o)}'`).join(' | ')}, received '${cut(issue.input)}'`;
+    return undefined;
+  },
 });
 import { assertPublicUrl, safeFetch, finalUrlOf } from './ssrf-guard.js';
 import {
@@ -184,7 +186,9 @@ function usdOf(chainId: number, asset: string, raw: string, decimals: number): s
  *   spend to that contract (wrap_eth, or send_transaction with value and data).
  *
  * `unbounded` marks an approval of 2^128 base units or more: no budget can
- * count it, so under a policy it is refused rather than reserved.
+ * count it, so it is refused rather than reserved: under a policy always, and
+ * otherwise unless the operator allowed it (1.14.8). An operator grant
+ * (setApprovalForAll, ERC-777 authorizeOperator) is unbounded by construction.
  *
  * `carried` is the native value a token or approval call sends along with
  * its calldata. A payable token contract keeps it, so it is a second spend:
@@ -201,7 +205,7 @@ type DescribedSend = { kind: 'native' | 'token' | 'approval' | 'spl' | 'contract
 /* Calldata the policy prices: which word holds the amount, which the recipient
    or spender, and for Permit2.approve which the token (there `to` is Permit2).
    The same functions the local token cap prices, so the two guards agree. */
-const SPEND_LAYOUTS: Record<string, { kind: 'token' | 'approval'; what: string; toIndex: number; amountIndex: number; tokenIndex?: number; permit2Only?: boolean }> = {
+const SPEND_LAYOUTS: Record<string, { kind: 'token' | 'approval'; what: string; toIndex: number; amountIndex: number; tokenIndex?: number; permit2Only?: boolean; nft?: true; operator?: true; batch?: true }> = {
   a9059cbb: { kind: 'token', what: 'transfer', toIndex: 0, amountIndex: 1 },                      // transfer(address,uint256)
   '23b872dd': { kind: 'token', what: 'transferFrom', toIndex: 1, amountIndex: 2 },                // transferFrom(address,address,uint256)
   '4000aea0': { kind: 'token', what: 'transferAndCall', toIndex: 0, amountIndex: 1 },             // transferAndCall(address,uint256,bytes)
@@ -211,8 +215,41 @@ const SPEND_LAYOUTS: Record<string, { kind: 'token' | 'approval'; what: string; 
   '39509351': { kind: 'approval', what: 'increaseAllowance', toIndex: 0, amountIndex: 1 },        // increaseAllowance(address,uint256)
   cae9ca51: { kind: 'approval', what: 'approveAndCall', toIndex: 0, amountIndex: 1 },             // approveAndCall(address,uint256,bytes)
   '87517c45': { kind: 'approval', what: 'Permit2 approve', toIndex: 1, amountIndex: 2, tokenIndex: 0, permit2Only: true }, // Permit2.approve(address,address,uint160,uint48)
+  // ERC-721 / ERC-1155 movers and operator grants (reported privately
+  // 2026-10-26, 1.14.8): none of these was decoded, so an NFT approval or
+  // transfer fell through to 'contract' with value 0 and reached the signer
+  // under a policy with no budget line, no ledger line and no recipient check.
+  // An operator grant is an unbounded approval by construction (`operator`;
+  // amountIndex -1 means there is no amount word, otherwise the bool at that
+  // word says grant or revoke). A transfer moves a token no budget can price
+  // (`nft`; amountIndex -1 means one token), so under a dollar budget it is an
+  // unpriced spend, refused unless unpriced_spends allows it, and its
+  // recipient is checked either way.
+  a22cb465: { kind: 'approval', what: 'setApprovalForAll', toIndex: 0, amountIndex: 1, nft: true, operator: true },        // setApprovalForAll(address,bool)
+  '959b8c3f': { kind: 'approval', what: 'ERC-777 authorizeOperator', toIndex: 0, amountIndex: -1, operator: true },      // authorizeOperator(address)
+  '42842e0e': { kind: 'token', what: 'ERC-721 safeTransferFrom', toIndex: 1, amountIndex: -1, nft: true },                 // safeTransferFrom(address,address,uint256)
+  b88d4fde: { kind: 'token', what: 'ERC-721 safeTransferFrom', toIndex: 1, amountIndex: -1, nft: true },                   // safeTransferFrom(address,address,uint256,bytes)
+  f242432a: { kind: 'token', what: 'ERC-1155 safeTransferFrom', toIndex: 1, amountIndex: 3, nft: true },                   // safeTransferFrom(address,address,uint256,uint256,bytes)
+  '2eb2c2d6': { kind: 'token', what: 'ERC-1155 safeBatchTransferFrom', toIndex: 1, amountIndex: 3, nft: true, batch: true }, // safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)
 };
 const UNBOUNDED_APPROVAL = 1n << 128n;
+const UINT256_MAX = (1n << 256n) - 1n;
+
+/**
+ * The sum of the `amounts` array of an ERC-1155 safeBatchTransferFrom, read
+ * through the caller's word reader so a short word refuses the whole call.
+ * `offsetWord` holds the array's byte offset from the start of the arguments.
+ */
+function batchTotal(wordAt: (i: number) => string, offsetWord: number): bigint {
+  const offset = BigInt('0x' + wordAt(offsetWord));
+  if (offset % 32n !== 0n || offset > 1n << 20n) throw new Error('policy: calldata for ERC-1155 safeBatchTransferFrom has a malformed amounts offset; refused rather than treated as a plain contract call. Nothing was signed.');
+  const base = Number(offset / 32n);
+  const count = BigInt('0x' + wordAt(base));
+  if (count > 4096n) throw new Error('policy: calldata for ERC-1155 safeBatchTransferFrom names more than 4096 amounts; refused. Nothing was signed.');
+  let total = 0n;
+  for (let i = 0; i < Number(count); i++) total += BigInt('0x' + wordAt(base + 1 + i));
+  return total;
+}
 
 async function describeSend(body: Record<string, unknown>, chainId: number): Promise<DescribedSend> {
   if (body.token_mint) {
@@ -253,13 +290,25 @@ async function describeSend(body: Record<string, unknown>, chainId: number): Pro
       };
       const token = layout.tokenIndex === undefined ? to : '0x' + wordAt(layout.tokenIndex).slice(24);
       const counterparty = '0x' + wordAt(layout.toIndex).slice(24);
-      const amount = BigInt('0x' + wordAt(layout.amountIndex));
       // The call's own value does not vanish because the calldata was
       // recognised: the contract keeps whatever rides along. It is a second
       // spend, native, to the contract (reported privately 2026-10-23, 1.14.4).
       const carried = BigInt(value) > 0n ? { raw: value, to } : undefined;
+      if (layout.operator) {
+        // setApprovalForAll(operator, false) takes a grant away and moves
+        // nothing: a zero-value call to the collection, reserving nothing.
+        const granted = layout.amountIndex < 0 || BigInt('0x' + wordAt(layout.amountIndex)) !== 0n;
+        if (!granted) return { kind: 'contract', to, asset: '', raw: value, decimals: nativeDecimals(chainId) };
+        return { kind: 'approval', to: counterparty, asset: token, raw: UINT256_MAX.toString(), decimals: 0, unbounded: true, ...(carried ? { carried } : {}) };
+      }
+      const amount = layout.amountIndex < 0 ? 1n : layout.batch ? batchTotal(wordAt, layout.amountIndex) : BigInt('0x' + wordAt(layout.amountIndex));
       if (layout.kind === 'approval' && amount >= UNBOUNDED_APPROVAL) {
         return { kind: 'approval', to: counterparty, asset: token, raw: amount.toString(), decimals: 0, unbounded: true, ...(carried ? { carried } : {}) };
+      }
+      if (layout.nft) {
+        // A collection has no decimals and no price: whole tokens, unpriced,
+        // to the recipient, recorded under the collection's address.
+        return { kind: layout.kind, to: counterparty, asset: token, raw: amount.toString(), decimals: 0, ...(carried ? { carried } : {}) };
       }
       // Decimals matter here only to price a registry stablecoin (resolved
       // offline) and to print the ledger amount. A token the registry and the
@@ -310,13 +359,26 @@ function assertSendTarget(d: DescribedSend, chainId: number): void {
  * carried on a token or approval call is a second spend, native, to the
  * called contract (1.14.4); the rent a local SPL send pays for the recipient's
  * token account is a native spend to the recipient, method 'rent' (1.14.7).
- * Throws for an unbounded approval under a policy.
+ * Throws for an unbounded approval: under a policy always, and otherwise
+ * unless the operator allowed it.
  */
+const unlimitedApprovalsAllowed = (): boolean => !POLICY.path && process.env.AGENTWALLET_ALLOW_UNLIMITED_APPROVAL === '1';
+const unlimitedApprovalsReport = (): string => POLICY.path
+  ? 'refused (a spend policy is set; no budget can count an unlimited allowance)'
+  : unlimitedApprovalsAllowed() ? 'allowed by the operator (AGENTWALLET_ALLOW_UNLIMITED_APPROVAL=1)' : 'refused by default (the operator can set AGENTWALLET_ALLOW_UNLIMITED_APPROVAL=1 while no policy is set)';
 function spendInputsOf(d: DescribedSend, chainId: number, tool: string, wallet: string, ctx: { host?: string; resource?: string; method?: SpendMethod } = {}): ReserveInput[] {
-  if (d.kind === 'approval' && d.unbounded && POLICY.path) {
-    throw new Error(
+  if (d.kind === 'approval' && d.unbounded) {
+    // The README promised an unlimited approval was "refused outright" while
+    // the code refused it only under a policy (reported privately 2026-10-26,
+    // 1.14.8). Now the default everywhere; only the operator opens it, and
+    // only where no policy is set.
+    if (POLICY.path) throw new Error(
       `policy: an unlimited approval of ${assetLabel(chainId, d.asset)} to ${d.to} cannot be counted against any budget, and under a spend policy every approval is a bounded spend. ` +
       `Approve an exact amount instead. Nothing was signed.`
+    );
+    if (!unlimitedApprovalsAllowed()) throw new Error(
+      `an unlimited approval of ${assetLabel(chainId, d.asset)} to ${d.to} is refused by default: it is a standing grant over the whole balance. ` +
+      `Approve an exact amount instead. Only the operator can allow unlimited approvals (AGENTWALLET_ALLOW_UNLIMITED_APPROVAL=1, never under a spend policy). Nothing was signed.`
     );
   }
   const base = { tool, mode: anyLocalMode() ? 'local' as const : 'hosted' as const, wallet: anyLocalMode() ? 'local' : wallet, chainId, host: ctx.host ?? null, resource: ctx.resource ?? null };
@@ -1174,7 +1236,7 @@ function validateGuardEnv(): void {
     throw new Error(`Unknown environment variable ${k}. AgentWallet refuses to start on an unrecognised AGENTWALLET_* name so that a misspelled cap cannot run uncapped. Known names: ${[...KNOWN_ENV].join(', ')}, AGENTWALLET_RPC_<chainId>, AGENTWALLET_SOLANA_RPC_<chainId>.`);
   }
 }
-const KNOWN_ENV = new Set(["AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS","AGENTWALLET_API_URL","AGENTWALLET_APPROVALS","AGENTWALLET_AUTOPAY_ASSETS","AGENTWALLET_CHAIN_ID","AGENTWALLET_DASHBOARD_URL","AGENTWALLET_KEYFILE","AGENTWALLET_KEYFILE_PASSPHRASE","AGENTWALLET_KEYFILE_PASSPHRASE_FILE","AGENTWALLET_LEDGER","AGENTWALLET_LEGACY_PAYWALL_ORIGINS","AGENTWALLET_MAX_AUTOPAY","AGENTWALLET_MAX_AUTOPAY_PER_HOUR","AGENTWALLET_MAX_FEE_NATIVE","AGENTWALLET_MAX_TX_NATIVE","AGENTWALLET_MAX_TX_SOL","AGENTWALLET_MAX_TX_TOKEN","AGENTWALLET_PASS","AGENTWALLET_PERMIT2_AUTO_APPROVE","AGENTWALLET_POLICY","AGENTWALLET_PRIVATE_KEY","AGENTWALLET_RPC_URL","AGENTWALLET_SOLANA_KEY","AGENTWALLET_SOLANA_KEYFILE","AGENTWALLET_SOLANA_RPC","AGENTWALLET_TOKEN_DECIMALS","AGENTWALLET_TOKEN_RISK","AGENTWALLET_USER","AGENTWALLET_WALLET_ID","AGENTWALLET_WEBHOOK_SECRET","AGENTWALLET_WEBHOOK_URL","AGENTWALLET_X402_MAX_TIMEOUT"]);
+const KNOWN_ENV = new Set(["AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS","AGENTWALLET_ALLOW_UNLIMITED_APPROVAL","AGENTWALLET_API_URL","AGENTWALLET_APPROVALS","AGENTWALLET_AUTOPAY_ASSETS","AGENTWALLET_CHAIN_ID","AGENTWALLET_DASHBOARD_URL","AGENTWALLET_KEYFILE","AGENTWALLET_KEYFILE_PASSPHRASE","AGENTWALLET_KEYFILE_PASSPHRASE_FILE","AGENTWALLET_LEDGER","AGENTWALLET_LEGACY_PAYWALL_ORIGINS","AGENTWALLET_MAX_AUTOPAY","AGENTWALLET_MAX_AUTOPAY_PER_HOUR","AGENTWALLET_MAX_FEE_NATIVE","AGENTWALLET_MAX_TX_NATIVE","AGENTWALLET_MAX_TX_SOL","AGENTWALLET_MAX_TX_TOKEN","AGENTWALLET_PASS","AGENTWALLET_PERMIT2_AUTO_APPROVE","AGENTWALLET_POLICY","AGENTWALLET_PRIVATE_KEY","AGENTWALLET_RPC_URL","AGENTWALLET_SOLANA_KEY","AGENTWALLET_SOLANA_KEYFILE","AGENTWALLET_SOLANA_RPC","AGENTWALLET_TOKEN_DECIMALS","AGENTWALLET_TOKEN_RISK","AGENTWALLET_USER","AGENTWALLET_WALLET_ID","AGENTWALLET_WEBHOOK_SECRET","AGENTWALLET_WEBHOOK_URL","AGENTWALLET_X402_MAX_TIMEOUT"]);
 
 /**
  * Register a tool whose arguments are strict: an unknown key (max_payemnt for
@@ -1301,7 +1363,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.14.7',
+    version: '1.14.8',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()
@@ -1719,13 +1781,13 @@ tool(
   'approve_token',
   'Approve a spender contract to transfer ERC-20 tokens on your behalf. ' +
     'Required before interacting with any DeFi protocol (DEXs, lending, etc.). ' +
-    'Use amount "max" for unlimited approval, or specify an exact amount. ' +
-    'Under a spend policy an approval is a spend: it counts against the budgets, the spender is checked as a recipient, and "max" is refused.',
+    'Specify an exact amount. "max" (an unlimited allowance) is refused by default and always under a spend policy; only the operator can allow it, with AGENTWALLET_ALLOW_UNLIMITED_APPROVAL=1 while no policy is set. ' +
+    'Under a spend policy an approval is a spend: it counts against the budgets and the spender is checked as a recipient.',
   {
     wallet_id: z.number().int().describe('Wallet ID'),
     token: z.string().regex(/^0x[a-fA-F0-9]{40}$/).describe('ERC-20 token contract address'),
     spender: z.string().regex(/^0x[a-fA-F0-9]{40}$/).describe('Contract address to approve as spender'),
-    amount: z.string().describe('Amount to approve in human-readable format (e.g. "1000"), or "max" for unlimited'),
+    amount: z.string().describe('Amount to approve in human-readable format (e.g. "1000"); "max" means unlimited and is refused unless the operator allowed it'),
     chain_id: z.number().int().describe('Chain ID'),
     decimals: z.number().int().min(0).max(36).optional().describe('Token decimals. Resolved from the registry or the token contract when omitted; if given, it must match'),
   },
@@ -2666,8 +2728,8 @@ tool(
 tool(
   'approve_permit2',
   'One-time ERC-20 approval of a token to the Permit2 contract, needed before paying x402 "upto" endpoints with that token. ' +
-    'A normal on-chain transaction (needs gas). By default approves the maximum, the ecosystem norm, so it never has to be repeated; ' +
-    'pass amount to grant a bounded allowance instead (required under AGENTWALLET_MAX_TX_TOKEN and under a spend policy, both of which refuse a max approval; under a policy the allowance counts against the budgets). ' +
+    'A normal on-chain transaction (needs gas). Pass amount to grant a bounded allowance; with no amount it asks for the maximum, which is refused by default, under AGENTWALLET_MAX_TX_TOKEN, and always under a spend policy (where the allowance counts against the budgets). ' +
+    'Only the operator can allow a maximum approval, with AGENTWALLET_ALLOW_UNLIMITED_APPROVAL=1 while no policy is set. ' +
     'Permit2 itself only moves what each signed authorization allows.',
   {
     wallet_id: z.number().int().describe('Wallet ID'),
@@ -3225,6 +3287,7 @@ tool(
         api_base: redactUrl(API_BASE),
         spend_policy: POLICY.path ? { path: POLICY.path, sha256: POLICY.hash, name: POLICY.policy.name ?? null, ledger: POLICY.ledgerPath, see: 'spend_policy' } : 'none (AGENTWALLET_POLICY not set)',
         client_guards: {
+          unlimited_approvals: unlimitedApprovalsReport(),
           autopay_cap_usd: autopayEnvCap(),
           internal_autopay_armed: Boolean(X402_WALLET_ID),
           max_autopay_per_hour: AUTOPAY_PER_HOUR,
@@ -3253,6 +3316,7 @@ tool(
       x402_max_timeout_seconds: maxAuthWindowSeconds(),
       per_tx_cap_token: (process.env.AGENTWALLET_MAX_TX_TOKEN || '').trim() || 'not set (ERC-20 and SPL transfers are uncapped)',
       allow_unknown_token_calls: process.env.AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS === '1',
+      unlimited_approvals: unlimitedApprovalsReport(),
       token_decimals_pins: parseDecimalPins(process.env.AGENTWALLET_TOKEN_DECIMALS).size,
       token_risk_lookup: process.env.AGENTWALLET_TOKEN_RISK !== '0',
       permit2_auto_approve: process.env.AGENTWALLET_PERMIT2_AUTO_APPROVE === '1',

@@ -5,7 +5,7 @@
     "type": "git",
     "url": "git+https://github.com/hifriendbot/agentwallet-mcp.git"
   },
-  "version": "1.14.7",
+  "version": "1.14.8",
   "description": "MCP server for AgentWallet: self-custody local signing on EVM and Solana, or hosted wallets. Sign, broadcast, pay x402 invoices, and accept x402 payments.",
   "type": "module",
   "main": "build/index.js",
@@ -20,7 +20,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node build/index.js",
-    "test": "node test/x402-payment.test.mjs && node test/eip3009.test.mjs && node test/permit2-risk.test.mjs && node test/token-cap.test.mjs && node test/spl-cap.test.mjs && node test/unknown-decimals-cap.test.mjs && node test/decimals-range-cap.test.mjs && node test/local-mode.test.mjs && node test/ssrf-guard.test.mjs && node test/x402-policy.test.mjs && node test/local-guard-shape.test.mjs && node test/allowance-total-cap.test.mjs && node test/autopay-scheme.test.mjs && node test/spl-recipient-guard.test.mjs && node test/approval-binding.test.mjs && node test/ata-rent-size.test.mjs && node test/final-url-guard.test.mjs && node test/audit-1135.test.mjs && node test/local-no-autopay.test.mjs && node test/audit-1136.test.mjs && node test/delete-confirm.test.mjs && node test/audit-1138.test.mjs && node test/audit-1139.test.mjs && node test/audit-11310.test.mjs && node test/audit-11311.test.mjs && node test/audit-11312.test.mjs && node test/audit-11313.test.mjs && node test/audit-11316.test.mjs && node test/spend-policy.test.mjs && node test/policy-path-resolution.test.mjs",
+    "test": "node test/x402-payment.test.mjs && node test/eip3009.test.mjs && node test/permit2-risk.test.mjs && node test/token-cap.test.mjs && node test/spl-cap.test.mjs && node test/unknown-decimals-cap.test.mjs && node test/decimals-range-cap.test.mjs && node test/local-mode.test.mjs && node test/ssrf-guard.test.mjs && node test/x402-policy.test.mjs && node test/local-guard-shape.test.mjs && node test/allowance-total-cap.test.mjs && node test/autopay-scheme.test.mjs && node test/spl-recipient-guard.test.mjs && node test/approval-binding.test.mjs && node test/ata-rent-size.test.mjs && node test/final-url-guard.test.mjs && node test/audit-1135.test.mjs && node test/local-no-autopay.test.mjs && node test/audit-1136.test.mjs && node test/delete-confirm.test.mjs && node test/audit-1138.test.mjs && node test/audit-1139.test.mjs && node test/audit-11310.test.mjs && node test/audit-11311.test.mjs && node test/audit-11312.test.mjs && node test/audit-11313.test.mjs && node test/audit-11316.test.mjs && node test/spend-policy.test.mjs && node test/policy-path-resolution.test.mjs && node test/server-json-env.test.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -59,12 +59,12 @@
     "node": ">=22.19.0"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.1",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "@solana/web3.js": "^1.99.0",
     "bs58": "^6.0.0",
-    "undici": "^8.11.2",
+    "undici": "^8.12.3",
     "viem": "^2.56.9",
-    "zod": "^3.24.0"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

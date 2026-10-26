@@ -457,7 +457,10 @@ check('wallet_mode names the policy', () => {
 });
 check('transfer_token above the remaining daily budget is refused before any RPC call', () => {
   const t = rawText(byId(102));
-  assert.match(t, /daily budget of 5 would be exceeded: 4 already spent/);
+  // The SDK dispatches the session's calls concurrently, so a later, in-budget
+  // 0.001 USDC line (117) can land before this one is checked; 4 or 4.001
+  // spent are both the seeded day, and the refusal is what is asserted.
+  assert.match(t, /daily budget of 5 would be exceeded: 4(\.001)? already spent/);
   assert.ok(!/RPC node answered/.test(t), 'no RPC was contacted');
 });
 check('transfer to a denied recipient is refused', () => {
@@ -1059,6 +1062,132 @@ check('spend_policy shows the rent as native spend on chain 900', () => {
   const sp = textOf(rentReport.responses.find((x) => x.id === 101));
   assert.equal(sp.budgets.native['900'].daily.spent, '0.00203928', JSON.stringify(sp.budgets.native));
   assert.equal(new Ledger(rentLedger).integrity, null);
+});
+
+// ─── 1.14.8: NFT calldata is classified; an unlimited approval is refused by default ───
+// Reported privately 2026-10-26: setApprovalForAll, safeTransferFrom and
+// safeBatchTransferFrom were not in the classifier, so an NFT approval or
+// transfer fell through as a zero-value contract call and reached the signer
+// under a policy with no budget line, no ledger line and no recipient check.
+// Same day, same reporter: an unlimited ERC-20 approval was refused only
+// under a policy while the README said "refused outright". A loopback fake
+// custodian records every /send body that reaches it.
+console.log('\n1.14.8: NFT calldata under the policy; unlimited approvals refused by default (reported 2026-10-26)\n');
+
+const nftPosts = [];
+const nftApi = createServer((req, res) => {
+  let raw = '';
+  req.on('data', (c) => { raw += c; });
+  req.on('end', () => {
+    if (req.method === 'POST') nftPosts.push({ path: req.url, body: JSON.parse(raw || '{}') });
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify(req.method === 'POST' ? { success: true, tx_hash: '0x' + 'cd'.repeat(32) } : { ok: true }));
+  });
+});
+await new Promise((r) => nftApi.listen(0, '127.0.0.1', r));
+const COLLECTION = '0xabababababababababababababababababababab';
+const OPERATOR = '0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd';
+const word = (n) => BigInt(n).toString(16).padStart(64, '0');
+const setApprovalForAll = (op, yes) => '0xa22cb465' + pad32(op) + word(yes ? 1 : 0);
+const erc721Transfer = (from, to, id) => '0x42842e0e' + pad32(from) + pad32(to) + word(id);
+const erc1155Transfer = (from, to, id, amount) => '0xf242432a' + pad32(from) + pad32(to) + word(id) + word(amount) + word(160) + word(0);
+const erc1155Batch = (from, to, ids, amounts) => '0x2eb2c2d6' + pad32(from) + pad32(to)
+  + word(160) + word(160 + 32 * (1 + ids.length)) + word(160 + 32 * (2 + ids.length + amounts.length))
+  + word(ids.length) + ids.map(word).join('') + word(amounts.length) + amounts.map(word).join('') + word(0);
+const nftSend = (data, to = COLLECTION) => ({ name: 'send_transaction', arguments: { wallet_id: 1, chain_id: 8453, to, value: '0', data } });
+const nftBase = { AGENTWALLET_API_URL: `http://127.0.0.1:${nftApi.address().port}`, AGENTWALLET_USER: 'u', AGENTWALLET_PASS: 'p', AGENTWALLET_TOKEN_RISK: '0' };
+const budgetPolicy = join(dir, 'nft-budget-policy.json');
+writeFileSync(budgetPolicy, JSON.stringify({ version: 1, budget: { daily: '1' } }));
+const openPolicy = join(dir, 'nft-open-policy.json');
+writeFileSync(openPolicy, JSON.stringify({ version: 1, budget: { daily: '1' }, unpriced_spends: 'allow', recipients: { deny: [OTHER] } }));
+const budgetEnv = { ...nftBase, AGENTWALLET_POLICY: budgetPolicy, AGENTWALLET_LEDGER: join(dir, 'nft-budget-ledger.jsonl') };
+const openEnv = { ...nftBase, AGENTWALLET_POLICY: openPolicy, AGENTWALLET_LEDGER: join(dir, 'nft-open-ledger.jsonl') };
+
+const nftGrant = await callTools([nftSend(setApprovalForAll(OPERATOR, true))], budgetEnv, { waitMs: 8000 });
+const nft721 = await callTools([nftSend(erc721Transfer(TEST_ADDRESS, OPERATOR, 7))], budgetEnv, { waitMs: 8000 });
+const nftBatch = await callTools([nftSend(erc1155Batch(TEST_ADDRESS, OPERATOR, [1, 2], [3, 4]))], budgetEnv, { waitMs: 8000 });
+const postsAfterBudget = nftPosts.length;
+const nftDenied = await callTools([nftSend(erc1155Transfer(TEST_ADDRESS, OTHER, 1, 5))], openEnv, { waitMs: 8000 });
+const postsAfterDenied = nftPosts.length;
+const nftAllowed = await callTools([nftSend(erc1155Transfer(TEST_ADDRESS, DEAD, 1, 5))], openEnv, { waitMs: 8000 });
+const nftRevoke = await callTools([nftSend(setApprovalForAll(OPERATOR, false))], openEnv, { waitMs: 8000 });
+const nftReport = await callTools([{ name: 'list_payments', arguments: { limit: 10 } }], openEnv, { waitMs: 7000 });
+const nftTruncated = await callTools([nftSend('0xf242432a' + pad32(TEST_ADDRESS) + pad32(DEAD) + word(1))], openEnv, { waitMs: 8000 });
+const postsBeforeNoPolicy = nftPosts.length;
+const noPolicy = await callTools([
+  { name: 'approve_permit2', arguments: { wallet_id: 1, token: USDC_BASE, chain_id: 8453 } },                           // 100
+  { name: 'approve_token', arguments: { wallet_id: 1, token: USDC_BASE, spender: DEAD, amount: 'max', chain_id: 8453 } }, // 101
+  nftSend(setApprovalForAll(OPERATOR, true)),                                                                              // 102
+  { name: 'wallet_mode', arguments: {} },                                                                                  // 103
+], nftBase, { waitMs: 9000 });
+const postsAfterNoPolicy = nftPosts.length;
+const optIn = await callTools([
+  { name: 'approve_token', arguments: { wallet_id: 1, token: USDC_BASE, spender: DEAD, amount: 'max', chain_id: 8453 } }, // 100
+  { name: 'wallet_mode', arguments: {} },                                                                                  // 101
+], { ...nftBase, AGENTWALLET_ALLOW_UNLIMITED_APPROVAL: '1' }, { waitMs: 9000 });
+const postsAfterOptIn = nftPosts.length;
+const optInUnderPolicy = await callTools([{ name: 'approve_permit2', arguments: { wallet_id: 1, token: USDC_BASE, chain_id: 8453 } }], { ...budgetEnv, AGENTWALLET_ALLOW_UNLIMITED_APPROVAL: '1' }, { waitMs: 8000 });
+nftApi.close();
+const nftSim = await callTools([
+  { name: 'simulate_transaction', arguments: { wallet_id: 1, to: COLLECTION, value: '0', data: setApprovalForAll(OPERATOR, true), chain_id: 8453 } },
+], { ...baseEnv, AGENTWALLET_POLICY: budgetPolicy, AGENTWALLET_LEDGER: join(dir, 'nft-sim-ledger.jsonl') }, { waitMs: 8000 });
+const first = (r) => r.responses.find((x) => x.id === 100);
+
+check('setApprovalForAll(operator, true) under a policy is refused as an unlimited approval before the custodian is asked', () => {
+  assert.match(rawText(first(nftGrant)), /unlimited approval of .* cannot be counted against any budget/);
+});
+check('an ERC-721 safeTransferFrom under a dollar budget is an unpriced spend of the collection and is refused', () => {
+  assert.match(rawText(first(nft721)), /is not a registry stablecoin, so the dollar budget cannot count it; refused/);
+});
+check('an ERC-1155 batch transfer is decoded (amounts summed) and refused the same way; nothing reached the custodian', () => {
+  assert.match(rawText(first(nftBatch)), /dollar budget cannot count it/);
+  assert.equal(postsAfterBudget, 0, JSON.stringify(nftPosts));
+});
+check('with unpriced spends allowed, an ERC-1155 transfer to a denied address is refused: the NFT recipient is a recipient', () => {
+  assert.match(rawText(first(nftDenied)), /policy denies recipient/);
+  assert.equal(postsAfterDenied, 0, JSON.stringify(nftPosts));
+});
+check('an allowed ERC-1155 transfer reaches the custodian once and sits on the ledger under the collection, to the recipient, unpriced', () => {
+  assert.match(rawText(first(nftAllowed)), /tx_hash/);
+  assert.ok(nftPosts.find((p) => String(p.body.data).startsWith('0xf242432a')), JSON.stringify(nftPosts));
+  const lp = textOf(first(nftReport));
+  const line = lp.payments.find((p) => String(p.asset).toLowerCase() === COLLECTION);
+  assert.ok(line, JSON.stringify(lp.payments));
+  assert.equal(String(line.to).toLowerCase(), DEAD.toLowerCase());
+  assert.equal(line.amount, '5');
+  assert.equal(line.usd, null);
+  assert.equal(line.method, 'transfer');
+  assert.equal(line.outcome, 'broadcast');
+});
+check('setApprovalForAll(operator, false) takes a grant away and moves nothing: it goes out and reserves nothing', () => {
+  assert.match(rawText(first(nftRevoke)), /tx_hash/);
+  assert.equal(textOf(first(nftReport)).payments.length, 1, JSON.stringify(textOf(first(nftReport)).payments));
+});
+check('truncated ERC-1155 calldata is refused, not reclassified as a plain contract call', () => {
+  assert.match(rawText(first(nftTruncated)), /is truncated/);
+});
+check('with no policy at all, approve_permit2 with no amount, approve_token "max" and setApprovalForAll(true) are refused by default', () => {
+  for (const id of [100, 101, 102]) assert.match(rawText(noPolicy.responses.find((r) => r.id === id)), /unlimited approval of .* is refused by default/, `id ${id}`);
+  assert.equal(postsAfterNoPolicy, postsBeforeNoPolicy, JSON.stringify(nftPosts));
+  assert.match(String(textOf(noPolicy.responses.find((r) => r.id === 103)).client_guards.unlimited_approvals), /refused by default/);
+});
+check('AGENTWALLET_ALLOW_UNLIMITED_APPROVAL=1 opens it while no policy is set, and wallet_mode says so', () => {
+  assert.match(rawText(first(optIn)), /tx_hash/);
+  assert.equal(postsAfterOptIn, postsBeforeNoPolicy + 1, JSON.stringify(nftPosts));
+  assert.match(String(nftPosts[nftPosts.length - 1].body.data), /^0x095ea7b3.*f{64}$/);
+  assert.match(String(textOf(optIn.responses.find((r) => r.id === 101)).client_guards.unlimited_approvals), /allowed by the operator/);
+});
+check('the opt-in has no effect under a policy', () => {
+  assert.match(rawText(first(optInUnderPolicy)), /cannot be counted against any budget/);
+});
+check('simulate_transaction reports setApprovalForAll as an unlimited approval to the operator and signs nothing', () => {
+  const s = textOf(first(nftSim));
+  assert.equal(s.ok, false);
+  assert.equal(s.moves.kind, 'approval');
+  assert.equal(String(s.moves.to).toLowerCase(), OPERATOR);
+  assert.equal(s.moves.amount, 'unlimited');
+  assert.match(s.policy, /unlimited approval/);
+  assert.equal(s.signed, false);
 });
 
 console.log(`\nspend-policy: ${passed} passed, ${failed} failed\n`);

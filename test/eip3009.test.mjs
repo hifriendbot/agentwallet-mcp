@@ -7,7 +7,7 @@
  */
 import assert from 'node:assert';
 import { parseEip7702Delegation, erc1271ProbeCalldata, classifyErc1271Probe, ERC1271_MAGIC } from '../build/x402-eip3009.js';
-import { privateKeyToAccount } from 'viem/accounts';
+import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { verifyTypedData } from 'viem';
 import {
   TRANSFER_WITH_AUTHORIZATION_TYPES,
@@ -31,7 +31,7 @@ async function okAsync(name, fn) { await fn(); passed++; console.log(`  ok - ${n
 
 const USDC_BASE = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 const PAY_TO = '0x1111111111111111111111111111111111111111';
-const KEY = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d'; // throwaway (Hardhat #1)
+const KEY = generatePrivateKey(); // fresh each run: a well-known key (Hardhat #1) sat here until 1.14.8 and its address is EIP-7702 delegated on Base (reported privately 2026-10-26)
 const chains = { base: 8453, 'eip155:8453': 8453, 'base-sepolia': 84532 };
 const resolveChainId = (n) => chains[n] ?? (n.startsWith('eip155:') ? Number(n.slice(7)) : null);
 

@@ -1,4 +1,7 @@
-# Publishes agentwallet-mcp to npm from CI with a provenance attestation.
+# Publishes agentwallet-mcp to npm from CI with a provenance attestation, then
+# publishes server.json to the official MCP registry, so the two cannot drift:
+# the registry served 1.7.4 for seven months while npm moved on, because the
+# registry publish was a manual step (reported privately 2026-10-26).
 #
 # One-time setup on npmjs.com (package settings > Publishing access):
 #   Trusted publisher: GitHub Actions, organization hifriendbot,
@@ -7,9 +10,14 @@
 #   Then set "Require two-factor authentication and disallow tokens" so a
 #   leaked laptop token cannot publish outside this workflow.
 #
-# To release: bump package.json with `npm version <x.y.z> --no-git-tag-version`,
-# commit, then create a GitHub release whose tag is v<x.y.z>. The job checks
-# that the tag matches package.json before it publishes.
+# The registry publish authenticates with the same OIDC token
+# (`mcp-publisher login github-oidc`): the io.github.hifriendbot namespace
+# belongs to the repository's owner, so no credential is stored for it either.
+#
+# To release: bump package.json with `npm version <x.y.z> --no-git-tag-version`
+# (server.json and the McpServer version string follow; `npm test` checks they
+# agree), commit, then create a GitHub release whose tag is v<x.y.z>. The job
+# checks that the tag matches package.json before it publishes.
 name: Release
 
 on:
@@ -34,6 +42,8 @@ jobs:
       - name: Use the npm the lock file was written with (11.5+ also supports trusted publishing)
         run: npm install -g npm@11.6.2
       - run: npm ci --ignore-scripts
+      - name: Audit production dependencies (SECURITY.md promises this before every release; a high or critical finding fails it)
+        run: npm audit --omit=dev --audit-level=high
       - run: npm run build
       - run: npm test
       - name: Check the release tag matches package.json
@@ -46,3 +56,38 @@ jobs:
           fi
       - name: Publish with provenance
         run: npm publish --provenance --access public
+
+  registry:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Wait for npm to serve the version (a publish is staged for a few minutes)
+        run: |
+          v="$(node -p "require('./package.json').version")"
+          for i in $(seq 1 40); do
+            if [ "$(npm view "agentwallet-mcp@$v" version 2>/dev/null)" = "$v" ]; then
+              echo "npm serves agentwallet-mcp@$v"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "npm never served agentwallet-mcp@$v; the registry entry was not updated"
+          exit 1
+      - name: Install mcp-publisher (pinned release, checksum verified)
+        env:
+          MCP_PUBLISHER_VERSION: 1.8.5
+        run: |
+          base="https://github.com/modelcontextprotocol/registry/releases/download/v${MCP_PUBLISHER_VERSION}"
+          curl -fsSLO "${base}/mcp-publisher_linux_amd64.tar.gz"
+          curl -fsSLO "${base}/registry_${MCP_PUBLISHER_VERSION}_checksums.txt"
+          grep ' mcp-publisher_linux_amd64.tar.gz$' "registry_${MCP_PUBLISHER_VERSION}_checksums.txt" | sha256sum -c -
+          tar xzf mcp-publisher_linux_amd64.tar.gz mcp-publisher
+          ./mcp-publisher --version
+      - name: Publish server.json to the MCP registry
+        run: |
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish

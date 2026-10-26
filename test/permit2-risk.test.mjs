@@ -2,7 +2,7 @@
  * upto (Permit2) typed data and token-risk scoring, offline. Run with: npm test
  */
 import assert from 'node:assert';
-import { privateKeyToAccount } from 'viem/accounts';
+import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { verifyTypedData } from 'viem';
 import {
   PERMIT2_ADDRESS, X402_UPTO_PERMIT2_PROXY, UPTO_PERMIT2_WITNESS_TYPES,
@@ -19,7 +19,7 @@ async function okAsync(name, fn) { await fn(); passed++; console.log(`  ok - ${n
 const USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 const PAY_TO = '0x1111111111111111111111111111111111111111';
 const FAC = '0xd407e409E34E0b9afb99EcCeb609bDbcD5e7f1bf';
-const KEY = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
+const KEY = generatePrivateKey(); // fresh each run, never a well-known key (reported privately 2026-10-26)
 const resolveChainId = (n) => (n === 'eip155:8453' ? 8453 : null);
 const upto = { scheme: 'upto', network: 'eip155:8453', amount: '500000', asset: USDC, payTo: PAY_TO, maxTimeoutSeconds: 120, extra: { facilitatorAddress: FAC } };
 const exact = { scheme: 'exact', network: 'eip155:8453', amount: '10000', asset: USDC, payTo: PAY_TO, maxTimeoutSeconds: 300, extra: { name: 'USD Coin', version: '2' } };

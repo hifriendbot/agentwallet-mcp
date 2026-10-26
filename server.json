@@ -6,12 +6,12 @@
     "url": "https://github.com/hifriendbot/agentwallet-mcp",
     "source": "github"
   },
-  "version": "1.14.7",
+  "version": "1.14.8",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "agentwallet-mcp",
-      "version": "1.14.7",
+      "version": "1.14.8",
       "transport": {
         "type": "stdio"
       },
@@ -143,6 +143,13 @@
           "isSecret": false
         },
         {
+          "name": "AGENTWALLET_ALLOW_UNLIMITED_APPROVAL",
+          "description": "1 lets an unlimited ERC-20 allowance or an NFT operator grant through while no spend policy is set (refused by default, and always refused under a policy)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
           "name": "AGENTWALLET_TOKEN_DECIMALS",
           "description": "Pin decimals for tokens outside the registry, e.g. 8453:0x<token>=6,<mint>=9; used for amounts and caps instead of the RPC answer",
           "isRequired": false,
@@ -208,6 +215,48 @@
         {
           "name": "AGENTWALLET_MAX_FEE_NATIVE",
           "description": "Local mode: the most a transaction may burn in fees (gas x max fee per gas), in native units; default 0.01",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_POLICY",
+          "description": "Path of a spend policy JSON file: rolling dollar and native budgets, host, recipient, chain, asset and tool lists, and a human-approval threshold, enforced from a hash-chained ledger",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_LEDGER",
+          "description": "Path of the append-only ledger the policy is enforced from (default: agentwallet-ledger.jsonl beside the policy file)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_WEBHOOK_URL",
+          "description": "https URL (or http on localhost) that receives every ledger line as it is written",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "AGENTWALLET_WEBHOOK_SECRET",
+          "description": "HMAC-SHA256 key for the X-AgentWallet-Signature header on webhook posts",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "AGENTWALLET_KEYFILE_PASSPHRASE",
+          "description": "Passphrase that opens an encrypted keyfile (made with `agentwallet-mcp encrypt-keyfile`)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "AGENTWALLET_KEYFILE_PASSPHRASE_FILE",
+          "description": "Path of a file holding the keyfile passphrase (instead of AGENTWALLET_KEYFILE_PASSPHRASE; not both)",
           "isRequired": false,
           "format": "string",
           "isSecret": false
