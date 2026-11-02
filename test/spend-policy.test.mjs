@@ -386,6 +386,7 @@ writeFileSync(policyFile, JSON.stringify({
   hosts: { deny: ['denied.example.com'] },
   recipients: { deny: [OTHER] },
   tools: { deny: ['delete_wallet', 'create_paywall'] },
+  unknown_calls: 'allow', // 1.14.11 refuses unpriced calldata by default; this block tests the accounting of such calls, so it opts back in
 }, null, 2));
 // AGENTWALLET_TOKEN_RISK=0: approve_token would otherwise ask GoPlus over the network before the policy runs.
 const baseEnv = { AGENTWALLET_PRIVATE_KEY: TEST_KEY, AGENTWALLET_API_URL: DEAD_API, AGENTWALLET_RPC_8453: DEAD_RPC, AGENTWALLET_POLICY: policyFile, AGENTWALLET_LEDGER: stdioLedger, AGENTWALLET_MAX_TX_TOKEN: '100', AGENTWALLET_TOKEN_RISK: '0' };
@@ -1302,9 +1303,9 @@ check('a Permit2 call the policy cannot price (permitBatch, or an unknown select
   assert.match(rawText(first(pP2Unknown)), /not a Permit2 call this policy can price/);
   assert.equal(postsBeforeRouter, 3, JSON.stringify(permitPosts));
 });
-check('the same unknown selector to a contract that is not Permit2 still passes as a zero-value call', () => {
-  assert.match(rawText(first(pRouter)), /tx_hash/);
-  assert.equal(permitPosts.length, postsBeforeRouter + 1, JSON.stringify(permitPosts));
+check('the same unknown selector to a contract that is not Permit2 is refused under a policy since 1.14.11 (unknown_calls defaults to refuse)', () => {
+  assert.match(rawText(first(pRouter)), /not a shape the policy can price.*contracts\.allow/);
+  assert.equal(permitPosts.length, postsBeforeRouter, JSON.stringify(permitPosts));
 });
 check('truncated permit calldata is refused, not reclassified as a plain contract call', () => {
   assert.match(rawText(first(pTruncated)), /is truncated/);
@@ -1602,6 +1603,107 @@ check('six pipelined 402s under AGENTWALLET_MAX_AUTOPAY_PER_HOUR=2 make exactly 
   const texts = [100, 101, 102, 103, 104, 105].map((id) => rawText(race.responses.find((r) => r.id === id)));
   assert.equal(texts.filter((t) => /automatic payments were already made in the last hour/.test(t)).length, 4, texts.join('\n---\n'));
   assert.equal(texts.filter((t) => /autopay_payment|paid/.test(t) && !/already made/.test(t)).length, 2, texts.join('\n---\n'));
+});
+
+// ─── 1.14.11: calldata the policy cannot price is the operator's call ───
+// Nineteen disclosure rows between 2026-10-14 and 2026-11-02 were one gap:
+// the classifier is a table of known shapes, and a shape it did not know was
+// a zero-value call that reserved nothing. Under a policy that is now
+// refused unless the operator lists the contract (contracts.allow) or opts
+// back in (unknown_calls: "allow"). Without a policy nothing changes.
+console.log('\n1.14.11: unpriced calldata is refused under a policy unless the contract is listed\n');
+
+const ucSends = [];
+const ucApi = createServer((req, res) => {
+  let raw = '';
+  req.on('data', (c) => { raw += c; });
+  req.on('end', () => {
+    if (req.method === 'POST' && req.url.startsWith('/wallets/')) ucSends.push({ path: req.url, body: JSON.parse(raw || '{}') });
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify(req.method === 'POST' ? { success: true, tx_hash: '0x' + 'ab'.repeat(32), chain_id: 8453 } : { ok: true }));
+  });
+});
+await new Promise((r) => ucApi.listen(0, '127.0.0.1', r));
+const ucBase = { AGENTWALLET_API_URL: `http://127.0.0.1:${ucApi.address().port}`, AGENTWALLET_USER: 'u', AGENTWALLET_PASS: 'p', AGENTWALLET_TOKEN_RISK: '0' };
+const ucPolicy = (name, policy) => { const f = join(dir, `uc-${name}.json`); writeFileSync(f, JSON.stringify(policy)); return { ...ucBase, AGENTWALLET_POLICY: f, AGENTWALLET_LEDGER: join(dir, `uc-${name}-ledger.jsonl`) }; };
+const routerCall = (to = ROUTER, value = '0') => ({ name: 'send_transaction', arguments: { wallet_id: 1, chain_id: 8453, to, value, data: '0x38ed1739' + word(1) } }); // a swap selector the table does not know
+const ucDefault = ucPolicy('default', { version: 1, budget: { daily: '1' }, native_budget: { 8453: { daily: '0.01' } } });
+const ucListed = ucPolicy('listed', { version: 1, budget: { daily: '1' }, native_budget: { 8453: { daily: '0.01' } }, contracts: { allow: ['8453:' + ROUTER] } });
+const ucBare = ucPolicy('bare', { version: 1, budget: { daily: '1' }, contracts: { allow: [ROUTER] } });
+const ucOtherChain = ucPolicy('other-chain', { version: 1, budget: { daily: '1' }, contracts: { allow: ['1:' + ROUTER] } });
+const ucOptIn = ucPolicy('opt-in', { version: 1, budget: { daily: '1' }, unknown_calls: 'allow' });
+const ucDeny = ucPolicy('deny', { version: 1, budget: { daily: '1' }, unknown_calls: 'allow', contracts: { deny: [USDC_BASE] } });
+
+const uRefused = await callTools([routerCall()], ucDefault, { waitMs: 8000 });
+const uRefusedValue = await callTools([routerCall(ROUTER, '1000000000000000')], ucDefault, { waitMs: 8000 });
+const sendsBeforeListed = ucSends.length;
+const uListed = await callTools([routerCall()], ucListed, { waitMs: 8000 });
+const uListedValue = await callTools([routerCall(ROUTER, '1000000000000000')], ucListed, { waitMs: 8000 });
+const uBare = await callTools([routerCall()], ucBare, { waitMs: 8000 });
+const uOtherChain = await callTools([routerCall()], ucOtherChain, { waitMs: 8000 });
+const uOptIn = await callTools([routerCall()], ucOptIn, { waitMs: 8000 });
+const sendsBeforeKnown = ucSends.length;
+const uKnown = await callTools([
+  { name: 'wrap_eth', arguments: { wallet_id: 1, amount: '0.001', chain_id: 8453 } },                                                       // 100
+  { name: 'send_transaction', arguments: { wallet_id: 1, chain_id: 8453, to: USDC_BASE, value: '0', data: transferCalldata(DEAD, 1000) } }, // 101
+  { name: 'send_transaction', arguments: { wallet_id: 1, chain_id: 8453, to: DEAD, value: '1000', data: '' } },                              // 102
+  { name: 'spend_policy', arguments: {} },                                                                                                   // 103
+], ucDefault, { waitMs: 9000 });
+const uDenied = await callTools([{ name: 'send_transaction', arguments: { wallet_id: 1, chain_id: 8453, to: USDC_BASE, value: '0', data: transferCalldata(DEAD, 1000) } }], ucDeny, { waitMs: 8000 });
+const sendsBeforeNoPolicy = ucSends.length;
+const uNoPolicy = await callTools([routerCall()], ucBase, { waitMs: 8000 });
+ucApi.close();
+const uSim = await callTools([
+  { name: 'simulate_transaction', arguments: { wallet_id: 1, to: ROUTER, value: '0', data: '0x38ed1739' + word(1), chain_id: 8453 } },
+], { ...baseEnv, AGENTWALLET_POLICY: join(dir, 'uc-default.json'), AGENTWALLET_LEDGER: join(dir, 'uc-sim-ledger.jsonl') }, { waitMs: 8000 });
+
+check('an unpriced selector to a contract the policy does not list is refused under a policy, with or without value, before the custodian is asked', () => {
+  assert.match(rawText(first(uRefused)), /selector 0x38ed1739 to 0xefef.* is not a shape the policy can price.*contracts\.allow/);
+  assert.match(rawText(first(uRefusedValue)), /not a shape the policy can price/);
+  assert.equal(sendsBeforeListed, 0, JSON.stringify(ucSends));
+});
+check('listed in contracts.allow (chain-scoped or bare) the same call goes out; the value it carries is still a native spend to the contract', () => {
+  assert.match(rawText(first(uListed)), /tx_hash/);
+  assert.match(rawText(first(uListedValue)), /tx_hash/);
+  assert.match(rawText(first(uBare)), /tx_hash/);
+  const lines = new Ledger(join(dir, 'uc-listed-ledger.jsonl')).payments({ limit: 10 });
+  assert.equal(lines.length, 1, JSON.stringify(lines));
+  assert.equal(lines[0].amount, '0.001');
+  assert.equal(String(lines[0].to).toLowerCase(), ROUTER);
+});
+check('an entry for the same contract on another chain does not admit it; unknown_calls "allow" restores the old behaviour', () => {
+  assert.match(rawText(first(uOtherChain)), /not a shape the policy can price/);
+  assert.match(rawText(first(uOptIn)), /tx_hash/);
+  assert.equal(sendsBeforeKnown, sendsBeforeListed + 4, JSON.stringify(ucSends));
+});
+check('known shapes are untouched: wrap_eth (WETH deposit), an ERC-20 transfer and a plain native send all pass under the default policy', () => {
+  for (const id of [100, 101, 102]) assert.match(rawText(uKnown.responses.find((r) => r.id === id)), /tx_hash/, `id ${id}`);
+  const sp = textOf(uKnown.responses.find((r) => r.id === 103));
+  assert.equal(sp.policy.unknown_calls, 'refuse');
+  assert.equal(sp.policy.contracts, null);
+});
+check('contracts.deny refuses a priced call too: a transfer calldata to a denied token never goes out', () => {
+  assert.match(rawText(first(uDenied)), /policy denies contract 0x8335.* on chain 8453 \(contracts\.deny\)/);
+  assert.equal(sendsBeforeNoPolicy, sendsBeforeKnown + 3, JSON.stringify(ucSends));
+});
+check('with no policy at all an unpriced call still passes to the signer, as before', () => {
+  assert.match(rawText(first(uNoPolicy)), /tx_hash/);
+  assert.equal(ucSends.length, sendsBeforeNoPolicy + 1);
+});
+check('simulate_transaction reports the unknown-call refusal and signs nothing', () => {
+  const s = textOf(first(uSim));
+  assert.equal(s.ok, false);
+  assert.equal(s.moves.kind, 'contract');
+  assert.match(s.policy, /not a shape the policy can price/);
+  assert.equal(s.signed, false);
+});
+check('policy parsing: contracts entries must be contracts, an empty allow list is refused, and the summary reports the counts', () => {
+  assert.throws(() => parsePolicy(JSON.stringify({ version: 1, contracts: { allow: ['native'] } })), /not a contract/);
+  assert.throws(() => parsePolicy(JSON.stringify({ version: 1, contracts: { allow: [] } })), /contracts\.allow/);
+  assert.throws(() => parsePolicy(JSON.stringify({ version: 1, unknown_calls: 'maybe' } )), /unknown_calls/);
+  const p = parsePolicy(JSON.stringify({ version: 1, contracts: { allow: ['8453:' + ROUTER], deny: [USDC_BASE] }, unknown_calls: 'refuse' }));
+  assert.equal(targetAllowed(p, USDC_BASE, 8453).ok, false);
+  assert.equal(targetAllowed(p, USDC_BASE).ok, true, 'without a chain the contract deny list is not consulted');
 });
 
 console.log(`\nspend-policy: ${passed} passed, ${failed} failed\n`);

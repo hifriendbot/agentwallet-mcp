@@ -58,7 +58,7 @@ import {
   resolveRpcUrl,
 } from './local-wallet.js';
 import { localSignAuthorization, localEthCall, localGetCode, localSignPermit2Upto, probeTokenDecimals, assertRpcServesChain } from './local-wallet.js';
-import { WRAPPED_NATIVE } from './wrapped-native.js';
+import { WRAPPED_NATIVE, wrappedNativeAddress } from './wrapped-native.js';
 import {
   buildUptoAuthorization, uptoPayload, permit2AllowanceCalldata, permit2ApproveCalldata, decodeUint, permit2Address,
   type UptoPermit2Authorization,
@@ -85,7 +85,7 @@ import {
 } from './local-solana.js';
 import { localSimulate } from './local-wallet.js';
 import {
-  loadPolicy, describePolicy, hostAllowed, recipientAllowed, targetAllowed, chainAllowed, assetAllowed, perHostRule, toolAllowed, hostOf,
+  loadPolicy, describePolicy, hostAllowed, recipientAllowed, targetAllowed, unknownCallAllowed, chainAllowed, assetAllowed, perHostRule, toolAllowed, hostOf,
   budgetReport, units as policyUnits, human as policyHuman, rawToUnits, type LoadedPolicy,
 } from './policy.js';
 import { Ledger, type ReserveInput, type Limits, type SpendMethod } from './ledger.js';
@@ -210,7 +210,9 @@ function usdOf(chainId: number, asset: string, raw: string, decimals: number): s
  * 1.14.7 that rent met the per-transaction SOL cap only and never the rolling
  * native_budget (reported privately 2026-10-26).
  */
-type DescribedSend = { kind: 'native' | 'token' | 'approval' | 'spl' | 'contract'; to: string; asset: string; raw: string; decimals: number; unbounded?: boolean; carried?: { raw: string; to: string; rent?: true } };
+type DescribedSend = { kind: 'native' | 'token' | 'approval' | 'spl' | 'contract'; to: string; asset: string; raw: string; decimals: number; unbounded?: boolean; carried?: { raw: string; to: string; rent?: true }; unknown?: string };
+/** WETH9 deposit() and withdraw(uint256): known shapes when aimed at the chain's own wrapped-native contract (wrap_eth, unwrap_eth). */
+const WRAPPED_NATIVE_SELECTORS = new Set(['d0e30db0', '2e1a7d4d']);
 
 /* Calldata the policy prices: which word holds the amount, which the recipient
    or spender, and for Permit2.approve which the token (there `to` is Permit2).
@@ -402,7 +404,15 @@ async function describeSend(body: Record<string, unknown>, chainId: number): Pro
       );
     }
   }
-  if (data && data !== '0x') return { kind: 'contract', to, asset: '', raw: value, decimals: nativeDecimals(chainId) };
+  if (data && data !== '0x') {
+    // A shape the table does not know. Under a policy it is refused unless
+    // the operator listed the contract (assertSendTarget, 1.14.11); the
+    // chain's wrapped-native deposit and withdraw are known shapes, since
+    // wrap_eth and unwrap_eth build them.
+    const selector = /^0x[0-9a-fA-F]{8}/.test(data) ? data.slice(0, 10).toLowerCase() : data.slice(0, 10);
+    const isWrapped = to.toLowerCase() === wrappedNativeAddress(chainId) && WRAPPED_NATIVE_SELECTORS.has(selector.slice(2));
+    return { kind: 'contract', to, asset: '', raw: value, decimals: nativeDecimals(chainId), ...(isWrapped ? {} : { unknown: selector }) };
+  }
   return { kind: 'native', to, asset: '', raw: value, decimals: nativeDecimals(chainId) };
 }
 
@@ -421,12 +431,23 @@ function assertSendTarget(d: DescribedSend, chainId: number): void {
   const c = chainAllowed(POL(), chainId);
   if (!c.ok) throw new Error(c.reason + ' Nothing was signed.');
   if (d.kind === 'contract' || d.kind === 'approval') {
-    const t = targetAllowed(POL(), d.kind === 'approval' ? d.asset : d.to);
+    const t = targetAllowed(POL(), d.kind === 'approval' ? d.asset : d.to, chainId);
+    if (!t.ok) throw new Error(t.reason + ' Nothing was signed.');
+  }
+  if (d.kind === 'token' && d.asset) {
+    const t = targetAllowed(POL(), d.asset, chainId); // the token or vault being moved; contracts.deny binds it
     if (!t.ok) throw new Error(t.reason + ' Nothing was signed.');
   }
   if (d.carried) {
-    const t = targetAllowed(POL(), d.carried.to); // the contract that keeps the value
+    const t = targetAllowed(POL(), d.carried.to, chainId); // the contract that keeps the value
     if (!t.ok) throw new Error(t.reason + ' Nothing was signed.');
+  }
+  // Calldata the table cannot price is the operator's call, not the table's
+  // (1.14.11). Without a policy nothing changes: the local caps and the
+  // hosted signer judge the call on their own terms, as before.
+  if (d.unknown && POLICY.path) {
+    const u = unknownCallAllowed(POL(), chainId, d.to, d.unknown);
+    if (!u.ok) throw new Error(u.reason + ' Nothing was signed.');
   }
 }
 
@@ -1491,7 +1512,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.14.10',
+    version: '1.14.11',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()

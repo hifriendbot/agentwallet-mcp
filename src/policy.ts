@@ -37,6 +37,10 @@ export const PolicySchema = z.object({
   recipients: z.object({ allow: z.array(Address).max(1000).optional(), deny: z.array(Address).max(1000).optional() }).strict().optional(),
   chains: z.object({ allow: z.array(z.number().int().positive()).max(100).optional() }).strict().optional(),
   assets: z.object({ allow: z.array(AssetRef).max(500).optional() }).strict().optional(),
+  /** Contracts the wallet may call with calldata the policy cannot price (a router, a bridge, a protocol). Entries may be scoped "chainId:0x...". deny refuses any call to the contract, priced or not. */
+  contracts: z.object({ allow: z.array(AssetRef).max(1000).optional(), deny: z.array(AssetRef).max(1000).optional() }).strict().optional(),
+  /** What to do with calldata the policy cannot price, aimed at a contract not in contracts.allow. Default refuse (1.14.11); "allow" restores the pre-1.14.11 behaviour of passing it as a zero-value call. */
+  unknown_calls: z.enum(['refuse', 'allow']).optional(),
   /** Ask the human (MCP elicitation) above `above`; in local mode an accepted ask may admit up to `max`, above the per-payment cap. */
   approval: z.object({ above: Dec.optional(), max: Dec.optional(), timeout_seconds: z.number().int().min(30).max(3600).optional() }).strict().optional(),
   tools: z.object({ allow: z.array(z.string().regex(/^[a-z_0-9]+$/)).max(100).optional(), deny: z.array(z.string().regex(/^[a-z_0-9]+$/)).max(100).optional() }).strict().optional(),
@@ -102,6 +106,8 @@ export function parsePolicy(text: string): Policy {
   if (p.tools?.allow && p.tools?.deny) throw new Error('policy field tools: use allow or deny, not both.');
   if (p.hosts?.allow && p.hosts.allow.length === 0) throw new Error('policy field hosts.allow: an empty allow list would refuse every host; remove it or list hosts.');
   if (p.recipients?.allow && p.recipients.allow.length === 0) throw new Error('policy field recipients.allow: an empty allow list would refuse every recipient; remove it or list addresses.');
+  if (p.contracts?.allow && p.contracts.allow.length === 0) throw new Error('policy field contracts.allow: an empty allow list is the default (unpriced calls refused); remove it or list contracts.');
+  for (const k of ['allow', 'deny'] as const) for (const e of p.contracts?.[k] || []) if (e.endsWith('native')) throw new Error(`policy field contracts.${k}: "${e}" is not a contract.`);
   return p;
 }
 
@@ -176,9 +182,36 @@ export function recipientAllowed(p: Policy, to: string): { ok: true } | { ok: fa
 }
 
 /** A contract target (approve, wrap, arbitrary calldata): the deny list only; an allow list is about where funds go. */
-export function targetAllowed(p: Policy, to: string): { ok: true } | { ok: false; reason: string } {
+export function targetAllowed(p: Policy, to: string, chainId?: number): { ok: true } | { ok: false; reason: string } {
   if (p.recipients?.deny?.some(x => sameAddress(x, to))) return { ok: false, reason: `policy denies contract target ${to} (recipients.deny).` };
+  if (chainId !== undefined && p.contracts?.deny?.some(e => contractRefMatches(e, chainId, to))) return { ok: false, reason: `policy denies contract ${to} on chain ${chainId} (contracts.deny).` };
   return { ok: true };
+}
+
+/** "8453:0xabc" matches that contract on that chain; a bare address matches it on every chain. */
+function contractRefMatches(entry: string, chainId: number, to: string): boolean {
+  const i = entry.indexOf(':');
+  if (i < 0) return sameAddress(entry, to);
+  return Number(entry.slice(0, i)) === chainId && sameAddress(entry.slice(i + 1), to);
+}
+
+/**
+ * May the wallet send calldata the policy cannot price to this contract?
+ * Since 1.14.11 the answer under a policy is no unless the operator listed
+ * the contract or set unknown_calls to "allow": the classifier is a table of
+ * known shapes, and every shape it did not know was, until then, a
+ * zero-value call that reserved nothing (nineteen disclosure rows between
+ * 2026-10-14 and 2026-11-02 were that one gap). The open set is now the
+ * operator's decision, not the table's.
+ */
+export function unknownCallAllowed(p: Policy, chainId: number, to: string, selector: string): { ok: true } | { ok: false; reason: string } {
+  if (p.contracts?.allow?.some(e => contractRefMatches(e, chainId, to))) return { ok: true };
+  if ((p.unknown_calls ?? 'refuse') === 'allow') return { ok: true };
+  return {
+    ok: false,
+    reason: `policy: calldata selector ${selector} to ${to} on chain ${chainId} is not a shape the policy can price (a transfer, an approval, a permit, a redemption), and the policy does not list the contract in contracts.allow; ` +
+      `refused rather than passed as a zero-value call. The operator can add "${chainId}:${to}" to contracts.allow, or set unknown_calls to "allow" to let every unpriced call through as before 1.14.11.`,
+  };
 }
 
 export function chainAllowed(p: Policy, chainId: number): { ok: true } | { ok: false; reason: string } {
@@ -242,6 +275,8 @@ export function describePolicy(lp: LoadedPolicy): Record<string, unknown> {
     recipients: p.recipients ? { allow: p.recipients.allow?.length ?? null, deny: p.recipients.deny?.length ?? null } : null,
     chains: p.chains ?? null,
     assets: p.assets ?? null,
+    contracts: p.contracts ? { allow: p.contracts.allow?.length ?? null, deny: p.contracts.deny?.length ?? null } : null,
+    unknown_calls: lp.path ? (p.unknown_calls ?? 'refuse') : 'allow (no policy set)',
     approval: p.approval ?? null,
     tools: p.tools ?? null,
     ledger: lp.ledgerPath,
