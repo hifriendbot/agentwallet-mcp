@@ -1328,5 +1328,281 @@ check('in local mode the per-transaction token cap prices a permit like an appro
   assert.ok(!/Blocked by local guard|cannot be counted|budget/.test(under), under);
 });
 
+// ─── 1.14.10: eight reports of 2026-11-02 ───
+// Reported privately 2026-11-02, one reporter, eight reports against 1.14.9:
+// (1) increaseApproval, (2) the ERC-1363 and ERC-223 movers, (3) the EIP-6909
+// grants and movers and (4) the ERC-4626 and Aave redemptions all fell
+// through the classifier as zero-value contract calls; (5) a native spend on
+// a chain with no native_budget entry passed a dollar-only policy unchecked;
+// (6) a chain-less hosted send was priced on 8453 and forwarded with no
+// chain, so the custodian chose its own; (7) a 5xx that carried the
+// transaction hash voided the reservation and dropped the hash; (8) the
+// auto-pay hourly cap was read before the awaited payment and written after
+// it. The loopback custodian below records every send and answers in the
+// mode the step sets.
+console.log('\n1.14.10: sibling movers, EIP-6909, redemptions, native under a dollar budget, hosted chain, 5xx after broadcast, auto-pay race (reported 2026-11-02)\n');
+
+const b10Sends = [];
+let b10Mode = 'ok';
+const b10Api = createServer((req, res) => {
+  let raw = '';
+  req.on('data', (c) => { raw += c; });
+  req.on('end', () => {
+    const body = JSON.parse(raw || '{}');
+    const json = (code, obj) => { res.statusCode = code; res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(obj)); };
+    if (req.method !== 'POST') return json(200, { ok: true });
+    if (req.url.startsWith('/eth-call')) return json(200, { result: '0x' + word(18) }); // decimals() of a vault or pool the registry does not know
+    if (b10Mode === '402') {
+      if (req.headers['x-agw-skip-x402']) { b10Sends.push({ path: req.url, body, autopay: true }); return setTimeout(() => json(200, { tx_hash: '0x' + 'cd'.repeat(32) }), 300); }
+      if (req.headers['x-payment']) return json(200, { tx_hash: '0x' + 'ef'.repeat(32), paid: true });
+      return json(402, { x402Version: 1, error: 'Payment Required', accepts: [{ scheme: 'exact', network: 'base', payTo: DEAD, maxAmountRequired: '1000', requiredDecimals: 18 }] });
+    }
+    b10Sends.push({ path: req.url, body });
+    if (b10Mode === '500-hash') return json(500, { error: 'custodian downstream failed after broadcast', tx_hash: '0x' + 'ab'.repeat(32) });
+    if (b10Mode === '500') return json(500, { error: 'custodian failed' });
+    if (b10Mode === '403') return json(403, { error: 'wallet paused' });
+    if (b10Mode === 'wrong-chain') return json(200, { success: true, tx_hash: '0x' + 'ab'.repeat(32), chain_id: 1 });
+    return json(200, { success: true, tx_hash: '0x' + 'ab'.repeat(32), chain_id: body.chain_id ?? 1 });
+  });
+});
+await new Promise((r) => b10Api.listen(0, '127.0.0.1', r));
+const VAULT = '0xbabababababababababababababababababababa';
+const POOL = '0xdadadadadadadadadadadadadadadadadadadada';
+const MULTI = '0xeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaeaea';
+const increaseApproval = (spender, amt) => '0xd73dd623' + pad32(spender) + word(amt);
+const transferAndCall2 = (to, amt) => '0x1296ee62' + pad32(to) + word(amt);
+const transferFromAndCall = (from, to, amt) => '0xd8fbe994' + pad32(from) + pad32(to) + word(amt);
+const erc223Transfer = (to, amt) => '0xbe45fd62' + pad32(to) + word(amt) + word(96) + word(0);
+const setOperator = (op, yes) => '0x558a7297' + pad32(op) + word(yes ? 1 : 0);
+const approve6909 = (spender, id, amt) => '0x426a8493' + pad32(spender) + word(id) + word(amt);
+const transfer6909 = (to, id, amt) => '0x095bcdb6' + pad32(to) + word(id) + word(amt);
+const redeem4626 = (shares, receiver, owner) => '0xba087652' + word(shares) + pad32(receiver) + pad32(owner);
+const withdraw4626 = (assets, receiver, owner) => '0xb460af94' + word(assets) + pad32(receiver) + pad32(owner);
+const aaveWithdraw = (asset, amt, to) => '0x69328dec' + pad32(asset) + word(amt) + pad32(to);
+const b10Send = (data, to = USDC_BASE) => ({ name: 'send_transaction', arguments: { wallet_id: 1, chain_id: 8453, to, value: '0', data } });
+const b10Base = { AGENTWALLET_API_URL: `http://127.0.0.1:${b10Api.address().port}`, AGENTWALLET_USER: 'u', AGENTWALLET_PASS: 'p', AGENTWALLET_TOKEN_RISK: '0' };
+const b10Policy = (name, policy) => { const f = join(dir, `b10-${name}.json`); writeFileSync(f, JSON.stringify(policy)); return { ...b10Base, AGENTWALLET_POLICY: f, AGENTWALLET_LEDGER: join(dir, `b10-${name}-ledger.jsonl`) }; };
+const sendsTo = (path) => b10Sends.filter((s) => s.path === path && !s.autopay);
+const b10One = (call, env, waitMs = 8000) => callTools([call], env, { waitMs });
+
+// (1) and (2): the sibling shapes, one session per step, a daily budget of 1.
+const sibEnv = b10Policy('siblings', { version: 1, budget: { daily: '1' }, recipients: { deny: [OTHER] } });
+const sUnlimited = await b10One(b10Send(increaseApproval(DEAD, (1n << 256n) - 1n)), sibEnv);
+const sDenied = await b10One(b10Send(increaseApproval(OTHER, 500000)), sibEnv);
+const sendsBeforeSib = sendsTo('/wallets/1/send').length;
+const sGrant = await b10One(b10Send(increaseApproval(DEAD, 500000)), sibEnv);
+const s1363Denied = await b10One(b10Send(transferAndCall2(OTHER, 100)), sibEnv);
+const s1363 = await b10One(b10Send(transferAndCall2(DEAD, 200000)), sibEnv);
+const s223 = await b10One(b10Send(erc223Transfer(DEAD, 200000)), sibEnv);
+const sOver = await b10One(b10Send(transferFromAndCall(TEST_ADDRESS, DEAD, 200000)), sibEnv);
+const sReport = await b10One({ name: 'list_payments', arguments: { limit: 10 } }, sibEnv, 7000);
+check('increaseApproval for 2^256-1 is refused as an unlimited approval; to a denied spender it is refused as a recipient; nothing reaches the custodian', () => {
+  assert.match(rawText(first(sUnlimited)), /unlimited approval of USDC .* cannot be counted against any budget/);
+  assert.match(rawText(first(sDenied)), /policy denies recipient/);
+  assert.equal(sendsBeforeSib, 0, JSON.stringify(b10Sends));
+});
+check('a bounded increaseApproval goes out once and is reserved as an approval of that amount', () => {
+  assert.match(rawText(first(sGrant)), /tx_hash/);
+  const line = textOf(first(sReport)).payments.find((p) => p.method === 'approval');
+  assert.ok(line, rawText(first(sReport)));
+  assert.equal(line.amount, '0.5');
+  assert.equal(line.usd, '0.5');
+  assert.equal(String(line.to).toLowerCase(), DEAD.toLowerCase());
+});
+check('the ERC-1363 two-argument transferAndCall and the ERC-223 transfer are token spends: recipient-checked, priced, reserved', () => {
+  assert.match(rawText(first(s1363Denied)), /policy denies recipient/);
+  assert.match(rawText(first(s1363)), /tx_hash/);
+  assert.match(rawText(first(s223)), /tx_hash/);
+  const transfers = textOf(first(sReport)).payments.filter((p) => p.method === 'transfer');
+  assert.equal(transfers.length, 2, rawText(first(sReport)));
+  for (const t of transfers) { assert.equal(t.amount, '0.2'); assert.equal(t.usd, '0.2'); }
+});
+check('transferFromAndCall is counted against what the earlier lines reserved: 0.2 after 0.9 breaks a daily budget of 1', () => {
+  assert.match(rawText(first(sOver)), /daily budget of 1 would be exceeded/);
+  assert.equal(sendsTo('/wallets/1/send').length, 3, JSON.stringify(b10Sends));
+});
+
+// (3) EIP-6909: the operator grant is unbounded; the per-id approve and movers are unpriced and recipient-checked.
+const mtEnv = b10Policy('multi', { version: 1, budget: { daily: '1' }, recipients: { deny: [OTHER] } });
+const mtOpenEnv = b10Policy('multi-open', { version: 1, budget: { daily: '1' }, unpriced_spends: 'allow', recipients: { deny: [OTHER] } });
+const mGrant = await b10One(b10Send(setOperator(DEAD, true), MULTI), mtEnv);
+const sendsBeforeRevoke = sendsTo('/wallets/1/send').length;
+const mRevoke = await b10One(b10Send(setOperator(DEAD, false), MULTI), mtEnv);
+const sendsAfterRevoke = sendsTo('/wallets/1/send').length;
+const mApprove = await b10One(b10Send(approve6909(DEAD, 1, 5), MULTI), mtEnv);
+const mDenied = await b10One(b10Send(transfer6909(OTHER, 1, 5), MULTI), mtOpenEnv);
+const sendsBeforeOpen = sendsTo('/wallets/1/send').length;
+const mOpen = await b10One(b10Send(transfer6909(DEAD, 1, 5), MULTI), mtOpenEnv);
+const mReport = await b10One({ name: 'list_payments', arguments: { limit: 10 } }, mtOpenEnv, 7000);
+check('EIP-6909 setOperator(x, true) is an unbounded approval and is refused under a policy; setOperator(x, false) goes out reserving nothing', () => {
+  assert.match(rawText(first(mGrant)), /unlimited approval of .* cannot be counted against any budget/);
+  assert.match(rawText(first(mRevoke)), /tx_hash/);
+  assert.equal(sendsAfterRevoke, sendsBeforeRevoke + 1);
+});
+check('an EIP-6909 per-id approve is an unpriced approval: refused under a dollar budget', () => {
+  assert.match(rawText(first(mApprove)), /not a registry stablecoin, so the dollar budget cannot count it/);
+});
+check('an EIP-6909 transfer is recipient-checked, and with unpriced_spends allow it goes out and is written to the ledger', () => {
+  assert.match(rawText(first(mDenied)), /policy denies recipient/);
+  assert.equal(sendsBeforeOpen, sendsBeforeRevoke + 1, 'the denied transfer never reached the custodian');
+  assert.match(rawText(first(mOpen)), /tx_hash/);
+  const line = textOf(first(mReport)).payments.find((p) => p.method === 'transfer');
+  assert.ok(line, rawText(first(mReport)));
+  assert.equal(String(line.asset).toLowerCase(), MULTI);
+  assert.equal(line.amount, '5');
+  assert.equal(line.usd, null);
+});
+
+// (4) Redemptions: ERC-4626 redeem and withdraw pay the vault's position to the receiver; Aave withdraw names the underlying.
+const rdEnv = b10Policy('redeem', { version: 1, budget: { daily: '1' }, recipients: { deny: [OTHER] } });
+const rdOpenEnv = b10Policy('redeem-open', { version: 1, budget: { daily: '1' }, unpriced_spends: 'allow', recipients: { deny: [OTHER] } });
+const rDenied = await b10One(b10Send(redeem4626(500, OTHER, TEST_ADDRESS), VAULT), rdEnv);
+const rUnpriced = await b10One(b10Send(redeem4626(500, DEAD, TEST_ADDRESS), VAULT), rdEnv);
+const rAaveDenied = await b10One(b10Send(aaveWithdraw(USDC_BASE, 1000000, OTHER), POOL), rdEnv);
+const sendsBeforeAave = sendsTo('/wallets/1/send').length;
+const rAave = await b10One(b10Send(aaveWithdraw(USDC_BASE, 1000000, DEAD), POOL), rdEnv);
+const rAaveOver = await b10One(b10Send(aaveWithdraw(USDC_BASE, 500000, DEAD), POOL), rdEnv);
+const rReport = await b10One({ name: 'list_payments', arguments: { limit: 10 } }, rdEnv, 7000);
+const rOpen = await b10One(b10Send(withdraw4626(100n * 10n ** 18n, DEAD, TEST_ADDRESS), VAULT), rdOpenEnv);
+const rOpenReport = await b10One({ name: 'list_payments', arguments: { limit: 10 } }, rdOpenEnv, 7000);
+check('an ERC-4626 redeem to a denied receiver is refused as a recipient; to an allowed one it is an unpriced spend of the vault, refused under a dollar budget', () => {
+  assert.match(rawText(first(rDenied)), /policy denies recipient/);
+  assert.match(rawText(first(rUnpriced)), /not a registry stablecoin, so the dollar budget cannot count it/);
+  assert.equal(sendsBeforeAave, sendsBeforeOpen + 1, 'no redemption reached the custodian');
+});
+check('an Aave Pool.withdraw of USDC is priced as a transfer of USDC to the receiver: recipient-checked, reserved at 1 dollar, and the next 0.5 breaks the daily budget', () => {
+  assert.match(rawText(first(rAaveDenied)), /policy denies recipient/);
+  assert.match(rawText(first(rAave)), /tx_hash/);
+  assert.match(rawText(first(rAaveOver)), /daily budget of 1 would be exceeded/);
+  const line = textOf(first(rReport)).payments.find((p) => p.method === 'transfer');
+  assert.ok(line, rawText(first(rReport)));
+  assert.equal(String(line.asset).toLowerCase(), USDC_BASE.toLowerCase());
+  assert.equal(line.amount, '1');
+  assert.equal(line.usd, '1');
+  assert.equal(String(line.to).toLowerCase(), DEAD.toLowerCase());
+});
+check('with unpriced_spends allow an ERC-4626 withdraw goes out and is written under the vault with the receiver as recipient', () => {
+  assert.match(rawText(first(rOpen)), /tx_hash/);
+  const line = textOf(first(rOpenReport)).payments.find((p) => p.method === 'transfer');
+  assert.ok(line, rawText(first(rOpenReport)));
+  assert.equal(String(line.asset).toLowerCase(), VAULT);
+  assert.equal(line.amount, '100');
+  assert.equal(String(line.to).toLowerCase(), DEAD.toLowerCase());
+});
+const rSim = await callTools([
+  { name: 'simulate_transaction', arguments: { wallet_id: 1, to: VAULT, value: '0', data: redeem4626(500, OTHER, TEST_ADDRESS), chain_id: 8453 } },
+], { ...baseEnv, AGENTWALLET_POLICY: join(dir, 'b10-redeem.json'), AGENTWALLET_LEDGER: join(dir, 'b10-sim-ledger.jsonl') }, { waitMs: 8000 });
+check('simulate_transaction reports a redemption as a token spend to the receiver and signs nothing', () => {
+  const s = textOf(first(rSim));
+  assert.equal(s.ok, false);
+  assert.equal(s.moves.kind, 'token');
+  assert.equal(String(s.moves.to).toLowerCase(), OTHER.toLowerCase());
+  assert.match(s.policy, /denies recipient/);
+  assert.equal(s.signed, false);
+});
+
+// (5) Native under a dollar-only policy: unpriced, so the unpriced rule decides it.
+{
+  const l = new Ledger(join(dir, 'b10-native-ledger.jsonl'));
+  const native = { tool: 'transfer', mode: 'local', wallet: 'local', chainId: 8453, asset: '', assetLabel: 'ETH', raw: '1000000000000000', decimals: 18, usd: null, to: DEAD, host: null, resource: null, method: 'native' };
+  check('ledger: a native spend with no native_budget for its chain is refused under a dollar budget with unpriced_spends refuse, named as such', () => {
+    const r = l.check(native, { usd: { daily: '0.5' }, native: undefined, host: null, unpriced: 'refuse' });
+    assert.equal(r.ok, false);
+    assert.match(r.reason, /no native_budget\.8453/);
+  });
+  check('ledger: the same spend is refused under a per-host ceiling alone, allowed with unpriced_spends allow, and counted by native_budget when one is set', () => {
+    assert.equal(l.check({ ...native, host: 'api.example.com' }, { usd: undefined, native: undefined, host: { pattern: 'api.example.com', daily: '1' }, unpriced: 'refuse' }).ok, false);
+    assert.equal(l.check(native, { usd: { daily: '0.5' }, native: undefined, host: null, unpriced: 'allow' }).ok, true);
+    assert.equal(l.check(native, { usd: { daily: '0.5' }, native: { daily: '0.01' }, host: null, unpriced: 'refuse' }).ok, true);
+    assert.equal(l.check({ ...native, raw: '20000000000000000' }, { usd: { daily: '0.5' }, native: { daily: '0.01' }, host: null, unpriced: 'refuse' }).ok, false);
+    assert.equal(l.check(native, { usd: undefined, native: undefined, host: null, unpriced: 'refuse' }).ok, true, 'no budget at all: nothing to count against');
+  });
+}
+const nRefuseEnv = { ...baseEnv, AGENTWALLET_POLICY: (() => { const f = join(dir, 'b10-native-refuse.json'); writeFileSync(f, JSON.stringify({ version: 1, budget: { daily: '1' } })); return f; })(), AGENTWALLET_LEDGER: join(dir, 'b10-native-refuse-ledger.jsonl') };
+const nAllowEnv = { ...baseEnv, AGENTWALLET_POLICY: (() => { const f = join(dir, 'b10-native-allow.json'); writeFileSync(f, JSON.stringify({ version: 1, budget: { daily: '1' }, unpriced_spends: 'allow' })); return f; })(), AGENTWALLET_LEDGER: join(dir, 'b10-native-allow-ledger.jsonl') };
+const nRefused = await callTools([{ name: 'transfer', arguments: { wallet_id: 1, to: DEAD, amount: '0.001', chain_id: 8453 } }], nRefuseEnv, { waitMs: 8000 });
+const nAllowed = await callTools([{ name: 'transfer', arguments: { wallet_id: 1, to: DEAD, amount: '0.001', chain_id: 8453 } }], nAllowEnv, { waitMs: 8000 });
+check('over stdio: a 0.001 ETH transfer under "budget daily 1" with no native_budget is refused before the RPC is asked; with unpriced_spends allow it passes the policy', () => {
+  assert.match(rawText(first(nRefused)), /no native_budget\.8453/);
+  const a = rawText(first(nAllowed));
+  assert.ok(!/native_budget|cannot price/.test(a), a); // it reaches the dead RPC and fails there, past the policy
+});
+
+// (6) Hosted chain: the body the custodian receives names the chain the policy priced.
+const hcEnv = b10Policy('hosted-chain', { version: 1, native_budget: { 8453: { daily: '0.01' }, 10: { daily: '0.01' } } });
+const chainless = { name: 'send_transaction', arguments: { wallet_id: 1, to: DEAD, value: '1000000000000000', data: '' } };
+const sendsBeforeChain = sendsTo('/wallets/1/send').length;
+const hcDefault = await b10One(chainless, hcEnv);
+const hcEnvTen = await b10One(chainless, { ...hcEnv, AGENTWALLET_CHAIN_ID: '10' });
+b10Mode = 'wrong-chain';
+const hcWrong = await b10One(chainless, hcEnv);
+b10Mode = 'ok';
+const hcReport = await b10One({ name: 'list_payments', arguments: { limit: 10 } }, hcEnv, 7000);
+check('a chain-less hosted send is forwarded with chain_id 8453, the chain the policy priced it on', () => {
+  assert.match(rawText(first(hcDefault)), /tx_hash/);
+  const s = sendsTo('/wallets/1/send')[sendsBeforeChain];
+  assert.ok(s, JSON.stringify(b10Sends));
+  assert.equal(s.body.chain_id, 8453);
+});
+check('with AGENTWALLET_CHAIN_ID=10 the same send is forwarded with chain_id 10 and ledgered on chain 10', () => {
+  assert.match(rawText(first(hcEnvTen)), /tx_hash/);
+  assert.equal(sendsTo('/wallets/1/send')[sendsBeforeChain + 1].body.chain_id, 10);
+  const ten = new Ledger(join(dir, 'b10-hosted-chain-ledger.jsonl')).payments({ limit: 10 }).find((p) => p.chain_id === 10);
+  assert.ok(ten, 'a ledger line on chain 10');
+});
+check('a custodian that reports another chain than the one it was told is written onto the ledger line as a chain mismatch', () => {
+  assert.match(rawText(first(hcWrong)), /tx_hash/);
+  const lines = textOf(first(hcReport)).payments;
+  assert.ok(lines.some((p) => /CHAIN MISMATCH: reserved on chain 8453, the API host reports chain 1/.test(String(p.outcome_detail))), JSON.stringify(lines));
+});
+
+// (7) A reached host's non-2xx: 4xx voids, 5xx stays counted, and a hash in the body is reported.
+const fiveEnv = b10Policy('fivexx', { version: 1, native_budget: { 8453: { daily: '0.01' } } });
+const fiveSend = { name: 'send_transaction', arguments: { wallet_id: 1, chain_id: 8453, to: DEAD, value: '5000000000000000', data: '' } };
+b10Mode = '500-hash';
+const fHash = await b10One(fiveSend, fiveEnv);
+b10Mode = 'ok';
+const fAfterHash = await b10One({ ...fiveSend, arguments: { ...fiveSend.arguments, value: '6000000000000000' } }, fiveEnv);
+const fReport = await b10One({ name: 'list_payments', arguments: { limit: 10 } }, fiveEnv, 7000);
+const plainEnv = b10Policy('fivexx-plain', { version: 1, native_budget: { 8453: { daily: '0.01' } } });
+b10Mode = '500';
+const fPlain = await b10One(fiveSend, plainEnv);
+b10Mode = '403';
+const fForbidden = await b10One(fiveSend, plainEnv);
+b10Mode = 'ok';
+const fPlainReport = await b10One({ name: 'list_payments', arguments: { limit: 10 } }, plainEnv, 7000);
+const fRetry = await b10One(fiveSend, plainEnv);
+check('a 500 whose body carries the transaction hash keeps the spend counted as unknown and names the hash in the error', () => {
+  const t = rawText(first(fHash));
+  assert.match(t, new RegExp('0x' + 'ab'.repeat(32)));
+  assert.match(t, /stays counted/);
+  const line = textOf(first(fReport)).payments.find((p) => p.amount === '0.005');
+  assert.ok(line, rawText(first(fReport)));
+  assert.equal(line.outcome, 'unknown');
+  assert.match(rawText(first(fAfterHash)), /native_budget\.8453 daily budget of 0\.01 would be exceeded: 0\.005 already spent/);
+});
+check('a plain 500 on a send stays counted as unknown; a 403 is the host\'s refusal and is voided, so a retry is not budget-refused', () => {
+  assert.match(rawText(first(fPlain)), /whether the custodian broadcast is unknown, so the spend stays counted/);
+  assert.match(rawText(first(fForbidden)), /wallet paused/);
+  const lines = textOf(first(fPlainReport)).payments;
+  assert.deepEqual(lines.map((p) => p.outcome).sort(), ['unknown', 'void'], JSON.stringify(lines));
+  assert.match(rawText(first(fRetry)), /tx_hash/);
+});
+
+// (8) Auto-pay hourly cap under pipelined calls: the slot is taken before the payment is awaited.
+b10Mode = '402';
+const sendsBeforeRace = b10Sends.filter((s) => s.autopay).length;
+const raceEnv = { ...b10Base, AGENTWALLET_WALLET_ID: '1', AGENTWALLET_MAX_AUTOPAY: '1', AGENTWALLET_MAX_AUTOPAY_PER_HOUR: '2', AGENTWALLET_AUTOPAY_ASSETS: 'native' };
+const race = await callTools(Array.from({ length: 6 }, () => ({ name: 'sign_transaction', arguments: { wallet_id: 1, chain_id: 8453, to: DEAD, value: '1000', data: '' } })), raceEnv, { waitMs: 15000 });
+b10Mode = 'ok';
+b10Api.close();
+check('six pipelined 402s under AGENTWALLET_MAX_AUTOPAY_PER_HOUR=2 make exactly two automatic payments; the other four are refused by the hourly cap', () => {
+  const paid = b10Sends.filter((s) => s.autopay).length - sendsBeforeRace;
+  assert.equal(paid, 2, `payments made: ${paid}`);
+  const texts = [100, 101, 102, 103, 104, 105].map((id) => rawText(race.responses.find((r) => r.id === id)));
+  assert.equal(texts.filter((t) => /automatic payments were already made in the last hour/.test(t)).length, 4, texts.join('\n---\n'));
+  assert.equal(texts.filter((t) => /autopay_payment|paid/.test(t) && !/already made/.test(t)).length, 2, texts.join('\n---\n'));
+});
+
 console.log(`\nspend-policy: ${passed} passed, ${failed} failed\n`);
 process.exit(failed ? 1 : 0);

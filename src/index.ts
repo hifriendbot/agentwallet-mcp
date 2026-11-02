@@ -174,15 +174,23 @@ function usdOf(chainId: number, asset: string, raw: string, decimals: number): s
  * What a /send body does with the wallet's funds, as the policy sees it.
  *
  * - native: value to an account.
- * - token: an ERC-20 value mover (transfer, transferFrom, transferAndCall,
- *   ERC-777 send and operatorSend); `to` is the recipient, `asset` the token.
- * - approval: a standing allowance (approve, increaseAllowance, approveAndCall,
- *   Permit2.approve, and the signed shapes EIP-2612 permit, DAI permit and
- *   Permit2.permit); `to` is the spender, `asset` the token. An allowance is a
- *   spend the spender executes later, so it is priced and budgeted when it is
- *   granted. Before 1.14.1 only `transfer` was decoded and an approval fell
- *   through to 'contract', outside every budget (reported privately 2026-10-14);
- *   before 1.14.9 the permit shapes still did (reported privately 2026-11-01).
+ * - token: a value mover (ERC-20 transfer and transferFrom, the ERC-677 and
+ *   ERC-1363 transferAndCall and transferFromAndCall shapes, the ERC-223
+ *   transfer with data, ERC-777 send and operatorSend, the ERC-721, ERC-1155
+ *   and EIP-6909 movers, and a redemption that pays the wallet's own vault or
+ *   lending position to a receiver: ERC-4626 redeem and withdraw, Aave
+ *   Pool.withdraw); `to` is the recipient, `asset` the token.
+ * - approval: a standing allowance (approve, increaseAllowance,
+ *   increaseApproval, both approveAndCall shapes, Permit2.approve, the signed
+ *   shapes EIP-2612 permit, DAI permit and Permit2.permit, and the operator
+ *   grants of ERC-721/1155, ERC-777 and EIP-6909); `to` is the spender,
+ *   `asset` the token. An allowance is a spend the spender executes later, so
+ *   it is priced and budgeted when it is granted. Before 1.14.1 only
+ *   `transfer` was decoded and an approval fell through to 'contract',
+ *   outside every budget (reported privately 2026-10-14); before 1.14.9 the
+ *   permit shapes still did (reported privately 2026-11-01); before 1.14.10
+ *   the sibling shapes, the EIP-6909 calls and the redemptions did (reported
+ *   privately 2026-11-02).
  * - spl: a Solana token transfer.
  * - contract: anything else; `raw` is the native value it carries, which is a
  *   spend to that contract (wrap_eth, or send_transaction with value and data).
@@ -245,6 +253,43 @@ const SPEND_LAYOUTS: Record<string, { kind: 'token' | 'approval'; what: string; 
   d505accf: { kind: 'approval', what: 'EIP-2612 permit', toIndex: 1, amountIndex: 2 },                                 // permit(address,address,uint256,uint256,uint8,bytes32,bytes32)
   '8fcbaf0c': { kind: 'approval', what: 'DAI permit', toIndex: 1, amountIndex: 4, operator: true },                   // permit(address,address,uint256,uint256,bool,uint8,bytes32,bytes32): allowed=true is unbounded by construction
   '2b67b570': { kind: 'approval', what: 'Permit2 permit', toIndex: 5, amountIndex: 2, tokenIndex: 1, permit2Only: true }, // Permit2.permit(address,((address,uint160,uint48,uint48),address,uint256),bytes): PermitSingle is static, so inlined
+  // Sibling shapes of the movers and grants above (reported privately
+  // 2026-11-02, 1.14.10, four reports): the legacy StandardToken
+  // increaseApproval, the ERC-1363 two-argument transferAndCall and
+  // approveAndCall and both transferFromAndCall shapes, the ERC-223 transfer
+  // with data, and the EIP-6909 multi-token movers and grants. Each moves the
+  // token or grants a standing allowance exactly as the shape already decoded
+  // beside it, and each fell through as a zero-value contract call.
+  d73dd623: { kind: 'approval', what: 'increaseApproval', toIndex: 0, amountIndex: 1 },          // increaseApproval(address,uint256)
+  '3177029f': { kind: 'approval', what: 'approveAndCall', toIndex: 0, amountIndex: 1 },          // approveAndCall(address,uint256) (ERC-1363)
+  '1296ee62': { kind: 'token', what: 'transferAndCall', toIndex: 0, amountIndex: 1 },            // transferAndCall(address,uint256) (ERC-1363)
+  d8fbe994: { kind: 'token', what: 'transferFromAndCall', toIndex: 1, amountIndex: 2 },          // transferFromAndCall(address,address,uint256) (ERC-1363)
+  c1d34b89: { kind: 'token', what: 'transferFromAndCall', toIndex: 1, amountIndex: 2 },          // transferFromAndCall(address,address,uint256,bytes) (ERC-1363)
+  be45fd62: { kind: 'token', what: 'ERC-223 transfer', toIndex: 0, amountIndex: 1 },             // transfer(address,uint256,bytes)
+  // EIP-6909: setOperator is the setApprovalForAll of a multi-token contract
+  // (unbounded by construction); the per-id approve and the movers carry an
+  // id word before the amount, and the contract has no decimals or price, so
+  // they are treated as the ERC-1155 shapes are: unpriced, recipient-checked.
+  '558a7297': { kind: 'approval', what: 'EIP-6909 setOperator', toIndex: 0, amountIndex: 1, nft: true, operator: true }, // setOperator(address,bool)
+  '426a8493': { kind: 'approval', what: 'EIP-6909 approve', toIndex: 0, amountIndex: 2, nft: true },                     // approve(address,uint256,uint256)
+  '095bcdb6': { kind: 'token', what: 'EIP-6909 transfer', toIndex: 0, amountIndex: 2, nft: true },                       // transfer(address,uint256,uint256)
+  fe99049a: { kind: 'token', what: 'EIP-6909 transferFrom', toIndex: 1, amountIndex: 3, nft: true },                     // transferFrom(address,address,uint256,uint256)
+  // Redemptions (reported privately 2026-11-02, 1.14.10): a vault or lending
+  // position is the wallet's asset, and its withdraw and redeem calls name a
+  // receiver, so a zero-value call paid the whole position to any address
+  // with nothing reserved. An ERC-4626 vault is itself the share token, so
+  // the spend is recorded under the vault (shares for redeem; for withdraw
+  // the amount is in the underlying, printed at the vault's decimals, which
+  // the standard keeps equal to the underlying's in every common vault), and
+  // priced only if the registry knows it, which a vault never is: refused
+  // under a dollar budget unless unpriced_spends allows, recipient-checked
+  // either way. Aave's Pool.withdraw names the underlying in the calldata, so
+  // that one is priced like a transfer of it. Any other protocol's shape is
+  // outside this table: a policy that holds positions elsewhere should list
+  // recipients.allow and, where it can, the contracts it may call.
+  ba087652: { kind: 'token', what: 'ERC-4626 redeem', toIndex: 1, amountIndex: 0 },               // redeem(uint256,address,address)
+  b460af94: { kind: 'token', what: 'ERC-4626 withdraw', toIndex: 1, amountIndex: 0 },             // withdraw(uint256,address,address)
+  '69328dec': { kind: 'token', what: 'Aave withdraw', toIndex: 2, amountIndex: 1, tokenIndex: 0 }, // Pool.withdraw(address,uint256,address)
 };
 /* The rest of Permit2's surface, by selector: permitBatch, transferFrom (two
    shapes), lockdown, permitTransferFrom and permitWitnessTransferFrom (two
@@ -490,7 +535,13 @@ function localChainId(body?: Record<string, unknown>, qs?: URLSearchParams): num
   if (fromQs) return parseInt(fromQs, 10);
   const fromEnv = (process.env.AGENTWALLET_CHAIN_ID || '').trim();
   if (fromEnv) return parseInt(fromEnv, 10);
-  return 8453; // Base, matching the custodial default
+  // Base. This used to say "matching the custodial default", and it did not:
+  // the hosted signer falls back to chain 1 when a body names no chain, so a
+  // chain-less hosted send was priced and ledgered here on 8453 and executed
+  // there on Ethereum (reported privately 2026-11-02, 1.14.10). The hosted
+  // path now writes the chain it priced into the body it forwards (api()), so
+  // whatever this returns, the custodian is told the same chain.
+  return 8453;
 }
 
 /**
@@ -696,8 +747,17 @@ async function api(path: string, method = 'GET', body?: Record<string, unknown>,
   // signature (body.message) moves nothing and is not gated.
   const m = /^\/wallets\/([^/]+)\/(send|sign)(\?|$)/.exec(path);
   const signsTx = m !== null && (m[2] === 'send' || typeof body?.message !== 'string');
+  let reservedChain: number | null = null;
   if (method === 'POST' && m && body && signsTx) {
     const chainId = localChainId(body, new URLSearchParams(path.split('?')[1] || ''));
+    // The custodian must execute on the chain the policy priced. A body with
+    // no chain_id used to go out as it came and the hosted signer chose its
+    // own default (chain 1), while the ledger said 8453 (reported privately
+    // 2026-11-02, 1.14.10). The chain is written into the body here, before
+    // the decode, so the two cannot differ; the custodian's answer is still
+    // compared with it below.
+    if (!anyLocalMode() && typeof body.chain_id !== 'number') body = { ...body, chain_id: chainId };
+    reservedChain = chainId;
     const d = await describeSend(body, chainId);
     assertSendTarget(d, chainId);
     const tool = ctx.tool || (m[2] === 'sign' ? 'sign_transaction' : 'send');
@@ -712,10 +772,18 @@ async function api(path: string, method = 'GET', body?: Record<string, unknown>,
   }
   try {
     const out = await apiInner(path, method, body, extraHeaders);
+    // A custodian that answers with a chain other than the one it was asked
+    // for executed somewhere the ledger did not count; the line cannot be
+    // re-booked (the spend is live), so the mismatch is written onto it and
+    // onto stderr for the operator.
+    const reported = (out as { chain_id?: unknown })?.chain_id;
+    const mismatch = reserved.length && reservedChain !== null && typeof reported === 'number' && reported !== reservedChain
+      ? ` CHAIN MISMATCH: reserved on chain ${reservedChain}, the API host reports chain ${reported}; the budget of chain ${reported} did not count this spend.` : '';
+    if (mismatch) console.error(`[agentwallet] ${path}:${mismatch}`);
     for (const seq of reserved) {
       const r = out as { tx_hash?: unknown; signature?: unknown };
-      if (m![2] === 'sign') LEDGER.settle(seq, 'signed', 'raw transaction returned to the caller; not broadcast by this process, so it stays counted');
-      else LEDGER.settle(seq, 'broadcast', typeof r?.tx_hash === 'string' ? r.tx_hash : typeof r?.signature === 'string' ? r.signature : null);
+      if (m![2] === 'sign') LEDGER.settle(seq, 'signed', 'raw transaction returned to the caller; not broadcast by this process, so it stays counted' + mismatch);
+      else LEDGER.settle(seq, 'broadcast', (typeof r?.tx_hash === 'string' ? r.tx_hash : typeof r?.signature === 'string' ? r.signature : '') + mismatch || null);
     }
     return out;
   } catch (e) {
@@ -816,6 +884,19 @@ async function apiInner(path: string, method = 'GET', body?: Record<string, unkn
 
   if (!res.ok) {
     const error = serverText((data as { error?: unknown }).error) || `HTTP ${res.status}`;
+    // The host was reached and answered. A 4xx is its refusal and the
+    // reservation is voided; a 5xx on a send or sign came after it took the
+    // request, and the custodian may have broadcast before whatever failed
+    // (a downstream write, a proxy), so the spend stays counted as unknown.
+    // Until 1.14.10 every non-2xx voided, and a 500 that carried the
+    // transaction hash in its body restored the whole budget and dropped
+    // the hash (reported privately 2026-11-02).
+    if (method === 'POST' && /^\/wallets\/[^/]+\/(send|sign)(\?|$)/.test(path)) {
+      const d = data as { tx_hash?: unknown; signature?: unknown };
+      const hash = looksLikeTxHash(d?.tx_hash) ? d.tx_hash : typeof d?.signature === 'string' && /^[1-9A-HJ-NP-Za-km-z]{43,120}$/.test(d.signature) ? d.signature : null;
+      if (hash) throw markMaybeLive(new Error(`${error} The AgentWallet API host answered ${path} with HTTP ${res.status} but reported a transaction (${hash}), so the spend is live and stays counted; check the wallet's history before retrying.`));
+      if (res.status >= 500) throw markMaybeLive(new Error(`${error} The AgentWallet API host answered ${path} with HTTP ${res.status} after taking the request; whether the custodian broadcast is unknown, so the spend stays counted. Check the wallet's history before retrying.`));
+    }
     throw new Error(error);
   }
 
@@ -1008,11 +1089,22 @@ async function handleX402Payment(
 
   // A hostile or broken host that answers 402 on every call must not drain the
   // wallet one cap at a time: at most AUTOPAY_PER_HOUR payments an hour (round 3).
+  // The slot is taken here, synchronously, before anything is awaited: the
+  // count used to be read here and written after the payment, so eight calls
+  // pipelined at once all read 0 and all paid under a limit of 2 (reported
+  // privately 2026-11-02, 1.14.10). A payment that never left this process
+  // gives its slot back below; one that may be live keeps it. The ledger's
+  // own auto-pay lines are counted too, so several processes sharing one
+  // ledger share the hour; without a ledger file the count is per process.
   const hourAgo = Date.now() - 3_600_000;
   while (autopayLog.length && autopayLog[0] < hourAgo) autopayLog.shift();
-  if (autopayLog.length >= AUTOPAY_PER_HOUR) {
-    throw new Error(`x402 auto-pay: ${autopayLog.length} automatic payments were already made in the last hour (AGENTWALLET_MAX_AUTOPAY_PER_HOUR=${AUTOPAY_PER_HOUR}); refusing another. Original error: ${serverText(x402Data.error)}`);
+  const made = Math.max(autopayLog.length, LEDGER.countSince('autopay', hourAgo));
+  if (made >= AUTOPAY_PER_HOUR) {
+    throw new Error(`x402 auto-pay: ${made} automatic payments were already made in the last hour (AGENTWALLET_MAX_AUTOPAY_PER_HOUR=${AUTOPAY_PER_HOUR}); refusing another. Original error: ${serverText(x402Data.error)}`);
   }
+  const slot = Date.now();
+  autopayLog.push(slot);
+  const giveBack = (): void => { const i = autopayLog.indexOf(slot); if (i >= 0) autopayLog.splice(i, 1); };
 
   // Send payment using our wallet (with X-AGW-SKIP-X402 to prevent recursion).
   // The ledger context names the API host and route; the /send hook reserves and settles the spend.
@@ -1044,13 +1136,13 @@ async function handleX402Payment(
       txHash = sendResult.tx_hash || sendResult.signature || '';
     }
   } catch (e) {
+    if (!isMaybeLive(e)) giveBack(); // refused, or never reached the host: the slot is free again
     throw new Error(`x402 auto-pay failed: ${(e as Error).message}. Original error: ${serverText(x402Data.error)}`);
   }
 
   if (!txHash) {
-    throw new Error('x402 auto-pay: no transaction hash returned.');
+    throw new Error('x402 auto-pay: no transaction hash returned.'); // the host answered the send; the slot stays taken
   }
-  autopayLog.push(Date.now());
   const autopayNotice = {
     amount: formatUnits(rawAmount, decimals), token: assetLabel(chainId, tokenAddress), pay_to: payTo, chain_id: chainId, tx_hash: txHash,
     route: `${originalMethod} ${originalPath}`,
@@ -1399,7 +1491,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.14.9',
+    version: '1.14.10',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()

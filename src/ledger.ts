@@ -216,6 +216,12 @@ export class Ledger {
     this.sync();
     return this.sumUsd(nowMs, host);
   }
+  /** Live spends (not voided) with this method written since `sinceMs`, from a fresh read: the hourly auto-pay count across every process sharing the file (1.14.10). */
+  countSince(method: SpendMethod, sinceMs: number): number {
+    this.sync();
+    return this.liveSpends().filter(e => e.method === method && Date.parse(e.ts) >= sinceMs).length;
+  }
+
   spentNative(chainId: number, nowMs = Date.now()): Spent {
     this.sync();
     return this.sumNative(chainId, nowMs);
@@ -252,8 +258,19 @@ export class Ledger {
     if (this.integrity) return { ok: false, reason: `The ledger at ${this.path} is not intact (${this.integrity}); every spend is refused until the operator has looked at it.` };
     const amount18 = rawToUnits(input.raw, input.decimals);
     if (input.asset === '') {
-      const r = refusal(limits.native, this.sumNative(input.chainId, nowMs), amount18, `native_budget.${input.chainId}`);
-      if (r) return { ok: false, reason: r };
+      // The chain's own coin is counted by native_budget alone; the dollar
+      // budget has no price for it. Until 1.14.10 a chain with no
+      // native_budget entry fell through here with nothing checked, so a
+      // policy of "budget daily 0.5, unpriced_spends refuse" bounded every
+      // stablecoin payment and no native one (reported privately
+      // 2026-11-02). Now such a spend is what it is to the dollar budget, an
+      // unpriced spend, and the unpriced rule decides it.
+      if (limits.native) {
+        const r = refusal(limits.native, this.sumNative(input.chainId, nowMs), amount18, `native_budget.${input.chainId}`);
+        if (r) return { ok: false, reason: r };
+      } else if (limits.unpriced === 'refuse' && (limits.usd || limits.host)) {
+        return { ok: false, reason: `policy: ${input.assetLabel} on chain ${input.chainId} is the chain's own coin, which the dollar budget cannot price, and the policy has no native_budget.${input.chainId}; refused (add native_budget.${input.chainId} to the policy to count it, or set unpriced_spends to "allow" to let native spends through uncounted). Nothing was signed.` };
+      }
     } else if (input.usd === null) {
       if (limits.unpriced === 'refuse' && (limits.usd || limits.host)) {
         return { ok: false, reason: `policy: ${input.assetLabel} on chain ${input.chainId} is not a registry stablecoin, so the dollar budget cannot count it; refused (set unpriced_spends to "allow" in the policy to let such spends through uncounted).` };

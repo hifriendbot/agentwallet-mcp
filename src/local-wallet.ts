@@ -398,7 +398,8 @@ const PERMIT2_SELECTORS = new Set(['87517c45', '2b67b570', '2a2d80d1', '36c78516
    and so read as "not a token" to the cap, which let setApprovalForAll to an
    attacker through uncapped (2026-10-04 round 2, verified on a live
    collection). Nothing prices an NFT, so these are refused outright. */
-const NFT_SELECTORS = new Set(['a22cb465', '42842e0e', 'b88d4fde', 'f242432a', '2eb2c2d6', '959b8c3f']); // plus ERC-777 authorizeOperator: an unbounded delegation
+const NFT_SELECTORS = new Set(['a22cb465', '42842e0e', 'b88d4fde', 'f242432a', '2eb2c2d6', '959b8c3f', // plus ERC-777 authorizeOperator: an unbounded delegation
+  '558a7297', '426a8493', '095bcdb6', 'fe99049a']); // EIP-6909 setOperator, approve, transfer, transferFrom: a multi-token contract has no decimals() either (1.14.10)
 
 /**
  * Calls the token cap knows how to price: which calldata word holds the
@@ -426,6 +427,15 @@ const CAP_LAYOUTS: Record<string, CapLayout> = {
   // and are refused by the rule below, as every unpriced call to a token or to
   // Permit2 is; the spend policy classifies both.
   d505accf: { amountIndex: 2, what: 'approval (EIP-2612 permit)' },           // permit(address,address,uint256,uint256,uint8,bytes32,bytes32)
+  // Sibling shapes priced by the spend policy since 1.14.10 (reported
+  // privately 2026-11-02): the same amount word, the same treatment, so the
+  // two guards keep pricing the same calls.
+  d73dd623: { amountIndex: 1, what: 'approval (increaseApproval)' },          // increaseApproval(address,uint256)
+  '3177029f': { amountIndex: 1, what: 'approval (approveAndCall)' },          // approveAndCall(address,uint256)
+  '1296ee62': { amountIndex: 1, what: 'token transfer (transferAndCall)' },   // transferAndCall(address,uint256)
+  d8fbe994: { amountIndex: 2, what: 'token transfer (transferFromAndCall)' }, // transferFromAndCall(address,address,uint256)
+  c1d34b89: { amountIndex: 2, what: 'token transfer (transferFromAndCall)' }, // transferFromAndCall(address,address,uint256,bytes)
+  be45fd62: { amountIndex: 1, what: 'token transfer (ERC-223)' },             // transfer(address,uint256,bytes)
   // WETH9 calls, priced only when `to` is the chain's own wrapped-native
   // contract (wrappedNativeOnly). deposit() carries its amount as msg.value,
   // not in calldata, hence amountIndex -1; withdraw(uint256) has it at word 0.
@@ -488,7 +498,7 @@ async function assertWithinTokenCap(chainId: number, to: Address, data: Hex, val
     }
     if (NFT_SELECTORS.has(selector)) {
       throw new Error(
-        `Blocked by local guard: calldata selector 0x${selector} is an NFT approval or transfer (ERC-721/1155) aimed at ${to}; AGENTWALLET_MAX_TX_TOKEN cannot price it, ` +
+        `Blocked by local guard: calldata selector 0x${selector} is an NFT approval or transfer (ERC-721/1155, or an EIP-6909 multi-token call) aimed at ${to}; AGENTWALLET_MAX_TX_TOKEN cannot price it, ` +
         `so it is refused rather than let through uncapped. Only the operator can allow it (AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS=1).`
       );
     }
