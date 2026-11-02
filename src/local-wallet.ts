@@ -419,6 +419,13 @@ const CAP_LAYOUTS: Record<string, CapLayout> = {
   '9bd9bbc6': { amountIndex: 1, what: 'token transfer (ERC-777 send)' },       // send(address,uint256,bytes)
   '62ad1b83': { amountIndex: 2, what: 'token transfer (ERC-777 operatorSend)' }, // operatorSend(address,address,uint256,bytes,bytes)
   '87517c45': { amountIndex: 2, tokenIndex: 0, what: 'Permit2 approval' },     // Permit2.approve(address,address,uint160,uint48)
+  // EIP-2612 permit sets the allowance exactly as approve does, with the
+  // owner's signature in the calldata (the local key can produce it), so it
+  // is priced as an approval (1.14.9, reported privately 2026-11-01). The DAI
+  // permit (0x8fcbaf0c, a bool grant) and Permit2.permit stay unpriced here
+  // and are refused by the rule below, as every unpriced call to a token or to
+  // Permit2 is; the spend policy classifies both.
+  d505accf: { amountIndex: 2, what: 'approval (EIP-2612 permit)' },           // permit(address,address,uint256,uint256,uint8,bytes32,bytes32)
   // WETH9 calls, priced only when `to` is the chain's own wrapped-native
   // contract (wrappedNativeOnly). deposit() carries its amount as msg.value,
   // not in calldata, hence amountIndex -1; withdraw(uint256) has it at word 0.
@@ -474,7 +481,7 @@ async function assertWithinTokenCap(chainId: number, to: Address, data: Hex, val
         : `the target is ${isPermit2 ? 'Permit2' : 'a token contract'} and this calldata is not one AGENTWALLET_MAX_TX_TOKEN can price`;
       throw new Error(
         `Blocked by local guard: calldata selector 0x${selector} refused rather than let through uncapped: ${why}. ` +
-        `Use transfer, transferFrom, approve, increaseAllowance, Permit2 approve, ` +
+        `Use transfer, transferFrom, approve, increaseAllowance, EIP-2612 permit, Permit2 approve, ` +
         `or deposit/withdraw on the chain's wrapped-native contract, ` +
         `or ask the operator, who alone can set AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS=1.`
       );

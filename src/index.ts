@@ -177,10 +177,12 @@ function usdOf(chainId: number, asset: string, raw: string, decimals: number): s
  * - token: an ERC-20 value mover (transfer, transferFrom, transferAndCall,
  *   ERC-777 send and operatorSend); `to` is the recipient, `asset` the token.
  * - approval: a standing allowance (approve, increaseAllowance, approveAndCall,
- *   Permit2.approve); `to` is the spender, `asset` the token. An allowance is a
+ *   Permit2.approve, and the signed shapes EIP-2612 permit, DAI permit and
+ *   Permit2.permit); `to` is the spender, `asset` the token. An allowance is a
  *   spend the spender executes later, so it is priced and budgeted when it is
  *   granted. Before 1.14.1 only `transfer` was decoded and an approval fell
- *   through to 'contract', outside every budget (reported privately 2026-10-14).
+ *   through to 'contract', outside every budget (reported privately 2026-10-14);
+ *   before 1.14.9 the permit shapes still did (reported privately 2026-11-01).
  * - spl: a Solana token transfer.
  * - contract: anything else; `raw` is the native value it carries, which is a
  *   spend to that contract (wrap_eth, or send_transaction with value and data).
@@ -231,6 +233,31 @@ const SPEND_LAYOUTS: Record<string, { kind: 'token' | 'approval'; what: string; 
   b88d4fde: { kind: 'token', what: 'ERC-721 safeTransferFrom', toIndex: 1, amountIndex: -1, nft: true },                   // safeTransferFrom(address,address,uint256,bytes)
   f242432a: { kind: 'token', what: 'ERC-1155 safeTransferFrom', toIndex: 1, amountIndex: 3, nft: true },                   // safeTransferFrom(address,address,uint256,uint256,bytes)
   '2eb2c2d6': { kind: 'token', what: 'ERC-1155 safeBatchTransferFrom', toIndex: 1, amountIndex: 3, nft: true, batch: true }, // safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)
+  // Signed allowances (reported privately 2026-11-01, 1.14.9): permit() sets
+  // allowance[owner][spender] exactly as approve() does, and the wallet can
+  // produce the owner's signature in-process, so one send_transaction both
+  // signs and broadcasts a standing allowance. None of these was decoded, so
+  // a permit fell through as a zero-value contract call with no budget line,
+  // no ledger line, no spender check and no unlimited refusal: the 1.14.1
+  // bypass again, through a selector that fix did not cover. The owner word
+  // is not compared with the wallet: a permit relayed for another owner is
+  // counted as if it were the wallet's own, which over-counts, never under.
+  d505accf: { kind: 'approval', what: 'EIP-2612 permit', toIndex: 1, amountIndex: 2 },                                 // permit(address,address,uint256,uint256,uint8,bytes32,bytes32)
+  '8fcbaf0c': { kind: 'approval', what: 'DAI permit', toIndex: 1, amountIndex: 4, operator: true },                   // permit(address,address,uint256,uint256,bool,uint8,bytes32,bytes32): allowed=true is unbounded by construction
+  '2b67b570': { kind: 'approval', what: 'Permit2 permit', toIndex: 5, amountIndex: 2, tokenIndex: 1, permit2Only: true }, // Permit2.permit(address,((address,uint160,uint48,uint48),address,uint256),bytes): PermitSingle is static, so inlined
+};
+/* The rest of Permit2's surface, by selector: permitBatch, transferFrom (two
+   shapes), lockdown, permitTransferFrom and permitWitnessTransferFrom (two
+   each), invalidateNonces and invalidateUnorderedNonces. Each moves tokens or
+   changes what may be moved, in shapes this table does not price (a batch is
+   several allowances in one call), so under a policy such a call to the
+   chain's Permit2 is refused rather than let through as a zero-value call to
+   "some contract" (1.14.9). The local token cap has refused the same calls
+   since the 2026-10-04 audit. */
+const PERMIT2_OTHER: Record<string, string> = {
+  '2a2d80d1': 'permit (batch)', '36c78516': 'transferFrom', '0d58b1db': 'transferFrom (batch)', cc53287f: 'lockdown',
+  '30f28b7a': 'permitTransferFrom', edd9444b: 'permitTransferFrom (batch)', '137c29fe': 'permitWitnessTransferFrom', fe8ec1a7: 'permitWitnessTransferFrom (batch)',
+  '3ff9dcb1': 'invalidateNonces', '65d9723c': 'invalidateUnorderedNonces',
 };
 const UNBOUNDED_APPROVAL = 1n << 128n;
 const UINT256_MAX = (1n << 256n) - 1n;
@@ -319,6 +346,15 @@ async function describeSend(body: Record<string, unknown>, chainId: number): Pro
       let decimals = 0;
       try { decimals = await resolveTrustedDecimals(chainId, token); } catch { decimals = 0; }
       return { kind: layout.kind, to: counterparty, asset: token, raw: amount.toString(), decimals, ...(carried ? { carried } : {}) };
+    }
+    // Every priced layout has returned by now; a Permit2 target here is a call
+    // the table does not know.
+    if (isPermit2 && POLICY.path) {
+      const other = PERMIT2_OTHER[data.slice(2, 10).toLowerCase()];
+      throw new Error(
+        `policy: calldata selector 0x${data.slice(2, 10)} aimed at Permit2 is ${other ? `Permit2 ${other}` : 'not a Permit2 call this policy can price'}, which moves tokens or changes what may be moved in a shape the policy cannot count; ` +
+        `refused rather than treated as a plain contract call. Use Permit2 approve or a single permit, each of which is reserved as an approval. Nothing was signed.`
+      );
     }
   }
   if (data && data !== '0x') return { kind: 'contract', to, asset: '', raw: value, decimals: nativeDecimals(chainId) };
@@ -1363,7 +1399,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.14.8',
+    version: '1.14.9',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()

@@ -1190,5 +1190,143 @@ check('simulate_transaction reports setApprovalForAll as an unlimited approval t
   assert.equal(s.signed, false);
 });
 
+// ─── 1.14.9: a permit is an approval ───
+// Reported privately 2026-11-01: EIP-2612 permit (0xd505accf), the DAI permit
+// (0x8fcbaf0c) and Permit2.permit (0x2b67b570) were not in the classifier, so
+// a signed allowance fell through as a zero-value contract call and reached
+// the signer under a policy with no budget line, no ledger line, no spender
+// check and no refusal of an unlimited allowance: the 2026-10-14 bypass
+// through a selector that fix did not cover. The same loopback custodian
+// pattern: every /send body that reaches it is recorded.
+console.log('\n1.14.9: permit() is an approval under the policy (reported 2026-11-01)\n');
+
+const permitPosts = [];
+const permitApi = createServer((req, res) => {
+  let raw = '';
+  req.on('data', (c) => { raw += c; });
+  req.on('end', () => {
+    if (req.method === 'POST') permitPosts.push({ path: req.url, body: JSON.parse(raw || '{}') });
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify(req.method === 'POST' ? { success: true, tx_hash: '0x' + 'ef'.repeat(32) } : { ok: true }));
+  });
+});
+await new Promise((r) => permitApi.listen(0, '127.0.0.1', r));
+const PERMIT2 = '0x000000000022d473030f116ddee9f6b43ac78ba3';
+const ROUTER = '0xefefefefefefefefefefefefefefefefefefefef';
+const sig = word(27) + word(1) + word(2); // v, r, s: any bytes, the chain checks the signature, the policy prices the grant
+const permit2612 = (owner, spender, value) => '0xd505accf' + pad32(owner) + pad32(spender) + word(value) + word(4102444800n) + sig;
+const daiPermit = (holder, spender, allowed) => '0x8fcbaf0c' + pad32(holder) + pad32(spender) + word(1) + word(4102444800n) + word(allowed ? 1 : 0) + sig;
+// Permit2.permit(owner, PermitSingle{details{token, amount, expiration, nonce}, spender, sigDeadline}, signature): the struct is static, so inlined; the bytes follow at offset 256.
+const permit2Permit = (owner, token, amount, spender) => '0x2b67b570' + pad32(owner) + pad32(token) + word(amount) + word(4102444800n) + word(0) + pad32(spender) + word(4102444800n) + word(256) + word(65) + '1b'.repeat(65).padEnd(192, '0');
+const permit2Batch = (owner) => '0x2a2d80d1' + pad32(owner) + word(96) + word(416) + word(96) + pad32(DEAD) + word(4102444800n) + word(1) + pad32(USDC_BASE) + word(500000) + word(4102444800n) + word(0) + word(65) + '1b'.repeat(65).padEnd(192, '0');
+const permitSend = (data, to = USDC_BASE) => ({ name: 'send_transaction', arguments: { wallet_id: 1, chain_id: 8453, to, value: '0', data } });
+const permitBase = { AGENTWALLET_API_URL: `http://127.0.0.1:${permitApi.address().port}`, AGENTWALLET_USER: 'u', AGENTWALLET_PASS: 'p', AGENTWALLET_TOKEN_RISK: '0' };
+const permitPolicy = join(dir, 'permit-policy.json');
+writeFileSync(permitPolicy, JSON.stringify({ version: 1, budget: { daily: '1' }, recipients: { deny: [OTHER] } }));
+const permitLedger = join(dir, 'permit-ledger.jsonl');
+const permitEnv = { ...permitBase, AGENTWALLET_POLICY: permitPolicy, AGENTWALLET_LEDGER: permitLedger };
+const UINT160_MAX = (1n << 160n) - 1n;
+
+// One session per step: the SDK runs calls in a session concurrently, and the budget steps depend on each other.
+const pUnlimited = await callTools([permitSend(permit2612(TEST_ADDRESS, DEAD, (1n << 256n) - 1n))], permitEnv, { waitMs: 8000 });
+const pDenied = await callTools([permitSend(permit2612(TEST_ADDRESS, OTHER, 500000))], permitEnv, { waitMs: 8000 });
+const postsBeforeGrant = permitPosts.length;
+const pGrant = await callTools([permitSend(permit2612(TEST_ADDRESS, DEAD, 500000))], permitEnv, { waitMs: 8000 });
+const pOverBudget = await callTools([permitSend(permit2612(TEST_ADDRESS, DEAD, 600000))], permitEnv, { waitMs: 8000 });
+const pDaiGrant = await callTools([permitSend(daiPermit(TEST_ADDRESS, DEAD, true))], permitEnv, { waitMs: 8000 });
+const pDaiRevoke = await callTools([permitSend(daiPermit(TEST_ADDRESS, DEAD, false))], permitEnv, { waitMs: 8000 });
+const pP2Unlimited = await callTools([permitSend(permit2Permit(TEST_ADDRESS, USDC_BASE, UINT160_MAX, DEAD), PERMIT2)], permitEnv, { waitMs: 8000 });
+const pP2Grant = await callTools([permitSend(permit2Permit(TEST_ADDRESS, USDC_BASE, 250000, DEAD), PERMIT2)], permitEnv, { waitMs: 8000 });
+const pP2Batch = await callTools([permitSend(permit2Batch(TEST_ADDRESS), PERMIT2)], permitEnv, { waitMs: 8000 });
+const pP2Unknown = await callTools([permitSend('0x12345678' + word(1), PERMIT2)], permitEnv, { waitMs: 8000 });
+const postsBeforeRouter = permitPosts.length;
+const pRouter = await callTools([permitSend('0x12345678' + word(1), ROUTER)], permitEnv, { waitMs: 8000 });
+const pTruncated = await callTools([permitSend('0xd505accf' + pad32(TEST_ADDRESS) + pad32(DEAD) + 'ff')], permitEnv, { waitMs: 8000 });
+const pReport = await callTools([{ name: 'list_payments', arguments: { limit: 10 } }], permitEnv, { waitMs: 7000 });
+const permitPostsBeforeNoPolicy = permitPosts.length;
+const pNoPolicy = await callTools([
+  permitSend(permit2612(TEST_ADDRESS, DEAD, (1n << 256n) - 1n)),                 // 100
+  permitSend(permit2Permit(TEST_ADDRESS, USDC_BASE, UINT160_MAX, DEAD), PERMIT2), // 101
+], permitBase, { waitMs: 9000 });
+permitApi.close();
+const pSim = await callTools([
+  { name: 'simulate_transaction', arguments: { wallet_id: 1, to: USDC_BASE, value: '0', data: permit2612(TEST_ADDRESS, DEAD, (1n << 256n) - 1n), chain_id: 8453 } },
+], { ...baseEnv, AGENTWALLET_POLICY: permitPolicy, AGENTWALLET_LEDGER: join(dir, 'permit-sim-ledger.jsonl') }, { waitMs: 8000 });
+// Local mode, per-transaction token cap of 100 USDC and a wide budget: the cap prices a permit like an approve.
+const capPolicy = join(dir, 'permit-cap-policy.json');
+writeFileSync(capPolicy, JSON.stringify({ version: 1, budget: { daily: '1000' } }));
+const capEnv = { ...baseEnv, AGENTWALLET_POLICY: capPolicy, AGENTWALLET_LEDGER: join(dir, 'permit-cap-ledger.jsonl') };
+const pCapOver = await callTools([permitSend(permit2612(TEST_ADDRESS, DEAD, 150000000))], capEnv, { waitMs: 8000 });
+const pCapUnder = await callTools([permitSend(permit2612(TEST_ADDRESS, DEAD, 50000000))], capEnv, { waitMs: 8000 });
+
+check('an EIP-2612 permit for 2^256-1 under a policy is refused as an unlimited approval before the custodian is asked', () => {
+  assert.match(rawText(first(pUnlimited)), /unlimited approval of USDC .* cannot be counted against any budget/);
+});
+check('a bounded permit to a denied address is refused: the permit spender is a recipient', () => {
+  assert.match(rawText(first(pDenied)), /policy denies recipient/);
+  assert.equal(postsBeforeGrant, 0, JSON.stringify(permitPosts));
+});
+check('a bounded permit to an allowed spender goes out once and is reserved on the ledger as an approval of that amount', () => {
+  assert.match(rawText(first(pGrant)), /tx_hash/);
+  assert.equal(permitPosts.filter((p) => String(p.body.data).startsWith('0xd505accf')).length, 1, JSON.stringify(permitPosts));
+  const lp = textOf(first(pReport));
+  const line = lp.payments.find((p) => p.method === 'approval' && p.amount === '0.5');
+  assert.ok(line, JSON.stringify(lp.payments));
+  assert.equal(String(line.asset).toLowerCase(), USDC_BASE.toLowerCase());
+  assert.equal(String(line.to).toLowerCase(), DEAD.toLowerCase());
+  assert.equal(line.usd, '0.5');
+  assert.equal(line.outcome, 'broadcast');
+});
+check('the next permit is counted against what the first one reserved: 0.6 after 0.5 breaks a daily budget of 1', () => {
+  assert.match(rawText(first(pOverBudget)), /daily budget of 1 would be exceeded/);
+});
+check('a DAI permit with allowed=true is an unbounded grant and is refused under a policy', () => {
+  assert.match(rawText(first(pDaiGrant)), /unlimited approval of .* cannot be counted against any budget/);
+});
+check('a DAI permit with allowed=false takes a grant away: it goes out and reserves nothing', () => {
+  assert.match(rawText(first(pDaiRevoke)), /tx_hash/);
+  assert.ok(permitPosts.find((p) => String(p.body.data).startsWith('0x8fcbaf0c')), JSON.stringify(permitPosts));
+});
+check('a Permit2.permit for the uint160 maximum is refused as unlimited; a bounded one is reserved with the token from the calldata and the spender as recipient', () => {
+  assert.match(rawText(first(pP2Unlimited)), /unlimited approval of USDC .* cannot be counted against any budget/);
+  assert.match(rawText(first(pP2Grant)), /tx_hash/);
+  const lp = textOf(first(pReport));
+  const line = lp.payments.find((p) => p.method === 'approval' && p.amount === '0.25');
+  assert.ok(line, JSON.stringify(lp.payments));
+  assert.equal(String(line.asset).toLowerCase(), USDC_BASE.toLowerCase());
+  assert.equal(String(line.to).toLowerCase(), DEAD.toLowerCase());
+  assert.equal(lp.payments.length, 2, JSON.stringify(lp.payments));
+});
+check('a Permit2 call the policy cannot price (permitBatch, or an unknown selector) is refused under a policy, not passed as a plain contract call', () => {
+  assert.match(rawText(first(pP2Batch)), /Permit2 permit \(batch\).*refused rather than treated as a plain contract call/);
+  assert.match(rawText(first(pP2Unknown)), /not a Permit2 call this policy can price/);
+  assert.equal(postsBeforeRouter, 3, JSON.stringify(permitPosts));
+});
+check('the same unknown selector to a contract that is not Permit2 still passes as a zero-value call', () => {
+  assert.match(rawText(first(pRouter)), /tx_hash/);
+  assert.equal(permitPosts.length, postsBeforeRouter + 1, JSON.stringify(permitPosts));
+});
+check('truncated permit calldata is refused, not reclassified as a plain contract call', () => {
+  assert.match(rawText(first(pTruncated)), /is truncated/);
+});
+check('with no policy at all, an unlimited permit and an unlimited Permit2.permit are refused by default', () => {
+  for (const id of [100, 101]) assert.match(rawText(pNoPolicy.responses.find((r) => r.id === id)), /unlimited approval of .* is refused by default/, `id ${id}`);
+  assert.equal(permitPosts.length, permitPostsBeforeNoPolicy, JSON.stringify(permitPosts));
+});
+check('simulate_transaction reports a permit as an approval to the spender and signs nothing', () => {
+  const s = textOf(first(pSim));
+  assert.equal(s.ok, false);
+  assert.equal(s.moves.kind, 'approval');
+  assert.equal(String(s.moves.to).toLowerCase(), DEAD.toLowerCase());
+  assert.equal(s.moves.amount, 'unlimited');
+  assert.match(s.policy, /unlimited approval/);
+  assert.equal(s.signed, false);
+});
+check('in local mode the per-transaction token cap prices a permit like an approve: 150 USDC refused by the cap, 50 USDC passes it', () => {
+  assert.match(rawText(first(pCapOver)), /approval \(EIP-2612 permit\) of 150000000 base units exceeds AGENTWALLET_MAX_TX_TOKEN/);
+  const under = rawText(first(pCapUnder));
+  assert.ok(!/Blocked by local guard|cannot be counted|budget/.test(under), under);
+});
+
 console.log(`\nspend-policy: ${passed} passed, ${failed} failed\n`);
 process.exit(failed ? 1 : 0);
