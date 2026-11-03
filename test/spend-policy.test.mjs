@@ -297,6 +297,60 @@ await checkAsync('two OS processes released at the same instant: exactly one fit
   assert.ok(!existsSync(p + '.lock'));
 });
 
+console.log('\n1.14.12: stale-lock recovery is one step, and a release removes only its own lock (reported 2026-11-02)\n');
+
+check('a release does not remove a lock another process took after reclaiming this one as stale', () => {
+  const p = join(dir, 'stolen.jsonl');
+  const A = new Ledger(p, null, { lockWaitMs: 300 });
+  const unlock = A.lock(); // private in TypeScript, a method at runtime
+  assert.match(readFileSync(p + '.lock', 'utf8'), new RegExp(`^${process.pid} [0-9a-f]{16} `), 'the lock carries the pid and a random token');
+  const theirs = '4242 00000000deadbeef 2026-11-02T00:00:00.000Z\n';
+  writeFileSync(p + '.lock', theirs);
+  unlock();
+  assert.equal(readFileSync(p + '.lock', 'utf8'), theirs, 'the other process\'s lock is still there');
+  unlinkSync(p + '.lock');
+  A.lock()();
+  assert.ok(!existsSync(p + '.lock'), 'its own lock is removed');
+});
+check('a stale lock is left alone while another waiter holds the reclaim step; a claim left by a dead waiter is cleared', () => {
+  const p = join(dir, 'reclaim.jsonl');
+  const A = new Ledger(p, null, { lockWaitMs: 300 });
+  const old = (Date.now() - 120_000) / 1000;
+  writeFileSync(p + '.lock', '1 dead');
+  utimesSync(p + '.lock', old, old);
+  writeFileSync(p + '.lock.reclaim', '2 reclaiming');
+  assert.throws(() => A.reserve(spend(), limits()), /locked by another agentwallet-mcp process/);
+  assert.ok(existsSync(p + '.lock'), 'the stale lock was not removed by a waiter that did not hold the claim');
+  assert.ok(existsSync(p + '.lock.reclaim'), 'the live claim was not removed');
+  utimesSync(p + '.lock.reclaim', old, old);
+  assert.equal(A.reserve(spend(), limits()), 1, 'a dead waiter\'s claim is cleared and the stale lock with it');
+  assert.ok(!existsSync(p + '.lock') && !existsSync(p + '.lock.reclaim'), 'nothing left behind');
+});
+await checkAsync('eight OS processes against a lock a dead process left behind: exactly one fits the last dollar, every trial', async () => {
+  const script = join(dir, 'race-child.mjs'); // written by the 1.14.2 test above
+  for (let trial = 0; trial < 3; trial++) {
+    const p = join(dir, `stale-race-${trial}.jsonl`);
+    writeFileSync(p, '');
+    writeFileSync(p + '.lock', '99999 dead');
+    const old = (Date.now() - 60_000) / 1000;
+    utimesSync(p + '.lock', old, old);
+    const children = Array.from({ length: 8 }, () => spawn(process.execPath, [script, p], { stdio: ['pipe', 'pipe', 'pipe'] }));
+    const outs = children.map(() => '');
+    const ready = children.map((c, i) => new Promise((res) => c.stdout.on('data', (d) => { outs[i] += d.toString(); if (outs[i].includes('ready')) res(); })));
+    const exits = children.map((c) => new Promise((res) => c.on('exit', res)));
+    await Promise.all(ready);
+    for (const c of children) c.stdin.write('go\n');
+    await Promise.all(exits);
+    const results = outs.map((o) => o.split('\n').find((l) => /^(RESERVED|REFUSED)/.test(l)) || '(no result)');
+    assert.equal(results.filter((r) => r.startsWith('RESERVED')).length, 1, `trial ${trial}: ${results.join(' | ')}`);
+    assert.equal(results.filter((r) => /lifetime budget of 1 would be exceeded/.test(r)).length, 7, `trial ${trial}: ${results.join(' | ')}`);
+    const after = new Ledger(p);
+    assert.equal(after.integrity, null, 'one chain');
+    assert.equal(after.size(), 1);
+    assert.ok(!existsSync(p + '.lock') && !existsSync(p + '.lock.reclaim'), 'no lock or claim left behind');
+  }
+});
+
 console.log('\nEncrypted keyfile\n');
 
 check('round trip; wrong passphrase fails with a fixed message; the format is recognised', () => {

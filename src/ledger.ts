@@ -17,7 +17,7 @@
  * file that no longer holds what this process wrote is refused the same way.
  */
 import { appendFileSync, existsSync, readFileSync, openSync, closeSync, writeSync, unlinkSync, statSync } from 'node:fs';
-import { createHash, createHmac } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { DAY_MS, MONTH_MS, type Spent, units, rawToUnits, human, canonicalHost } from './policy.js';
 
 /**
@@ -67,6 +67,12 @@ const MAX_LINE = 16 * 1024;
 const LOCK_WAIT_MS = 10_000;
 /** A lock older than this was left by a process that died holding it. */
 const LOCK_STALE_MS = 30_000;
+/** What a lock file holds: the holder's pid and a random token, so a release can tell its own lock from one taken after it. */
+function lockToken(): string { return `${process.pid} ${randomBytes(8).toString('hex')}`; }
+/** The lock file as one thing to compare: its mtime and its first line. null when it is gone. */
+function lockIdentity(lockPath: string): { mtimeMs: number; line: string } | null {
+  try { return { mtimeMs: statSync(lockPath).mtimeMs, line: readFileSync(lockPath, 'utf8').split(/\r?\n/)[0] }; } catch { return null; }
+}
 const sleeper = new Int32Array(new SharedArrayBuffer(4));
 function sleepSync(ms: number): void { Atomics.wait(sleeper, 0, 0, ms); }
 
@@ -155,26 +161,71 @@ export class Ledger {
     this.integrity = c.integrity;
   }
 
-  /** Take the exclusive lock file; returns the release. A lock a dead process left behind is cleared after LOCK_STALE_MS. */
+  /**
+   * Take the exclusive lock file; returns the release. A lock a dead process
+   * left behind is cleared after LOCK_STALE_MS (reclaimStale). The release
+   * removes the lock only while it still carries this call's token: a lock
+   * this process held past the stale window and another process reclaimed
+   * belongs to whoever took it next, and must not be removed from under them.
+   */
   private lock(): () => void {
     if (!this.path) return () => {};
     const lockPath = this.path + '.lock';
+    const token = lockToken();
     const deadline = Date.now() + this.lockWaitMs;
     for (;;) {
       try {
         const fd = openSync(lockPath, 'wx', 0o600);
-        try { writeSync(fd, `${process.pid} ${new Date().toISOString()}\n`); } finally { closeSync(fd); }
-        return () => { try { unlinkSync(lockPath); } catch { /* already gone */ } };
+        try { writeSync(fd, `${token} ${new Date().toISOString()}\n`); } finally { closeSync(fd); }
+        return () => {
+          if (!lockIdentity(lockPath)?.line.startsWith(token + ' ')) return; // reclaimed as stale and retaken, or already gone
+          try { unlinkSync(lockPath); } catch { /* already gone */ }
+        };
       } catch (e) {
         if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
       }
-      try {
-        if (Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS) { unlinkSync(lockPath); continue; }
-      } catch { continue; /* released between the two calls */ }
+      this.reclaimStale(lockPath);
       if (Date.now() >= deadline) {
         throw new Error(`The ledger at ${this.path} is locked by another agentwallet-mcp process (${lockPath}) that did not finish within ${this.lockWaitMs} ms. Nothing was signed. If no other process is running, remove the lock file.`);
       }
       sleepSync(5);
+    }
+  }
+
+  /**
+   * Clear a lock left by a process that died holding it. The judgement that
+   * the lock is stale and its removal are one step under a second file, the
+   * claim, taken with 'wx' like the lock itself: a waiter that cannot take the
+   * claim leaves the lock alone and retries, and the one that holds it looks
+   * at the lock again (mtime and first line) before removing it, so a fresh
+   * lock another waiter took in the meantime is never the one removed. Before
+   * 1.14.12 the stat and the unlink were two calls with nothing between them,
+   * and two waiters judging one stale lock could, between them, remove the
+   * fresh lock one of them had just taken, after which both held the ledger
+   * (reported privately, 2026-11-02). A claim older than the stale window was
+   * itself left by a waiter that died inside this step and is removed the old
+   * way; the step is a stat and an unlink, so that is the window that remains.
+   */
+  private reclaimStale(lockPath: string): void {
+    const seen = lockIdentity(lockPath);
+    if (!seen || Date.now() - seen.mtimeMs <= LOCK_STALE_MS) return; // gone, or live
+    const claimPath = lockPath + '.reclaim';
+    let fd: number;
+    try {
+      fd = openSync(claimPath, 'wx', 0o600);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+      try { if (Date.now() - statSync(claimPath).mtimeMs > LOCK_STALE_MS) unlinkSync(claimPath); } catch { /* finished or cleared meanwhile */ }
+      return; // another waiter is clearing it; retry the lock
+    }
+    try {
+      try { writeSync(fd, `${lockToken()} ${new Date().toISOString()}\n`); } finally { closeSync(fd); }
+      const now = lockIdentity(lockPath);
+      if (now && now.mtimeMs === seen.mtimeMs && now.line === seen.line && Date.now() - now.mtimeMs > LOCK_STALE_MS) {
+        try { unlinkSync(lockPath); } catch { /* gone meanwhile */ }
+      }
+    } finally {
+      try { unlinkSync(claimPath); } catch { /* already gone */ }
     }
   }
 
