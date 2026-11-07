@@ -1,5 +1,7 @@
 # AgentWallet MCP Server
 
+[![Tested by AddonAudit](https://addonaudit.com/badges/tested.svg)](https://addonaudit.com/addon/io-github-hifriendbot-agentwallet/)
+
 Permissionless wallet infrastructure for AI agents. Create wallets, sign transactions, and broadcast on-chain, on any EVM chain and Solana. Built-in guards. No KYC. The only AI agent wallet that accepts crypto for its own API fees.
 
 **Your keys can stay on your machine.** Set one environment variable and every signature happens in your own process. No server sees the key, no company can freeze the wallet, and you can verify that claim by reading `src/local-wallet.ts` or by running the server with the API pointed at a closed port.
@@ -66,7 +68,7 @@ Set either key, or both. They are independent: run EVM locally and Solana hosted
 
 Local signing uses [viem](https://viem.sh) for EVM and `@solana/web3.js` for Solana, plus `bs58` for key parsing. SPL instructions are built by hand rather than with `@solana/spl-token`, because that package pulls in `bigint-buffer`, which carries a high severity buffer overflow advisory. A wallet has no business shipping that to save a dozen lines of instruction encoding.
 
-`npm audit` reports no advisories as of 1.13.5; the overrides in package.json keep two advisories under `@solana/web3.js`'s jayson closed. Earlier releases carried advisories inside `@modelcontextprotocol/sdk`'s HTTP transport dependencies. This server speaks stdio, so that code never loads, and the SDK is not something this package can patch. Run the audit yourself. Publishing a tree you can inspect is the point.
+`npm audit` in a checkout of this repository reports no advisories, and the release workflow fails on a high or critical finding. An install is different: as of 1.14.13, `npx agentwallet-mcp` carries four medium advisories, three in `stream-json` 1.9 and one in `uuid` 8, both pulled in by `jayson` 4 under `@solana/web3.js` 1.x. The overrides in package.json move them to clean versions inside this repository only; npm ignores a dependency's overrides, and until 1.14.13 this paragraph claimed they held for installs too. None of the four is reachable: `@solana/web3.js` loads only jayson's HTTP client, which uses `uuid` v4 for request ids (the advisory is in v3, v5 and v6 with a caller-supplied buffer), and `stream-json` is loaded by jayson's streaming server parsers, which that client never calls. `jayson` 5 drops both packages, but `@solana/web3.js` 1.x pins jayson 4 and its maintainers have closed the bump as out of scope for 1.x, so the four stay until this package stops depending on `@solana/web3.js` 1.x. Earlier releases carried advisories inside `@modelcontextprotocol/sdk`'s HTTP transport dependencies; this server speaks stdio, so that code never loads. Run the audit yourself, on an install rather than a checkout. Publishing a tree you can inspect is the point.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/hifriendbot/agentwallet-mcp/main/assets/demo.svg" alt="AgentWallet demo, AI agent pays x402 invoice automatically" width="800">
@@ -310,7 +312,7 @@ On-chain verification ensures every payment is real. Replay protection prevents 
 | x402 Acceptance (Paywalls) | No | **Yes** |
 | Pay for API Fees with Crypto | No (credit card only) | **Yes (USDC via x402)** |
 | Supported Chains | 8 EVM + Solana | **Any EVM + Solana** |
-| Token Tools | Yes | **ERC-20 + SPL (34 tools)** |
+| Token Tools | Yes | **ERC-20 + SPL (40 tools)** |
 | MCP Server | Yes | **Yes** |
 
 ## Pay with Crypto, No Credit Card Required

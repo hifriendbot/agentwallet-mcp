@@ -46,6 +46,14 @@ jobs:
         run: npm audit --omit=dev --audit-level=high
       - run: npm run build
       - run: npm test
+      - name: Audit the tree a consumer installs (npm applies this package's overrides only in its own checkout, so the audit above never saw it; a high or critical finding fails it)
+        run: |
+          tgz="$(npm pack --ignore-scripts --json --pack-destination "$RUNNER_TEMP" | node -p "JSON.parse(require('fs').readFileSync(0,'utf8'))[0].filename")"
+          mkdir "$RUNNER_TEMP/consumer" && cd "$RUNNER_TEMP/consumer"
+          npm init -y >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund "$RUNNER_TEMP/$tgz"
+          npm audit --omit=dev || true
+          npm audit --omit=dev --audit-level=high
       - name: Check the release tag matches package.json
         if: github.event_name == 'release'
         run: |
