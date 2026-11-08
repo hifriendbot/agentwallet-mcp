@@ -379,8 +379,7 @@ export function classifyDecimalsError(err: unknown): DecimalsProbe {
  * Decimals to price a known transfer or approval at. Anything short of a
  * usable answer is evaluated at 0, the only value that cannot fail open.
  */
-async function resolveTokenDecimals(chainId: number, token: Address): Promise<number> {
-  const probe = await probeTokenDecimals(chainId, token);
+function resolvedDecimals(probe: DecimalsProbe): number {
   return typeof probe === 'number' ? probe : 0;
 }
 
@@ -400,6 +399,15 @@ const PERMIT2_SELECTORS = new Set(['87517c45', '2b67b570', '2a2d80d1', '36c78516
    collection). Nothing prices an NFT, so these are refused outright. */
 const NFT_SELECTORS = new Set(['a22cb465', '42842e0e', 'b88d4fde', 'f242432a', '2eb2c2d6', '959b8c3f', // plus ERC-777 authorizeOperator: an unbounded delegation
   '558a7297', '426a8493', '095bcdb6', 'fe99049a']); // EIP-6909 setOperator, approve, transfer, transferFrom: a multi-token contract has no decimals() either (1.14.10)
+/* ERC-721 declares transferFrom(address,address,uint256) and
+   approve(address,uint256) with the same selectors as ERC-20, and there the
+   last word is a token id, not an amount. Both are priced below, so a
+   collection (which declines decimals()) was evaluated at 0 decimals and a
+   transfer of token #42 passed a cap of 1000 whatever the token was worth,
+   while safeTransferFrom to the same collection was refused above (reported
+   privately 2026-11-08, 1.14.14). On a target that declines decimals() these
+   two shapes are NFT calls and refused the same way. */
+const ERC721_SHARED_SELECTORS = new Set(['23b872dd', '095ea7b3']);
 
 /**
  * Calls the token cap knows how to price: which calldata word holds the
@@ -533,7 +541,18 @@ async function assertWithinTokenCap(chainId: number, to: Address, data: Hex, val
 
   // Every wrapped native in the table is a WETH9 clone with 18 decimals, the
   // same figure wrap_eth and unwrap_eth encode with; no RPC needed to price it.
-  const decimals = layout.wrappedNativeOnly ? 18 : await resolveTokenDecimals(chainId, token);
+  let decimals = 18;
+  if (!layout.wrappedNativeOnly) {
+    const probe = await probeTokenDecimals(chainId, token);
+    if (probe === 'not-a-token' && ERC721_SHARED_SELECTORS.has(selector) && process.env.AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS !== '1') {
+      throw new Error(
+        `Blocked by local guard: calldata selector 0x${selector} (${layout.what}) is aimed at ${token}, which declines decimals(), so it is not an ERC-20 token: ` +
+        `ERC-721 uses this selector for an NFT approval or transfer and the amount word is a token id, which AGENTWALLET_MAX_TX_TOKEN cannot price; ` +
+        `refused rather than compared with the cap as if it were an amount. Only the operator can allow it (AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS=1).`
+      );
+    }
+    decimals = resolvedDecimals(probe);
+  }
   const [whole, frac = ''] = cap.split('.');
   const capRaw = BigInt(whole + frac.padEnd(decimals, '0').slice(0, decimals));
 

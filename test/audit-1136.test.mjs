@@ -93,6 +93,23 @@ try {
   await refused('ERC-721 safeTransferFrom is refused', () => localSend(8453, fresh20(), 0n, '0x42842e0e' + ATT + ATT + '0'.repeat(63) + '1'), /NFT approval or transfer/);
   await refused('ERC-1155 safeTransferFrom is refused', () => localSend(8453, fresh20(), 0n, '0xf242432a' + ATT + ATT + '0'.repeat(64 * 3)), /NFT approval or transfer/);
   await refused('an unrelated selector on a non-token still passes the cap (stops at the nonce fetch)', () => localSend(8453, fresh20(), 0n, '0x12345678' + ATT), /eth_getTransactionCount|not served/);
+  // Reported privately 2026-11-08 (1.14.14): ERC-721 transferFrom and approve
+  // share their selectors with ERC-20, so a collection's token id was priced
+  // as an amount at 0 decimals and #1 passed a cap of 1. The mock reverts
+  // decimals() (code 3), which is how a collection answers.
+  await refused('ERC-721 transferFrom(from, to, tokenId 1) to a collection is refused, not compared with the cap', () => localSend(8453, fresh20(), 0n, '0x23b872dd' + ATT + ATT + '0'.repeat(63) + '1'), /ERC-721 uses this selector/);
+  await refused('ERC-721 approve(operator, tokenId 1) to a collection is refused', () => localSend(8453, fresh20(), 0n, '0x095ea7b3' + ATT + '0'.repeat(63) + '1'), /ERC-721 uses this selector/);
+  // The same calldata to a contract that answers decimals() is an ERC-20
+  // transferFrom and is priced as before: 1 base unit under a cap of 1 at 18
+  // decimals passes the cap and stops at the nonce fetch.
+  rpcQueue.push({ result: '0x' + '0'.repeat(62) + '12' });
+  await refused('ERC-20 transferFrom of 1 base unit on a token that answers decimals() still passes the cap', () => localSend(8453, fresh20(), 0n, '0x23b872dd' + ATT + ATT + '0'.repeat(63) + '1'), /eth_getTransactionCount|not served/);
+  // A token id above the cap was refused before and still is, by the cap itself.
+  await refused('a token id above the cap is still refused by the cap on a target whose decimals() answer is unusable', () => { rpcQueue.push({ result: '0x' + 'ff'.repeat(40) }); return localSend(8453, fresh20(), 0n, '0x23b872dd' + ATT + ATT + '0'.repeat(60) + '1000'); }, /exceeds AGENTWALLET_MAX_TX_TOKEN/);
+  // The operator's escape hatch opens it, as it does for the explicit NFT selectors.
+  process.env.AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS = '1';
+  await refused('with AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS=1 the call reaches the cap and then the nonce fetch', () => localSend(8453, fresh20(), 0n, '0x23b872dd' + ATT + ATT + '0'.repeat(63) + '1'), /eth_getTransactionCount|not served/);
+  delete process.env.AGENTWALLET_ALLOW_UNKNOWN_TOKEN_CALLS;
 } finally { rpc.close(); }
 
 /* ── Solana: pre-funded ATA address ───────────────────────────── */
