@@ -91,6 +91,7 @@ import {
 import { Ledger, type ReserveInput, type Limits, type SpendMethod } from './ledger.js';
 import { markMaybeLive, isMaybeLive, carryMaybeLive, connectionNeverMade } from './maybe-live.js';
 import { discover } from './discovery.js';
+import { endpointVerdict, endpointRefusal, type EndpointVerdict } from './endpoint-check.js';
 
 /* `agentwallet-mcp encrypt-keyfile <in> <out>` runs the keyfile tool instead of the server. */
 if (process.argv[2] === 'encrypt-keyfile') {
@@ -2519,6 +2520,24 @@ tool(
       }
     }
 
+    // Step 3f: Endpoint check (policy endpoint_check). An independent x402 index is asked what it knows about this
+    // URL before anything is signed: its recommendation, and whether the payTo in this quote is the one its own probe
+    // of the same URL gets paid. Only the URL's origin and path leave this process. Off without the policy field; a
+    // re-sent authorization was checked when it was signed.
+    let endpointCheck: EndpointVerdict | null = null;
+    if (!alreadySigned && POL().endpoint_check) {
+      const rule = POL().endpoint_check!;
+      endpointCheck = await endpointVerdict(rule, url, { payTo: option.payTo, chainId });
+      const refusal = endpointRefusal(rule, endpointCheck);
+      if (refusal) {
+        return jsonResponse({
+          status: 402, payment_required: true, payment_made: false, policy_refusal: true,
+          required_amount: amount, token: tokenLabel, network: option.network, chain_id: chainId, pay_to: option.payTo, host: payHost,
+          endpoint_check: endpointCheck, error: refusal + ' Nothing was signed.', server_text_is_untrusted: true,
+        });
+      }
+    }
+
     // Step 4: Hard per-payment cap, ALWAYS applied. If the caller omits max_payment
     // we fall back to AGENTWALLET_MAX_AUTOPAY (default "1"). Above the cap a hosted
     // wallet can ask its owner instead of refusing: an approval is created, the
@@ -2845,6 +2864,7 @@ tool(
       network: option.network,
       chain_id: chainId,
       pay_to: option.payTo,
+      endpoint_check: endpointCheck,
       payer,
       payer_delegation: payerDelegationInfo,
       // tx_hash is only ever ours (we broadcast it). The server's claimed hash
@@ -3270,9 +3290,16 @@ tool(
       });
       if (!v.ok) refusals.push(v.reason);
     }
+    // The same endpoint check pay_x402 would run, so "would this be paid?" includes the index's answer.
+    let endpointCheck: EndpointVerdict | null = null;
+    if (POL().endpoint_check) {
+      endpointCheck = await endpointVerdict(POL().endpoint_check!, url, { payTo: String(option.payTo), chainId });
+      const refusal = endpointRefusal(POL().endpoint_check!, endpointCheck);
+      if (refusal) refusals.push(refusal);
+    }
     return jsonResponse({
       status: 402, payment_required: true, x402_version: Number(info.x402Version) || 1, host,
-      would_pay: refusals.length === 0, refusals,
+      would_pay: refusals.length === 0, refusals, endpoint_check: endpointCheck,
       requires_human_approval: human,
       amount, token: tokenLabel, token_address: tokenAddress || null, scheme: serverText(option.scheme), network: serverText(option.network), chain_id: chainId, pay_to: serverText(option.payTo),
       amount_is_maximum: option.scheme === 'upto', per_payment_cap: cap, within_cap: withinCap,

@@ -46,6 +46,14 @@ export const PolicySchema = z.object({
   tools: z.object({ allow: z.array(z.string().regex(/^[a-z_0-9]+$/)).max(100).optional(), deny: z.array(z.string().regex(/^[a-z_0-9]+$/)).max(100).optional() }).strict().optional(),
   /** Ledger path; relative paths resolve against the policy file's directory. */
   ledger: z.string().min(1).max(1024).optional(),
+  /** Ask an independent x402 index (Settled, settled.tools) about the endpoint before pay_x402 signs: its recommendation (pay, caution, avoid, unknown) against `refuse` (default ["avoid"]), and whether the quote's payTo is the one the index's own probe of the URL is paid at. Only the URL's origin and path are sent. `on_error` says what to do when the index cannot answer (default "allow"). */
+  endpoint_check: z.object({
+    provider: z.literal('settled'),
+    refuse: z.array(z.enum(['avoid', 'caution', 'unknown'])).max(3).optional(),
+    on_error: z.enum(['allow', 'refuse']).optional(),
+    timeout_seconds: z.number().int().min(1).max(60).optional(),
+    base_url: z.string().url().max(200).optional(),
+  }).strict().optional(),
 }).strict();
 
 export type Policy = z.infer<typeof PolicySchema>;
@@ -279,6 +287,7 @@ export function describePolicy(lp: LoadedPolicy): Record<string, unknown> {
     unknown_calls: lp.path ? (p.unknown_calls ?? 'refuse') : 'allow (no policy set)',
     approval: p.approval ?? null,
     tools: p.tools ?? null,
+    endpoint_check: p.endpoint_check ?? null,
     ledger: lp.ledgerPath,
   };
 }
