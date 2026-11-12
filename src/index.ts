@@ -1512,7 +1512,7 @@ const AddressSchema = z.string().regex(
 const server = new McpServer(
   {
     name: 'agentwallet',
-    version: '1.14.14',
+    version: '1.14.15',
   },
   {
     instructions: `AgentWallet gives AI agents their own blockchain wallets. ${anyLocalMode()
@@ -1589,7 +1589,7 @@ ${anyLocalMode() ? '' : '- Use unpause_wallet to resume operations.\n- Use delet
 | Sign without broadcasting | sign_transaction |
 | Pay for x402 resource | pay_x402 |
 | Charge for your resource | create_paywall |
-| Check usage/billing | get_usage |`,
+| Check usage (hosted is free) | get_usage |`,
   },
 );
 
@@ -2923,7 +2923,7 @@ tool(
 tool(
   'get_usage',
   'Get the current month\'s usage statistics. ' +
-    'Returns operations count, tier info, remaining quota, and fees.',
+    'Hosted AgentWallet is free: returns the operations count and what is left under the fair-use ceiling.',
   {},
   async () => {
     const data = await api('/usage');
@@ -2935,10 +2935,8 @@ tool(
 
 tool(
   'buy_verification_credits',
-  'Buy x402 verification credits with USDC on-chain. ' +
-    'Paywall owners need credits to process verifications beyond the free tier (1,000/month) ' +
-    'when they don\'t have Stripe billing configured. ' +
-    'Returns 402 payment instructions — pay on-chain and retry with proof.',
+  'Hosted AgentWallet is free and x402 verifications carry no fee, so there are no credits to buy: ' +
+    'this call reports that and spends nothing. Kept so existing agent configurations do not break.',
   {
     count: z.number().int().min(100).default(1000)
       .describe('Number of verification credits to purchase (min 100, default 1000)'),

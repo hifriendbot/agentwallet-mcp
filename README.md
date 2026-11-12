@@ -2,11 +2,11 @@
 
 [![Tested by AddonAudit](https://addonaudit.com/badges/tested.svg)](https://addonaudit.com/addon/io-github-hifriendbot-agentwallet/)
 
-Permissionless wallet infrastructure for AI agents. Create wallets, sign transactions, and broadcast on-chain, on any EVM chain and Solana. Built-in guards. No KYC. The only AI agent wallet that accepts crypto for its own API fees.
+Permissionless wallet infrastructure for AI agents. Create wallets, sign transactions, and broadcast on-chain, on any EVM chain and Solana. Built-in guards. No KYC. Free to use.
 
 **Your keys can stay on your machine.** Set one environment variable and every signature happens in your own process. No server sees the key, no company can freeze the wallet, and you can verify that claim by reading `src/local-wallet.ts` or by running the server with the API pointed at a closed port.
 
-**No KYC. No KYT. No approval process. No transaction monitoring. No one can block your wallet. Pay with USDC on-chain, no credit card required.**
+**No KYC. No KYT. No approval process. No transaction monitoring. No one can block your wallet. Free: no fee per operation and no credit card.**
 
 ## Two modes
 
@@ -88,14 +88,16 @@ Local signing uses [viem](https://viem.sh) for EVM and `@solana/web3.js` for Sol
 
 ## Pricing
 
-- **$0.00345 per operation**
-- **6,000 free operations/month**
-- **$0.0005 per x402 verification**
-- **1,000 free x402 verifications/month**
-- **Pay with USDC on-chain** via x402, no credit card required
-- No monthly fee, no tiers, just pay as you go
+AgentWallet is free.
 
-Competitor comparisons are kept at [hifriendbot.com/wallet/#pricing](https://hifriendbot.com/wallet/#pricing) with the date they were last verified. They live there rather than here because a published npm README cannot be corrected when someone else changes their prices.
+- **$0 per operation** on hosted wallets
+- **$0 per x402 verification** on paywalls
+- **Local mode is free and needs no account**: your key, your machine
+- No card, no invoice, no tiers
+- Fair use: up to 100,000 hosted operations a month per account, which only bounds abuse
+- Your wallet pays network gas to the chain, as with any wallet
+
+A comparison with Coinbase is kept at [hifriendbot.com/wallet/vs-coinbase](https://hifriendbot.com/wallet/vs-coinbase/) with the date it was last verified. It lives there rather than here because a published npm README cannot be corrected when someone else changes their product.
 
 ## Quick Start
 
@@ -121,7 +123,7 @@ Add to your config:
 }
 ```
 
-> `AGENTWALLET_WALLET_ID` is optional. Set it to enable x402 auto-pay: when you exceed the free tier without a credit card, the MCP server automatically pays for operations with USDC from this wallet. Only the metered routes (creating a wallet, signing, sending) are paid this way, at most `AGENTWALLET_MAX_AUTOPAY_PER_HOUR` times an hour (default 20; the slot is taken before the payment is sent, so parallel calls cannot overrun it, and processes sharing a ledger file share the hour, while without one the count is per process), and every automatic payment is reported in the tool result under `autopay_payment`. A 402 on any other route is reported, never paid.
+> `AGENTWALLET_WALLET_ID` is optional. The hosted service is free and asks for no payment, so today this setting changes nothing. It names the wallet x402 auto-pay would use if the API host ever answered a metered call with a 402, and the limits below bound what could be paid in that case. Only the metered routes (creating a wallet, signing, sending) are paid this way, at most `AGENTWALLET_MAX_AUTOPAY_PER_HOUR` times an hour (default 20; the slot is taken before the payment is sent, so parallel calls cannot overrun it, and processes sharing a ledger file share the hour, while without one the count is per process), and every automatic payment is reported in the tool result under `autopay_payment`. A 402 on any other route is reported, never paid.
 >
 > **Auto-pay safety cap.** `AGENTWALLET_MAX_AUTOPAY` (optional, default `1`) is the most one x402 payment may authorize, in stablecoin units: `1` means one dollar. It prices registry stablecoins only (USDC, USDT, USDbC, DAI on the supported chains, USDC and USDT on Solana). A requirement in the chain's native asset or in any other token is refused, because "1" measured in ETH is a few thousand dollars; list such assets in `AGENTWALLET_AUTOPAY_ASSETS` (comma-separated addresses or mints, or the word `native`) to allow them, and the cap then applies in that asset's own units. Any requirement above the cap is rejected instead of paid, so a malformed or tampered payment requirement cannot drain the wallet. This automatic path settles `exact` requirements only; an `upto` offer from the API is refused before any wallet call, because paying a usage maximum upfront is not what the offer means (use `pay_x402`, which signs a Permit2 authorization for it). The cap is the operator's ceiling: a `max_payment` argument can lower it for one call but never raise it. Raise the variable itself if you genuinely need larger automatic payments (for example `"5"` for up to 5 USDC per call).
 
@@ -293,35 +295,27 @@ When an agent hits the paywall URL:
 3. Retries with proof of payment
 4. Receives the protected content
 
-On-chain verification ensures every payment is real. Replay protection prevents double-spending. Revenue tracking shows you who paid, how much, and when. 1,000 free verifications/month, then $0.0005 each. See the [pricing comparison](https://hifriendbot.com/wallet/#pricing) for how that stacks up.
+On-chain verification ensures every payment is real. Replay protection prevents double-spending. Revenue tracking shows you who paid, how much, and when. Paywall verifications are free.
 
 ## How We Compare
 
-| Feature | Coinbase CDP | AgentWallet |
+| | Coinbase Agentic Wallets | AgentWallet |
 |---------|-------------|-------------|
-| Setup Time | Install SDK + configure | **3 lines of config** |
-| Approval Process | Identity verification required | **None, instant access** |
-| KYC Required | Yes | **No** |
-| KYT / Transaction Monitoring | Yes | **No** |
-| Can Block Your Wallet | Yes | **No** |
-| Built-in Guards | Yes (requires setup) | **Yes (hosted: active by default; local: env caps you set)** |
-| Free Operations / Month | 5,000 | **6,000** |
-| Cost Per Operation | $0.005 | **$0.00345** |
-| x402 Verification Cost | $0.001 | **$0.0005** |
-| Free x402 Verifications / Month | 1,000 | **1,000** |
-| x402 Acceptance (Paywalls) | No | **Yes** |
-| Pay for API Fees with Crypto | No (credit card only) | **Yes (USDC via x402)** |
-| Supported Chains | 8 EVM + Solana | **Any EVM + Solana** |
-| Token Tools | Yes | **ERC-20 + SPL (40 tools)** |
-| MCP Server | Yes | **Yes** |
+| Setup | CLI or MCP server | **3 lines of MCP config** |
+| Sign-in | Email one-time code | **Local mode: none. Hosted: a free account** |
+| Where the private key lives | Coinbase infrastructure | **Your machine in local mode. Hosted keys are encrypted and exportable** |
+| Fully local signing | No | **Yes, on EVM and Solana** |
+| Spending limits | Caps per session and per transaction | **A policy file: rolling budgets, per-endpoint ceilings, recipient lists, approval above a threshold, hash-chained ledger** |
+| Price of wallet operations | See Coinbase's pricing page | **$0** |
+| Selling over x402 | Facilitator: 1,000 onchain transactions free a month, then $0.001 each | **Paywalls with on-chain verification: free** |
+| Chains | Base, Polygon and Solana for payments | **Any EVM chain + Solana** |
+| MCP Server | Yes | **Yes, 40 tools** |
 
-## Pay with Crypto, No Credit Card Required
+Coinbase details are from the Coinbase Developer Platform documentation, last verified November 12, 2026. Coinbase wrote the x402 standard and has the wider distribution; AgentWallet speaks the same standard with any server. The dated, maintained version of this table is at [hifriendbot.com/wallet/vs-coinbase](https://hifriendbot.com/wallet/vs-coinbase/).
 
-AgentWallet is the only AI agent wallet infrastructure that accepts crypto for its own API fees. Every competitor, Coinbase CDP, Circle, MoonPay, Crossmint, Turnkey, requires a credit card or monthly invoice. With AgentWallet, your agent can pay for operations with USDC on-chain via the x402 protocol. No credit card, no invoice, no billing portal. Just on-chain payments.
+## Free, With No Card
 
-When your agent exceeds the free tier (6,000 ops/month) without a credit card configured, the API returns HTTP 402 with USDC payment instructions. Your agent pays on-chain, retries with proof of payment, and the operation executes. Fully automated via the MCP server.
-
-You can also pre-purchase x402 verification credits with USDC using the `buy_verification_credits` tool, keeping your paywalls running beyond the free 1,000 verifications/month without needing a credit card.
+There is nothing to pay AgentWallet for. Hosted operations and paywall verifications carry no fee, so there is no card to add, no invoice and no credits to buy (`buy_verification_credits` now answers that there is nothing to purchase). `get_usage` reports the month's operation count against the fair-use ceiling.
 
 ## Built-in Guards
 
